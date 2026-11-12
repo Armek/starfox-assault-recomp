@@ -63,8 +63,8 @@ On Linux, `wine` or `wibo` is downloaded automatically for the compilers.
 ## Static recompilation (PC port)
 
 [recomp/](recomp/README.md) translates `main.dol` to C and links it into a native executable.
-Milestone 1 is done: all 4,403 game-side functions translate and compile, and recompiled MSL code
-passes a self-test against the host C library. Booting the game is next.
+Milestones 1-2 are done: everything in main.dol translates and compiles, and the recompiled game
+boots through OSInit into main (see docs/boot_trace.md). Threads and interrupts are next.
 
 ## See also
 

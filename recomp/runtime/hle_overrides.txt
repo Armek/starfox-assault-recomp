@@ -1,0 +1,16 @@
+# Guest functions the runtime reimplements instead of recompiling (one symbol name per line).
+# Each one needs an HLE(name) definition in recomp/runtime/hle.c.
+
+# Console output: OSReport -> vprintf -> stdout -> __write_console. On retail hardware this writes
+# to the dev-kit UART, so the output is lost; print it on the host instead.
+__write_console
+__TRK_write_console
+
+# Audio DSP bring-up: uploads a boot task and polls DSP mailboxes. Audio will be a host backend.
+__OSInitAudioSystem
+
+# Configures BATs and the memory interface via real mode + rfi. Host memory needs no protection setup.
+__OSInitMemoryProtection
+
+# Video: no VI interrupt yet, so waiting for retrace would idle forever. Pace at 60 Hz instead.
+VIWaitForRetrace

@@ -3,15 +3,40 @@
 Translates the Gekko (PowerPC 750CL) machine code in `main.dol` into portable C, then links it with a
 host runtime into a native executable. This is the route toward a PC / Linux / Steam Deck build.
 
-## Status: milestone 1 done
+## Status: milestone 2 done (boots into `main`)
 
-- All **4,403** game-side functions in `main.dol` are translated, with **0 untranslated instructions**.
-  That covers the game, the Namco engine layer, CRI ADX/Sofdec, the MSL C library and `.init`.
-- The **972** Dolphin SDK and MetroTRK functions are left as stubs (`hle_stubs.c`) that log calls.
-  The runtime will reimplement them for PC; see [docs/sdk_boundary.md](../docs/sdk_boundary.md).
-- The generated C (~31 MB, 71 files) compiles with clang 19 at `-O1` with no errors or warnings, and links into `sfa`.
-- `sfa --selftest` runs recompiled game code (`__init_registers`, `memset`, `strlen`, and MSL `sprintf`
-  with integer, string and floating-point formats) and checks the results against the host C library: **5/5 pass**.
+- **Milestone 1:** all of `main.dol` translates to C with 0 untranslated instructions. It compiles with
+  clang 19 with no errors or warnings, and `sfa --selftest` passes 5/5 (recompiled `memset`, `strlen`,
+  `sprintf` checked against the host C library).
+- **Milestone 2:** `sfa` boots the game.
+  - It runs the recompiled `__start` → `OSInit` → `main`. The Dolphin OS banner prints from the game's own code
+    ("Kernel built : May 21 2004", "Console Type : Retail 3", "Memory 24 MB", arena range).
+  - It then runs the game's video and engine initialization.
+  - It stops after **949 SDK calls to 246 distinct functions**, when `GXDrawDone` sleeps waiting for a
+    GPU interrupt. See [docs/boot_trace.md](../docs/boot_trace.md).
+- **The SDK is recompiled too**, except for the 5 functions in `runtime/hle_overrides.txt`, which are
+  reimplemented in `runtime/hle.c`:
+  - console output (`__write_console`)
+  - audio DSP init
+  - memory protection
+  - `VIWaitForRetrace`, paced at 60 Hz.
+
+  Each SDK call is logged to `build/GF7E01/sdk_trace.txt`. The MetroTRK debugger is stubbed.
+- **Jump tables:** the generator also finds them by pattern (`lis`/`addi`/`lwzx`/`mtctr`/`bctr`), not just
+  from dtk's `jumptable_` symbols. That resolves 162 more `bctr` sites.
+- **Watchdog:** a guest polling one hardware register 2,000,000 times stops with a report of the last 24
+  functions entered.
+
+## Next: milestone 2b (threads and interrupts)
+
+The boot stops at the first place the game sleeps a thread to wait for hardware. Getting further needs:
+1. **Thread switching.** `OSSaveContext`/`OSLoadContext` switch stacks with `rfi`, which compiled code can't
+   do. Run each guest thread on its own host thread or coroutine, and let only one run at a time.
+2. **Interrupt delivery** from the runtime: VI retrace (60 Hz), PE finish/token (from the GX layer),
+   DVD transfer complete, AI/DSP. These should call the SDK's own recompiled handlers (`__VIRetraceHandler`, …).
+3. **DVD reads** served from `orig/GF7E01/files` through the FST (`DVDReadAbsAsyncPrio` / the low-level layer).
+4. **A GX command stream sink** at `0xCC008000`. For now it only needs to raise the draw-done/token interrupts.
+   Real rendering comes later.
 
 ## Build
 

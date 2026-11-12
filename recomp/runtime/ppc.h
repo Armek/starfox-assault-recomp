@@ -201,6 +201,17 @@ PPC_INLINE void psq_st(Ctx *c, int s, uint32_t a, int w, int i) {
     if (!w) psq_quant(a + sz, c->f[s].ps1, type, scale);
 }
 
+/* ---- Function-entry tracing --------------------------------------------------------------------- */
+
+#define RT_TRACE_RING 256
+extern uint32_t g_trace_ring[RT_TRACE_RING]; /* last functions entered, for crash reports */
+extern uint32_t g_trace_pos;
+extern int g_trace_sdk;                      /* log every Dolphin SDK call */
+void rt_sdk_enter(Ctx *c, uint32_t addr);
+
+#define RT_ENTER(c, a) (g_trace_ring[g_trace_pos++ & (RT_TRACE_RING - 1)] = (a))
+#define RT_ENTER_SDK(c, a) do { RT_ENTER(c, a); if (g_trace_sdk) rt_sdk_enter((c), (a)); } while (0)
+
 /* ---- Runtime services used by generated code ---------------------------------------------------- */
 
 void rt_call(Ctx *c, uint32_t addr);                       /* indirect call (bctrl, blrl) */

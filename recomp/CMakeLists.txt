@@ -8,6 +8,8 @@ if(NOT EXISTS "${GENERATED_DIR}/sources.txt")
 endif()
 
 file(STRINGS "${GENERATED_DIR}/sources.txt" GENERATED_SOURCES)
+# Re-run configure whenever the generator's file list changes.
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${GENERATED_DIR}/sources.txt")
 list(TRANSFORM GENERATED_SOURCES PREPEND "${GENERATED_DIR}/")
 
 set(CMAKE_C_STANDARD 11)
@@ -16,7 +18,7 @@ if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE RelWithDebInfo)
 endif()
 
-add_executable(sfa runtime/runtime.c ${GENERATED_SOURCES})
+add_executable(sfa runtime/runtime.c runtime/hle.c ${GENERATED_SOURCES})
 target_include_directories(sfa PRIVATE runtime "${GENERATED_DIR}")
 
 if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")

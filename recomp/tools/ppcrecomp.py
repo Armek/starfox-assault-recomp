@@ -6,8 +6,10 @@ Reads the original main.dol and the function/jump-table symbols that decomp-tool
 
     void f_XXXXXXXX(Ctx *c);   // XXXXXXXX = original address
 
-Functions inside the HLE ranges (Dolphin SDK, MetroTRK) are not translated. The runtime is meant
-to reimplement them, so this script writes stubs for them in hle_stubs.c.
+Everything is translated except:
+  - functions named in recomp/runtime/hle_overrides.txt, which the runtime reimplements (HLE), and
+  - the MetroTRK debugger, which becomes logging stubs (hle_stubs.c) unless overridden.
+Dolphin SDK functions get an RT_ENTER_SDK hook so the runtime can trace calls into the SDK.
 
 Usage: python recomp/tools/ppcrecomp.py [--out build/GF7E01/recomp]
 """
@@ -21,11 +23,10 @@ from collections import defaultdict
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 VERSION = "GF7E01"
 
-# Address ranges whose functions the runtime reimplements instead of recompiling.
-HLE_RANGES = [
-    (0x8012D438, 0x8015CA04, "Dolphin SDK"),
-    (0x801E8D48, 0x801EEFA0, "MetroTRK"),
-]
+SDK_RANGE = (0x8012D438, 0x8015CA04)  # Dolphin SDK: recompiled, but traced
+STUB_RANGES = [(0x801E8D48, 0x801EEFA0, "MetroTRK")]
+HLE_LIST = os.path.join(ROOT, "recomp", "runtime", "hle_overrides.txt")
+C_IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 FUNCS_PER_FILE = 64
 
 # --------------------------------------------------------------------------------------------- input
@@ -117,9 +118,40 @@ class FuncGen:
     def __init__(self, ctx, start, size, name):
         self.ctx, self.start, self.end, self.name = ctx, start, start + size, name
         self.labels = set()
-        self.jt_targets = sorted(t for t in ctx.jt_targets if start <= t < self.end)
+        found = {t for t in ctx.jt_targets if start <= t < self.end} | self.find_jump_tables()
+        self.jt_targets = sorted(found)
         self.labels.update(self.jt_targets)
         self.unknown = 0
+
+    def find_jump_tables(self):
+        """Find `lis rT,hi; addi rT,rT,lo; ... lwzx rX,rT,rI; mtctr rX; bctr` and read the table."""
+        img, targets = self.ctx.img, set()
+        for pc in range(self.start, self.end, 4):
+            if img.word(pc) != 0x4E800420:  # bctr
+                continue
+            base_reg, table = None, None
+            for back in range(pc - 4, max(self.start, pc - 64) - 4, -4):
+                w = img.word(back)
+                op = w >> 26
+                if base_reg is None and op == 31 and (w >> 1) & 0x3FF == 23:  # lwzx
+                    base_reg = (w >> 16) & 31
+                elif base_reg is not None and op == 14 and (w >> 21) & 31 == base_reg:  # addi base, x, lo
+                    lo, src = sx16(w & 0xFFFF), (w >> 16) & 31
+                    for back2 in range(back - 4, max(self.start, back - 64) - 4, -4):
+                        w2 = img.word(back2)
+                        if w2 >> 26 == 15 and (w2 >> 21) & 31 == src and (w2 >> 16) & 31 == 0:  # lis
+                            table = (((w2 & 0xFFFF) << 16) + lo) & 0xFFFFFFFF
+                            break
+                    break
+            if table is None:
+                continue
+            for i in range(1024):
+                t = img.word(table + i * 4)
+                if t is None or not (self.start <= t < self.end) or t & 3:
+                    break
+                targets.add(t)
+            self.ctx.found_tables += 1
+        return targets
 
     # ---- control flow
     def inside(self, t):
@@ -560,6 +592,8 @@ class FuncGen:
             lines.append((pc, w, code))
             last = w
         out = [f"/* {self.name} */", f"void f_{self.start:08X}(Ctx *c) {{"]
+        sdk = SDK_RANGE[0] <= self.start < SDK_RANGE[1]
+        out.append(f"    {'RT_ENTER_SDK' if sdk else 'RT_ENTER'}(c, {hx(self.start)});")
         for pc, w, code in lines:
             if pc in self.labels:
                 out.append(f"L_{pc:08X}:;")
@@ -579,6 +613,7 @@ class Context:
         self.func_starts = {a for a, _, _, _ in funcs}
         self.jt_targets = set()
         self.unsupported = defaultdict(int)
+        self.found_tables = 0
         for addr, size in tables:
             for o in range(0, size, 4):
                 t = img.word(addr + o)
@@ -587,11 +622,18 @@ class Context:
 
 # ---------------------------------------------------------------------------------------------- main
 
-def is_hle(addr):
-    for lo, hi, _ in HLE_RANGES:
-        if lo <= addr < hi:
-            return True
-    return False
+def is_stub(addr):
+    return any(lo <= addr < hi for lo, hi, _ in STUB_RANGES)
+
+
+def load_hle_list():
+    names = set()
+    if os.path.exists(HLE_LIST):
+        for line in open(HLE_LIST, encoding="utf-8"):
+            line = line.split("#")[0].strip()
+            if line:
+                names.add(line)
+    return names
 
 
 def c_string(s):
@@ -606,10 +648,14 @@ def main():
     segs, entry, _ = load_dol(os.path.join(ROOT, "orig", VERSION, "sys", "main.dol"))
     img = Image(segs)
     funcs, tables = load_symbols(os.path.join(ROOT, "config", VERSION, "symbols.txt"))
-    ctx = Context(img, funcs, tables, HLE_RANGES)
+    ctx = Context(img, funcs, tables, STUB_RANGES)
 
-    recomp = [f for f in funcs if not is_hle(f[0])]
-    hle = [f for f in funcs if is_hle(f[0])]
+    overrides = load_hle_list()
+    missing = overrides - {n for _, _, n, _ in funcs}
+    if missing:
+        sys.exit(f"hle_overrides.txt names unknown functions: {sorted(missing)}")
+    recomp = [f for f in funcs if f[2] not in overrides and not is_stub(f[0])]
+    hle = [f for f in funcs if f[2] not in overrides and is_stub(f[0])]
     os.makedirs(args.out, exist_ok=True)
 
     with open(os.path.join(args.out, "funcs.h"), "w", newline="\n") as fh:
@@ -617,6 +663,10 @@ def main():
         for a, _, n, _ in funcs:
             fh.write(f"void f_{a:08X}(Ctx *c); /* {n} */\n")
         fh.write(f"\n#define GUEST_ENTRY 0x{entry:08X}u\n")
+        fh.write("\n/* Named access to guest functions: G_<name> is the address, F_<name> the C function. */\n")
+        for a, _, n, _ in funcs:
+            if C_IDENT.match(n):
+                fh.write(f"#define G_{n} 0x{a:08X}u\n#define F_{n} f_{a:08X}\n")
 
     total_unknown, files = 0, []
     for i in range(0, len(recomp), FUNCS_PER_FILE):
@@ -648,8 +698,9 @@ def main():
     with open(os.path.join(args.out, "sources.txt"), "w", newline="\n") as fs:
         fs.write("\n".join(files + ["hle_stubs.c", "func_table.c"]) + "\n")
 
-    print(f"functions: {len(funcs)} total, {len(recomp)} recompiled, {len(hle)} HLE stubs")
-    print(f"jump tables: {len(tables)} ({len(ctx.jt_targets)} targets)")
+    print(f"functions: {len(funcs)} total, {len(recomp)} recompiled, {len(overrides)} HLE overrides, "
+          f"{len(hle)} stubs")
+    print(f"jump tables: {len(tables)} from symbols ({len(ctx.jt_targets)} targets), {ctx.found_tables} bctr sites resolved by pattern")
     print(f"untranslated instructions: {total_unknown}")
     for k, v in sorted(ctx.unsupported.items(), key=lambda x: -x[1]):
         print(f"  {v:6}  {k}")
