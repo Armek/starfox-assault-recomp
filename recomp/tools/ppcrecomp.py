@@ -76,6 +76,8 @@ def sx16(v):
 
 
 def hx(v):
+    if isinstance(v, str):  # already a C expression (a relocated value in a REL module)
+        return v
     return f"0x{v & 0xFFFFFFFF:X}u"
 
 
@@ -136,6 +138,16 @@ class FuncGen:
                 if base_reg is None and op == 31 and (w >> 1) & 0x3FF == 23:  # lwzx
                     base_reg = (w >> 16) & 31
                 elif base_reg is not None and op == 14 and (w >> 21) & 31 == base_reg:  # addi base, x, lo
+                    rel = self.ctx.relocs.get(back) if self.ctx.relocs else None
+                    if rel is not None:  # REL module: the table is `section + addend`, entries are ADDR32 relocs
+                        for i in range(1024):
+                            e = self.ctx.data_relocs.get((rel.sec, rel.addend + i * 4))
+                            t = e.branch_target() if e is not None and e.is_code() else None
+                            if t is None or not (self.start <= t < self.end):
+                                break
+                            targets.add(t)
+                        self.ctx.found_tables += 1
+                        break
                     lo, src = sx16(w & 0xFFFF), (w >> 16) & 31
                     for back2 in range(back - 4, max(self.start, back - 64) - 4, -4):
                         w2 = img.word(back2)
@@ -178,7 +190,11 @@ class FuncGen:
         if not self.jt_targets:
             return "{ rt_jump(c, c->ctr); return; }"
         cases = " ".join(f"case {hx(t)}: goto L_{t:08X};" for t in self.jt_targets)
-        return f"switch (c->ctr) {{ {cases} default: rt_jump(c, c->ctr); return; }}"
+        sel = "c->ctr"
+        m = self.ctx.module
+        if m is not None:  # CTR holds a runtime address in the loaded module: map it to our addresses
+            sel = f"(c->ctr - g_rel[{m.index}].sec[{m.text_sec}] + {hx(m.vbase)})"
+        return f"switch ({sel}) {{ {cases} default: rt_jump(c, c->ctr); return; }}"
 
     @staticmethod
     def bc_cond(bo, bi):
@@ -195,12 +211,41 @@ class FuncGen:
             return pre + action
         return f"{pre}if ({cond}) {action}"
 
+    # ---- relocations (REL modules only)
+    def reloc_imm_insn(self, w, pc, rel):
+        """An instruction whose 16-bit immediate is patched by OSLink: use the runtime value."""
+        op = w >> 26
+        rd, ra = (w >> 21) & 31, (w >> 16) & 31
+        addr = rel.expr()
+        field = {4: f"({addr} & 0xFFFFu)", 5: f"({addr} >> 16)", 6: f"((({addr}) + 0x8000u) >> 16)"}[rel.type]
+        S, U, UH = f"(uint32_t)(int32_t)(int16_t){field}", field, f"({field} << 16)"
+        if op == 14:
+            return f"{R(rd)} = {RA0(ra)} + {S};"
+        if op == 15:
+            return f"{R(rd)} = {RA0(ra)} + {UH};"
+        if op in (24, 25, 26, 27, 28, 29):
+            opr = "|" if op in (24, 25) else "^" if op in (26, 27) else "&"
+            val = U if op in (24, 26, 28) else UH
+            return f"{R(ra)} = {R(rd)} {opr} {val};" + (f" RC0(c, {R(ra)});" if op in (28, 29) else "")
+        if 32 <= op <= 55:
+            return self.loadstore_d(op, rd, ra, S)
+        raise Unsupported(f"relocated immediate on opcode {op}")
+
+    def reloc_branch_target(self, pc, w):
+        rel = self.ctx.relocs.get(pc) if self.ctx.relocs else None
+        if rel and rel.type in (10, 11):
+            return rel.branch_target()
+        return None
+
     # ---- instruction translation
     def insn(self, w, pc):
         op = w >> 26
         rd, ra, rb, rc = (w >> 21) & 31, (w >> 16) & 31, (w >> 11) & 31, (w >> 6) & 31
         uimm, simm, Rc = w & 0xFFFF, sx16(w & 0xFFFF), w & 1
         rc0 = lambda reg: f" RC0(c, {reg});" if Rc else ""
+        rel = self.ctx.relocs.get(pc) if self.ctx.relocs else None
+        if rel and rel.type in (4, 5, 6):
+            return self.reloc_imm_insn(w, pc, rel)
 
         if op == 3:  # twi
             return self.trap(rd, R(ra), hx(simm), pc)
@@ -227,6 +272,9 @@ class FuncGen:
             bo, bi = rd, ra
             bd = sx16(w & 0xFFFC)
             t = (bd if w & 2 else pc + bd) & 0xFFFFFFFF
+            rt = self.reloc_branch_target(pc, w)
+            if rt is not None:
+                t = rt
             pre, cond = self.bc_cond(bo, bi)
             action = ("{ " + self.call(t, pc) + " }") if w & 1 else self.jump(t, pc)
             return self.branch_cond(pre, cond, action)
@@ -237,6 +285,9 @@ class FuncGen:
             if li & 0x02000000:
                 li -= 0x04000000
             t = (li if w & 2 else pc + li) & 0xFFFFFFFF
+            rt = self.reloc_branch_target(pc, w)
+            if rt is not None:
+                t = rt
             return self.call(t, pc) if w & 1 else self.jump(t, pc)
         if op == 19:
             return self.op19(w, pc)
@@ -621,12 +672,15 @@ class FuncGen:
 
 
 class Context:
-    def __init__(self, img, funcs, tables, hle):
+    def __init__(self, img, funcs, tables, hle, relocs=None, data_relocs=None, module=None):
         self.img = img
         self.func_starts = {a for a, _, _, _ in funcs}
         self.jt_targets = set()
         self.unsupported = defaultdict(int)
         self.found_tables = 0
+        self.relocs = relocs or {}            # code address -> Reloc (REL modules)
+        self.data_relocs = data_relocs or {}  # (section, offset) -> Reloc (REL modules)
+        self.module = module                  # RelModule being generated, or None for main.dol
         for addr, size in tables:
             for o in range(0, size, 4):
                 t = img.word(addr + o)
@@ -640,7 +694,7 @@ class Context:
         for a, s, _, _ in starts:
             for pc in range(a, a + s, 4):
                 w = img.word(pc)
-                if w is None or not w & 1:
+                if w is None or not w & 1 or pc in self.relocs:  # relocated calls are resolved separately
                     continue
                 op = w >> 26
                 if op == 18 and not w & 2:
@@ -678,6 +732,125 @@ def c_string(s):
     return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
+# ------------------------------------------------------------------------------------------ REL modules
+# Each module's code gets its own virtual address range so its functions have unique names and its
+# internal (unrelocated) branches resolve at generation time. Anything OSLink patches at run time
+# becomes an expression over g_rel[module].sec[section], filled in when the game links the module.
+REL_VBASE, REL_VSTRIDE = 0x90000000, 0x00400000
+REL_EXCLUDED = {"m009"}       # never loaded; built against an older main.dol (see config.yml)
+REL_IMPORT_BY_ID = {8: "m4", 11: "m8"}  # module ids other modules import from (id 11 is shared)
+
+
+class RelModule:
+    def __init__(self, name, index, data):
+        u = lambda o: struct.unpack_from(">I", data, o)[0]
+        self.name, self.index, self.data = name, index, data
+        self.id, self.nsec = u(0), u(0xC)
+        so = u(0x10)
+        self.sections = [(u(so + i * 8), u(so + i * 8 + 4)) for i in range(self.nsec)]
+        self.text_sec = next(i for i, (o, sz) in enumerate(self.sections) if o & 1 and sz)
+        self.text_off = self.sections[self.text_sec][0] & ~3
+        self.text_size = self.sections[self.text_sec][1]
+        self.vbase = REL_VBASE + index * REL_VSTRIDE
+        self.relocs, self.data_relocs, self.funcs = {}, {}, []
+
+
+class Reloc:
+    def __init__(self, rtype, target, sec, addend):
+        self.type, self.target, self.sec, self.addend = rtype, target, sec, addend  # target None = main.dol
+
+    def expr(self):
+        if self.target is None:
+            return hx(self.addend)
+        return f"(g_rel[{self.target.index}].sec[{self.sec}] + {hx(self.addend)})"
+
+    def is_code(self):
+        return self.target is None or self.sec == self.target.text_sec
+
+    def branch_target(self):
+        if self.target is None:
+            return self.addend
+        if self.sec == self.target.text_sec:
+            return self.target.vbase + self.addend
+        return None
+
+
+class RelImage:
+    def __init__(self, m):
+        self.m = m
+
+    def word(self, addr):
+        o = addr - self.m.vbase
+        if 0 <= o <= self.m.text_size - 4:
+            return struct.unpack_from(">I", self.m.data, self.m.text_off + o)[0]
+        return None
+
+
+def load_rels():
+    files = sorted(f[:-4] for f in os.listdir(os.path.join(ROOT, "orig", VERSION, "files")) if f.endswith(".rel"))
+    names = [n for n in files if n not in REL_EXCLUDED]
+    mods = [RelModule(n, i, open(os.path.join(ROOT, "orig", VERSION, "files", n + ".rel"), "rb").read())
+            for i, n in enumerate(names)]
+    by_name = {m.name: m for m in mods}
+    for m in mods:
+        d = m.data
+        u = lambda o: struct.unpack_from(">I", d, o)[0]
+        io, isz = u(0x28), u(0x2C)
+        for k in range(isz // 8):
+            mid, o = u(io + k * 8), u(io + k * 8 + 4)
+            target = None if mid == 0 else m if mid == m.id else by_name[REL_IMPORT_BY_ID[mid]]
+            sec, off = 0, 0
+            while True:
+                delta, rtype, tsec, addend = struct.unpack_from(">HBBI", d, o)
+                o += 8
+                if rtype == 203:
+                    break
+                if rtype == 202:
+                    sec, off = tsec, 0
+                    continue
+                off += delta
+                if rtype == 201:
+                    continue
+                r = Reloc(rtype, target, tsec, addend)
+                if sec == m.text_sec:
+                    m.relocs[m.vbase + (off & ~3)] = r  # ADDR16 relocs point at the field (insn + 2)
+                else:
+                    m.data_relocs[(sec, off)] = r
+        # functions: dtk's symbols, plus any code dtk left as a gap
+        found = []
+        for line in open(os.path.join(ROOT, "config", VERSION, m.name, "symbols.txt"), encoding="utf-8"):
+            x = SYM.match(line)
+            if x and x.group(4) == "function" and x.group(2) == "text" and x.group(5):
+                found.append((int(x.group(3), 16), int(x.group(5), 16), x.group(1)))
+        found.sort()
+        pos, full = 0, []
+        for off, size, name in found + [(m.text_size, 0, None)]:
+            if off > pos and any(struct.unpack_from(">I", d, m.text_off + q)[0] for q in range(pos, off, 4)):
+                full.append((pos, off - pos, f"gap_{pos:X}"))
+            if name:
+                full.append((off, size, name))
+            pos = max(pos, off + size)
+        m.funcs = [(m.vbase + off, size, f"{m.name}:{name}", "text") for off, size, name in full]
+    return mods
+
+
+def write_funcs(path, ctx, funcs, chunk_name, files):
+    unknown = 0
+    for i in range(0, len(funcs), FUNCS_PER_FILE):
+        chunk = funcs[i:i + FUNCS_PER_FILE]
+        name = f"{chunk_name}_{i // FUNCS_PER_FILE:03d}.c"
+        files.append(name)
+        with open(os.path.join(path, name), "w", newline="\n") as fc:
+            fc.write("/* Generated by recomp/tools/ppcrecomp.py - do not edit. */\n#include \"funcs.h\"\n\n")
+            for a, s, n, _ in chunk:
+                g = FuncGen(ctx, a, s, n)
+                fc.write(g.generate() + "\n\n")
+                unknown += g.unknown
+                for e in sorted(ctx.mid_entries.get(a, ())):
+                    fc.write(FuncGen(ctx, a, s, n).generate(entry=e) + "\n\n")
+    return unknown
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--out", default=os.path.join(ROOT, "build", VERSION, "recomp"))
@@ -687,6 +860,28 @@ def main():
     img = Image(segs)
     funcs, tables = load_symbols(os.path.join(ROOT, "config", VERSION, "symbols.txt"))
     ctx = Context(img, funcs, tables, STUB_RANGES)
+
+    # REL modules: one context each, all sharing the set of known function entry points
+    mods = load_rels()
+    mctx = {m.name: Context(RelImage(m), m.funcs, [], None, m.relocs, m.data_relocs, m) for m in mods}
+    import bisect
+    keys = [a for a, _, _, _ in funcs]
+    for m in mods:  # calls from modules into the middle of a main.dol function
+        for r in m.relocs.values():
+            t = r.branch_target() if r.type in (10, 11) and r.target is None else None
+            if t is None or t in ctx.func_starts:
+                continue
+            k = bisect.bisect_right(keys, t) - 1
+            if k >= 0 and funcs[k][0] < t < funcs[k][0] + funcs[k][1]:
+                ctx.mid_entries[funcs[k][0]].add(t)
+    shared = set(ctx.func_starts)
+    for es in ctx.mid_entries.values():
+        shared |= es
+    for c in mctx.values():
+        shared |= c.func_starts
+    ctx.func_starts = shared
+    for c in mctx.values():
+        c.func_starts = shared
 
     overrides = load_hle_list()
     missing = overrides - {n for _, _, n, _ in funcs}
@@ -698,31 +893,34 @@ def main():
     recomp_starts = {a for a, _, _, _ in recomp}
     extra = sorted((e, f"{n}+0x{e - a:X}") for a, _, n, _ in funcs if a in recomp_starts
                    for e in ctx.mid_entries.get(a, ()))
-    all_entries = sorted([(a, n) for a, _, n, _ in funcs] + extra)
+    mod_entries = []
+    for m in mods:
+        c = mctx[m.name]
+        for a, _, n, _ in m.funcs:
+            mod_entries.append((a, n))
+            mod_entries += [(e, f"{n}+0x{e - a:X}") for e in c.mid_entries.get(a, ())]
+    all_entries = sorted([(a, n) for a, _, n, _ in funcs] + extra + mod_entries)
 
     with open(os.path.join(args.out, "funcs.h"), "w", newline="\n") as fh:
         fh.write("/* Generated by recomp/tools/ppcrecomp.py - do not edit. */\n#pragma once\n#include \"ppc.h\"\n\n")
         for a, n in all_entries:
             fh.write(f"void f_{a:08X}(Ctx *c); /* {n} */\n")
         fh.write(f"\n#define GUEST_ENTRY 0x{entry:08X}u\n")
+        fh.write("\n/* REL modules: section addresses, filled in when the game links a module (OSNotifyLink). */\n")
+        fh.write(f"#define RT_NUM_RELS {len(mods)}\n")
+        fh.write("typedef struct { uint32_t sec[32]; uint32_t loaded; } RelRuntime;\n")
+        fh.write("extern RelRuntime g_rel[RT_NUM_RELS];\n")
+        fh.write("typedef struct { const char *name; uint32_t id, nsec, text_sec, vbase, text_size; const uint32_t *sizes; } RelInfo;\n")
+        fh.write("extern const RelInfo g_rel_info[RT_NUM_RELS];\n")
         fh.write("\n/* Named access to guest functions: G_<name> is the address, F_<name> the C function. */\n")
         for a, _, n, _ in funcs:
             if C_IDENT.match(n):
                 fh.write(f"#define G_{n} 0x{a:08X}u\n#define F_{n} f_{a:08X}\n")
 
-    total_unknown, files = 0, []
-    for i in range(0, len(recomp), FUNCS_PER_FILE):
-        chunk = recomp[i:i + FUNCS_PER_FILE]
-        name = f"recomp_{i // FUNCS_PER_FILE:03d}.c"
-        files.append(name)
-        with open(os.path.join(args.out, name), "w", newline="\n") as fc:
-            fc.write("/* Generated by recomp/tools/ppcrecomp.py - do not edit. */\n#include \"funcs.h\"\n\n")
-            for a, s, n, _ in chunk:
-                g = FuncGen(ctx, a, s, n)
-                fc.write(g.generate() + "\n\n")
-                total_unknown += g.unknown
-                for e in sorted(ctx.mid_entries.get(a, ())):
-                    fc.write(FuncGen(ctx, a, s, n).generate(entry=e) + "\n\n")
+    files = []
+    total_unknown = write_funcs(args.out, ctx, recomp, "recomp", files)
+    for m in mods:
+        total_unknown += write_funcs(args.out, mctx[m.name], m.funcs, f"rel_{m.name}", files)
 
     with open(os.path.join(args.out, "hle_stubs.c"), "w", newline="\n") as fc:
         fc.write("/* Generated by recomp/tools/ppcrecomp.py - do not edit.\n"
@@ -737,17 +935,34 @@ def main():
         fc.write(f"const unsigned g_func_count = {len(all_entries)};\nconst FuncEntry g_funcs[] = {{\n")
         for a, n in all_entries:
             fc.write(f"    {{ 0x{a:08X}u, f_{a:08X}, {c_string(n)} }},\n")
-        fc.write("};\n")
+        fc.write("};\n\n")
+        # module descriptions, used to recognise a module when the game links it
+        for m in mods:
+            fc.write(f"static const uint32_t sizes_{m.index}[] = {{ {', '.join(str(sz) for _, sz in m.sections)} }};\n")
+        fc.write("const RelInfo g_rel_info[RT_NUM_RELS] = {\n")
+        for m in mods:
+            fc.write(f"    {{ {c_string(m.name)}, {m.id}, {m.nsec}, {m.text_sec}, {hx(m.vbase)}, {m.text_size}, sizes_{m.index} }},\n")
+        fc.write("};\nRelRuntime g_rel[RT_NUM_RELS];\n")
 
     with open(os.path.join(args.out, "sources.txt"), "w", newline="\n") as fs:
         fs.write("\n".join(files + ["hle_stubs.c", "func_table.c"]) + "\n")
 
-    print(f"functions: {len(funcs)} total, {len(recomp)} recompiled, {len(overrides)} HLE overrides, "
-          f"{len(hle)} stubs")
-    print(f"jump tables: {len(tables)} from symbols ({len(ctx.jt_targets)} targets), {ctx.found_tables} bctr sites resolved by pattern")
-    print(f"extra entry points (calls into the middle of a function): {len(extra)}")
+    nrel_funcs = sum(len(m.funcs) for m in mods)
+    print(f"functions: {len(funcs)} in main.dol ({len(recomp)} recompiled, {len(overrides)} HLE overrides, "
+          f"{len(hle)} stubs), {nrel_funcs} in {len(mods)} REL modules")
+    print(f"REL relocations: {sum(len(m.relocs) for m in mods)} in code, "
+          f"{sum(len(m.data_relocs) for m in mods)} in data")
+    found = ctx.found_tables + sum(c.found_tables for c in mctx.values())
+    print(f"jump tables: {len(tables)} from symbols ({len(ctx.jt_targets)} targets), "
+          f"{found} bctr sites resolved by pattern")
+    nmid = len(extra) + sum(len(e) for c in mctx.values() for e in c.mid_entries.values())
+    print(f"extra entry points (calls into the middle of a function): {nmid}")
+    unsupported = defaultdict(int)
+    for c in [ctx] + list(mctx.values()):
+        for k, v in c.unsupported.items():
+            unsupported[k] += v
     print(f"untranslated instructions: {total_unknown}")
-    for k, v in sorted(ctx.unsupported.items(), key=lambda x: -x[1]):
+    for k, v in sorted(unsupported.items(), key=lambda x: -x[1]):
         print(f"  {v:6}  {k}")
     print(f"wrote {len(files)} source files to {args.out}")
 

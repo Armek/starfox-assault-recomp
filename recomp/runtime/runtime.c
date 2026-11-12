@@ -62,7 +62,18 @@ void rt_console_putc(char ch) { fputc(ch, stdout); if (ch == '\n') fflush(stdout
 
 /* ---- function lookup --------------------------------------------------------------------------- */
 
+/* A runtime address inside a linked REL module's code -> the address its code was generated at. */
+static uint32_t rel_to_generated(uint32_t addr) {
+    for (unsigned i = 0; i < RT_NUM_RELS; i++) {
+        const RelInfo *ri = &g_rel_info[i];
+        uint32_t base = g_rel[i].sec[ri->text_sec];
+        if (g_rel[i].loaded && addr >= base && addr < base + ri->text_size) return addr - base + ri->vbase;
+    }
+    return addr;
+}
+
 static const FuncEntry *find_func(uint32_t addr) {
+    if (addr >= 0x80000000u) addr = rel_to_generated(addr);
     unsigned lo = 0, hi = g_func_count;
     while (lo < hi) {
         unsigned mid = (lo + hi) / 2;
@@ -72,6 +83,32 @@ static const FuncEntry *find_func(uint32_t addr) {
     return NULL;
 }
 
+/* OSNotifyLink(OSModuleInfo *module): called by the SDK's Link() once a module is relocated.
+ * Its section table now holds absolute addresses (and the bss address). Record them so the
+ * module's generated code can compute every relocated address. */
+static void rel_notify(Ctx *c, int linked) {
+    uint32_t m = c->r[3], id = rd32(m), nsec = rd32(m + 0xC), si = rd32(m + 0x10);
+    for (unsigned i = 0; i < RT_NUM_RELS; i++) {
+        const RelInfo *ri = &g_rel_info[i];
+        if (ri->id != id || ri->nsec != nsec) continue;
+        int match = 1;
+        for (uint32_t k = 0; k < nsec && match; k++) match = rd32(si + k * 8 + 4) == ri->sizes[k];
+        if (!match) continue;
+        if (linked) {
+            for (uint32_t k = 0; k < nsec && k < 32; k++) g_rel[i].sec[k] = rd32(si + k * 8) & ~3u;
+            g_rel[i].loaded = 1;
+            printf("[rel] linked %s: text 0x%08X, %u sections\n", ri->name, g_rel[i].sec[ri->text_sec], nsec);
+        } else {
+            g_rel[i].loaded = 0;
+            printf("[rel] unlinked %s\n", ri->name);
+        }
+        return;
+    }
+    rt_fatal("OSNotify%sLink: unknown module id %u with %u sections", linked ? "" : "Un", id, nsec);
+}
+HLE(OSNotifyLink) { rel_notify(c, 1); }
+HLE(OSNotifyUnlink) { rel_notify(c, 0); }
+
 const char *rt_func_name(uint32_t addr) {
     const FuncEntry *e = find_func(addr);
     return e ? e->name : "?";
@@ -79,6 +116,7 @@ const char *rt_func_name(uint32_t addr) {
 
 /* Name of the function containing addr (for return addresses). */
 static const char *func_containing(uint32_t addr) {
+    if (addr >= 0x80000000u) addr = rel_to_generated(addr);
     unsigned lo = 0, hi = g_func_count;
     while (lo < hi) {
         unsigned mid = (lo + hi) / 2;
@@ -214,6 +252,9 @@ static void aram_dma(void) {
     uint32_t cnt = (uint32_t)mmio_get(0x5028, 4);
     uint32_t len = cnt & 0x03FFFFE0u;
     if (!g_aram) g_aram = calloc(1, ARAM_SIZE);
+    if (getenv("SFA_GX_DEBUG"))
+        printf("[aram] %s main %08X aram %08X len 0x%X\n", cnt & 0x80000000u ? "ARAM->main" : "main->ARAM",
+               0x80000000u | mm, ar, len);
     for (uint32_t i = 0; i < len; i++) {
         uint32_t a = (ar + i) & (ARAM_SIZE - 1), m = 0x80000000u | (mm + i);
         if (!ppc_is_ram(m)) rt_fatal("ARAM DMA outside main RAM: 0x%08X", m);

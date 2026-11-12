@@ -8,27 +8,40 @@
 #define EFB_WIDTH 640
 #define EFB_HEIGHT 528
 
-/* One vertex after CPU transform: clip-space position, color, texture coordinate. */
+/* One vertex after CPU transform: clip-space position, both color channels, eight texcoords. */
 typedef struct {
     float x, y, z, w;
-    float r, g, b, a;
-    float s, t;
+    float c0[4], c1[4];
+    float uv[8][2];
 } GxVertex;
 
 typedef enum { GX_PRIM_TRIANGLES, GX_PRIM_LINES, GX_PRIM_POINTS } GxPrimKind;
 
-/* Render state for one batch of triangles. */
+/* The TEV configuration: everything that decides the generated fragment shader. The renderer
+ * caches one GL program per distinct value (compared bytewise, so keep unused fields zeroed). */
 typedef struct {
-    uint32_t texture;       /* GxTexture id, 0 = none */
-    uint8_t tex_wrap_s, tex_wrap_t, tex_linear;
+    uint32_t color_env[16]; /* BP 0xC0 + 2i: d, c, b, a, bias, sub, clamp, scale, dest */
+    uint32_t alpha_env[16]; /* BP 0xC1 + 2i: swaps, d, c, b, a, bias, sub, clamp, scale, dest */
+    uint32_t tref[8];       /* BP 0x28-0x2F: per stage pair texmap, texcoord, enable, channel */
+    uint32_t ksel[8];       /* BP 0xF6-0xFD: swap tables and konst selectors */
+    uint32_t alpha_cmp;     /* BP 0xF3 compare functions and logic (refs are uniforms) */
+    uint8_t nstages;
+    uint8_t pad[3];
+} GxTevConfig;
+
+/* Render state for one batch. */
+typedef struct {
+    GxTevConfig tev;
+    float konst[4][4];       /* konst colors K0-K3 */
+    float reg[4][4];         /* TEV registers PREV, C0, C1, C2 (initial values) */
+    float alpha_ref[2];
+    uint32_t texture[8];     /* GxTexture id per texture map, 0 = none */
+    uint8_t wrap_s[8], wrap_t[8], linear[8];
     uint8_t blend_enable, blend_src, blend_dst, blend_sub, logic_op;
     uint8_t color_update, alpha_update;
     uint8_t z_enable, z_func, z_update;
     uint8_t cull;            /* 0 none, 1 front (cw), 2 back (ccw), 3 all */
-    uint8_t tev_mode;        /* 0 = color only, 1 = texture * color, 2 = texture only */
     uint16_t scissor[4];     /* x0, y0, x1, y1 in EFB pixels (inclusive) */
-    uint8_t alpha_test;      /* 1 = discard alpha < alpha_ref */
-    float alpha_ref;
 } GxState;
 
 typedef struct {

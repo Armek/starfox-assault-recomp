@@ -202,29 +202,73 @@ static uint32_t texture_for_map(int n) {
     GxTextureUpload *u = &f->uploads[f->nuploads++];
     u->id = e->id; u->width = w; u->height = h;
     u->rgba = decode_texture(addr, fmt, w, h, pal, tlut_fmt);
+    if (getenv("SFA_GX_DEBUG")) {
+        uint32_t nz = 0;
+        for (uint32_t q = 0; q < size && q < 4096; q++) nz += rd8(addr + q) != 0;
+        printf("[gx-tex] frame %u id %u addr %08X fmt %u %ux%u tlut %03X/%u nonzero %u/%u\n", g_frame_number, e->id, addr,
+               fmt, w, h, tlut & 0x3FF, tlut_fmt, nz, size < 4096 ? size : 4096);
+        char path[256];
+        snprintf(path, sizeof path, "build/GF7E01/textures/tex_%04u_%08X_f%u_%ux%u.bmp", e->id, addr, fmt, w, h);
+        FILE *fp = fopen(path, "wb");
+        if (fp) { /* 32-bit BMP, top-down */
+            uint32_t sz = w * h * 4, v;
+            uint8_t hdr[54] = {'B', 'M'};
+            v = 54 + sz; memcpy(hdr + 2, &v, 4);
+            v = 54; memcpy(hdr + 10, &v, 4);
+            v = 40; memcpy(hdr + 14, &v, 4);
+            memcpy(hdr + 18, &w, 4);
+            int32_t nh = -(int32_t)h; memcpy(hdr + 22, &nh, 4);
+            hdr[26] = 1; hdr[28] = 32;
+            fwrite(hdr, 1, 54, fp);
+            for (uint32_t i = 0; i < w * h; i++) {
+                uint8_t *px = u->rgba + i * 4, bgra[4] = {px[2], px[1], px[0], px[3]};
+                fwrite(bgra, 1, 4, fp);
+            }
+            fclose(fp);
+        }
+    }
     return e->id;
 }
 
 /* ---- render state ------------------------------------------------------------------------------ */
-static void current_state(GxState *s, int *texcoord_out) {
+/* TEV registers and konst colors share BP 0xE0-0xE7 (bit 23 selects which); RA then BG per index. */
+static float g_tevreg[4][4], g_konst[4][4];
+
+static void tev_color_write(uint32_t reg, uint32_t val) {
+    int idx = (int)(reg - 0xE0) >> 1, bg = (reg - 0xE0) & 1, konst = (val >> 23) & 1;
+    float (*dst)[4] = konst ? g_konst : g_tevreg;
+    float lo, hi;
+    if (konst) { lo = (val & 0xFF) / 255.f; hi = ((val >> 12) & 0xFF) / 255.f; }
+    else { lo = ((int32_t)(val << 21) >> 21) / 255.f; hi = ((int32_t)((val >> 12) << 21) >> 21) / 255.f; }
+    if (!bg) { dst[idx][0] = lo; dst[idx][3] = hi; } /* RA: red, alpha */
+    else { dst[idx][2] = lo; dst[idx][1] = hi; }     /* BG: blue, green */
+}
+
+static void current_state(GxState *s) {
     memset(s, 0, sizeof *s);
-    uint32_t tref = bp[0x28];
-    int tex_enable = (tref >> 6) & 1, map = tref & 7;
-    *texcoord_out = (tref >> 3) & 7;
-    uint32_t cc = bp[0xC0]; /* TEV stage 0 color combiner: d c b a in 4-bit fields */
-    int args[4] = {(int)(cc >> 12) & 15, (int)(cc >> 8) & 15, (int)(cc >> 4) & 15, (int)cc & 15};
-    int uses_tex = 0, uses_ras = 0;
-    for (int i = 0; i < 4; i++) {
-        if (args[i] == 8 || args[i] == 9) uses_tex = 1;
-        if (args[i] == 10 || args[i] == 11) uses_ras = 1;
+    GxTevConfig *t = &s->tev;
+    t->nstages = (uint8_t)(((bp[0x00] >> 10) & 15) + 1);
+    for (int i = 0; i < t->nstages; i++) {
+        t->color_env[i] = bp[0xC0 + 2 * i] & 0xFFFFFF;
+        t->alpha_env[i] = bp[0xC1 + 2 * i] & 0xFFFFFF;
     }
-    if (tex_enable && uses_tex) {
-        s->texture = texture_for_map(map);
+    for (int i = 0; i < (t->nstages + 1) / 2; i++) t->tref[i] = bp[0x28 + i] & 0xFFFFFF;
+    for (int i = 0; i < 8; i++) t->ksel[i] = bp[0xF6 + i] & 0xFFFFFF;
+    t->alpha_cmp = bp[0xF3] & 0xFF0000;
+    s->alpha_ref[0] = (bp[0xF3] & 0xFF) / 255.f;
+    s->alpha_ref[1] = ((bp[0xF3] >> 8) & 0xFF) / 255.f;
+    memcpy(s->konst, g_konst, sizeof s->konst);
+    memcpy(s->reg, g_tevreg, sizeof s->reg);
+    /* textures referenced by enabled stages */
+    for (int i = 0; i < t->nstages; i++) {
+        uint32_t tr = (t->tref[i / 2] >> ((i & 1) * 12)) & 0xFFF;
+        int map = tr & 7;
+        if (!((tr >> 6) & 1) || s->texture[map]) continue;
+        s->texture[map] = texture_for_map(map);
         uint32_t mode0 = bp[map < 4 ? 0x80 + map : 0xA0 + (map - 4)];
-        s->tex_wrap_s = mode0 & 3;
-        s->tex_wrap_t = (mode0 >> 2) & 3;
-        s->tex_linear = (mode0 >> 4) & 1;
-        s->tev_mode = uses_ras ? 1 : 2;
+        s->wrap_s[map] = mode0 & 3;
+        s->wrap_t[map] = (mode0 >> 2) & 3;
+        s->linear[map] = (mode0 >> 4) & 1;
     }
     uint32_t bm = bp[0x41];
     s->blend_enable = bm & 1;
@@ -247,21 +291,15 @@ static void current_state(GxState *s, int *texcoord_out) {
     if (y1 > EFB_HEIGHT - 1) y1 = EFB_HEIGHT - 1;
     if (x1 < x0 || y1 < y0) { x0 = y0 = 0; x1 = EFB_WIDTH - 1; y1 = EFB_HEIGHT - 1; }
     s->scissor[0] = (uint16_t)x0; s->scissor[1] = (uint16_t)y0; s->scissor[2] = (uint16_t)x1; s->scissor[3] = (uint16_t)y1;
-    uint32_t ac = bp[0xF3];
-    int comp0 = (ac >> 16) & 7, ref0 = ac & 0xFF;
-    if ((comp0 == 4 || comp0 == 6) && ref0 > 0) { /* GREATER / GEQUAL */
-        s->alpha_test = 1;
-        s->alpha_ref = (ref0 + (comp0 == 4 ? 1 : 0)) / 255.0f;
-    }
 }
 
 /* ---- vertex decoding --------------------------------------------------------------------------- */
 typedef struct {
     float pos[3];
-    float col[4];
+    float col[2][4];
     float tex[8][2];
     int pnmtx, texmtx[8];
-    int has_col;
+    int has_col[2];
 } RawVertex;
 
 /* Inline vertex data that arrived through the write-gather pipe lives in a host buffer; it is
@@ -373,13 +411,12 @@ static void read_vertex(const VtxFormat *f, uint32_t *p, RawVertex *v) {
         if (f->nrm >= 2 && f->nrm_cnt && f->nrm_idx3) *p += 3 * (f->nrm == 2 ? 1 : 2);
         else attr_addr(f->nrm, 1, p, comps * k_comp_size[f->nrm_fmt]);
     }
-    v->has_col = 0;
     for (int i = 0; i < 2; i++) {
+        v->has_col[i] = 0;
         if (!f->col[i]) continue;
         uint32_t a = attr_addr(f->col[i], 2 + i, p, k_color_size[f->col_fmt[i]]);
-        float c[4];
-        read_color(&a, f->col_fmt[i], c);
-        if (i == 0) { memcpy(v->col, c, sizeof c); v->has_col = 1; }
+        read_color(&a, f->col_fmt[i], v->col[i]);
+        v->has_col[i] = 1;
     }
     for (int i = 0; i < 8; i++) {
         if (!f->tex[i]) continue;
@@ -394,8 +431,24 @@ static void unpack_color(uint32_t rgba, float *c) {
     c[0] = (rgba >> 24) / 255.f; c[1] = ((rgba >> 16) & 255) / 255.f; c[2] = ((rgba >> 8) & 255) / 255.f; c[3] = (rgba & 255) / 255.f;
 }
 
-/* Position -> clip space (via the position matrix, projection and viewport); color; texcoord. */
-static void transform(const RawVertex *v, int texcoord, GxVertex *o) {
+/* Color channel ch (0/1), color or alpha part, from XF channel control (no per-light model yet:
+ * lit channels get the material color scaled by ambient plus a fixed directional estimate). */
+static float channel(const RawVertex *v, int ch, int alpha_part, int comp) {
+    uint32_t ctrl = xf[(alpha_part ? 0x1010 : 0x100E) + ch];
+    float mat[4], amb[4];
+    unpack_color(xf[0x100C + ch], mat);
+    unpack_color(xf[0x100A + ch], amb);
+    int vtx = ctrl & 1, light = (ctrl >> 1) & 1, amb_vtx = (ctrl >> 6) & 1;
+    int src = ch < 2 && v->has_col[ch] ? ch : (v->has_col[0] ? 0 : -1);
+    float m = vtx && src >= 0 ? v->col[src][comp] : mat[comp];
+    if (!light) return m;
+    float a = amb_vtx && src >= 0 ? v->col[src][comp] : amb[comp];
+    float lit = a + 0.6f;
+    return m * (lit > 1.f ? 1.f : lit);
+}
+
+/* Position -> clip space (via the position matrix, projection and viewport); colors; texcoords. */
+static void transform(const RawVertex *v, GxVertex *o) {
     uint32_t m = (uint32_t)v->pnmtx * 4;
     float x = v->pos[0], y = v->pos[1], z = v->pos[2];
     float vx = xff(m + 0) * x + xff(m + 1) * y + xff(m + 2) * z + xff(m + 3);
@@ -414,38 +467,39 @@ static void transform(const RawVertex *v, int texcoord, GxVertex *o) {
     o->z = wz * 2.0f - cw;
     o->w = cw;
 
-    /* color channel 0: material register or vertex color (lighting not modelled yet) */
-    float mat[4], col[4];
-    unpack_color(xf[0x100C], mat);
-    memcpy(col, mat, sizeof col);
-    if ((xf[0x100E] & 1) && v->has_col) memcpy(col, v->col, 3 * sizeof(float));
-    if ((xf[0x1010] & 1) && v->has_col) col[3] = v->col[3];
-    o->r = col[0]; o->g = col[1]; o->b = col[2]; o->a = col[3];
-
-    /* texture coordinate `texcoord`: texgen source row, then its texture matrix */
-    uint32_t tg = xf[0x1040 + texcoord];
-    int src_row = (tg >> 7) & 31, proj = (tg >> 1) & 1;
-    float in[4] = {0, 0, 1, 1};
-    if (src_row == 0) { in[0] = x; in[1] = y; in[2] = z; }
-    else if (src_row >= 5 && src_row <= 12) { in[0] = v->tex[src_row - 5][0]; in[1] = v->tex[src_row - 5][1]; }
-    if (!((tg >> 2) & 1)) in[2] = 1; /* AB11 */
-    uint32_t tm = (uint32_t)v->texmtx[texcoord] * 4;
-    float s = xff(tm + 0) * in[0] + xff(tm + 1) * in[1] + xff(tm + 2) * in[2] + xff(tm + 3);
-    float t = xff(tm + 4) * in[0] + xff(tm + 5) * in[1] + xff(tm + 6) * in[2] + xff(tm + 7);
-    if (proj) {
-        float q = xff(tm + 8) * in[0] + xff(tm + 9) * in[1] + xff(tm + 10) * in[2] + xff(tm + 11);
-        if (q != 0) { s /= q; t /= q; }
+    for (int k = 0; k < 3; k++) {
+        o->c0[k] = channel(v, 0, 0, k);
+        o->c1[k] = channel(v, 1, 0, k);
     }
-    o->s = s;
-    o->t = t;
+    o->c0[3] = channel(v, 0, 1, 3);
+    o->c1[3] = channel(v, 1, 1, 3);
+
+    /* texture coordinates: each texgen's source row, then its texture matrix */
+    uint32_t ntexgen = xf[0x103F] & 15;
+    for (uint32_t tc = 0; tc < 8; tc++) {
+        if (tc >= ntexgen) { o->uv[tc][0] = o->uv[tc][1] = 0; continue; }
+        uint32_t tg = xf[0x1040 + tc];
+        int src_row = (tg >> 7) & 31, proj = (tg >> 1) & 1;
+        float in[4] = {0, 0, 1, 1};
+        if (src_row == 0) { in[0] = x; in[1] = y; in[2] = z; }
+        else if (src_row >= 5 && src_row <= 12) { in[0] = v->tex[src_row - 5][0]; in[1] = v->tex[src_row - 5][1]; }
+        if (!((tg >> 2) & 1)) in[2] = 1; /* AB11 */
+        uint32_t tm = (uint32_t)v->texmtx[tc] * 4;
+        float s_ = xff(tm + 0) * in[0] + xff(tm + 1) * in[1] + xff(tm + 2) * in[2] + xff(tm + 3);
+        float t_ = xff(tm + 4) * in[0] + xff(tm + 5) * in[1] + xff(tm + 6) * in[2] + xff(tm + 7);
+        if (proj) {
+            float q = xff(tm + 8) * in[0] + xff(tm + 9) * in[1] + xff(tm + 10) * in[2] + xff(tm + 11);
+            if (q != 0) { s_ /= q; t_ /= q; }
+        }
+        o->uv[tc][0] = s_;
+        o->uv[tc][1] = t_;
+    }
 }
 
-static void emit(GxPrimKind kind, const GxVertex *vs, const uint32_t *idx, uint32_t n) {
+static void emit(GxPrimKind kind, const GxState *stp, const GxVertex *vs, const uint32_t *idx, uint32_t n) {
     if (!n) return;
     GxFrame *f = frame();
-    GxState st;
-    int tc;
-    current_state(&st, &tc);
+    const GxState st = *stp;
     GxBatch *last = f->nbatches ? &f->batches[f->nbatches - 1] : NULL;
     if (!last || last->kind != kind || memcmp(&last->state, &st, sizeof st) || last->first + last->count != f->nverts ||
         (f->nclears && f->clears[f->nclears - 1].at_batch == f->nbatches)) {
@@ -463,12 +517,30 @@ static void emit(GxPrimKind kind, const GxVertex *vs, const uint32_t *idx, uint3
     last->count += n;
 }
 
+/* SFA_GX_DEBUG=1: print each distinct draw configuration once (for finding unhandled GX features). */
+static void debug_draw_config(void) {
+    static int enabled = -1;
+    static uint32_t seen[512];
+    static unsigned nseen;
+    if (enabled < 0) enabled = getenv("SFA_GX_DEBUG") != NULL;
+    if (!enabled) return;
+    uint32_t tref = bp[0x28], map = tref & 7;
+    uint32_t img0 = bp[map < 4 ? 0x88 + map : 0xA8 + (map - 4)], img3 = bp[map < 4 ? 0x94 + map : 0xB4 + (map - 4)];
+    uint32_t nstages = ((bp[0x00] >> 10) & 15) + 1, ntex = bp[0x00] & 15;
+    uint32_t key = fnv((const uint8_t *)&bp[0xC0], 8, 2166136261u) ^ (tref * 31) ^ (nstages << 24) ^ (img0 >> 20) * 977 ^ (bp[0xC0 + 2] * 7);
+    for (unsigned i = 0; i < nseen; i++) if (seen[i] == key) return;
+    if (nseen < 512) seen[nseen++] = key;
+    printf("[gx-cfg] frame %u stages=%u ntex=%u tref0=%03X C0=%06X A0=%06X C1=%06X A1=%06X tex fmt=%u %ux%u addr=%08X kc=%06X\n",
+           g_frame_number, nstages, ntex, tref & 0xFFF, bp[0xC0], bp[0xC1], bp[0xC2], bp[0xC3], (img0 >> 20) & 15, (img0 & 0x3FF) + 1,
+           ((img0 >> 10) & 0x3FF) + 1, (img3 & 0xFFFFFF) << 5, bp[0xF6]);
+}
+
 static void draw(uint8_t opcode, uint32_t p, uint32_t count) {
+    debug_draw_config();
     VtxFormat fmt;
     vtx_format(opcode & 7, &fmt);
     GxState st;
-    int texcoord;
-    current_state(&st, &texcoord);
+    current_state(&st);
     static GxVertex *vs;
     static uint32_t *idx, cap;
     if (count * 6 > cap) {
@@ -480,7 +552,7 @@ static void draw(uint8_t opcode, uint32_t p, uint32_t count) {
         RawVertex rv;
         memset(&rv, 0, sizeof rv);
         read_vertex(&fmt, &p, &rv);
-        transform(&rv, texcoord, &vs[i]);
+        transform(&rv, &vs[i]);
     }
     uint32_t n = 0;
     GxPrimKind kind = GX_PRIM_TRIANGLES;
@@ -503,7 +575,7 @@ static void draw(uint8_t opcode, uint32_t p, uint32_t count) {
     case 0xB0: kind = GX_PRIM_LINES; for (uint32_t i = 0; i + 1 < count; i++) { idx[n++] = i; idx[n++] = i + 1; } break;
     default: kind = GX_PRIM_POINTS; for (uint32_t i = 0; i < count; i++) idx[n++] = i; break;
     }
-    emit(kind, vs, idx, n);
+    emit(kind, &st, vs, idx, n);
     g_stat_draws++;
 }
 
@@ -512,6 +584,9 @@ static void efb_copy(uint32_t v) {
     uint32_t tl = bp[0x49], wh = bp[0x4A];
     int x = (int)(tl & 0x3FF), y = (int)((tl >> 10) & 0x3FF), w = (int)(wh & 0x3FF) + 1, h = (int)((wh >> 10) & 0x3FF) + 1;
     int to_xfb = (v >> 14) & 1, clear = (v >> 11) & 1;
+    if (!to_xfb && getenv("SFA_GX_DEBUG"))
+        printf("[gx-copy] frame %u EFB (%d,%d %dx%d) -> texture %08X fmt %u half %u\n", g_frame_number, x, y, w, h,
+               0x80000000u | ((bp[0x4B] & 0xFFFFFF) << 5), (v >> 4) & 15 | ((v >> 3) & 1) << 4, (v >> 9) & 1);
     if (to_xfb) {
         GxFrame *f = frame();
         f->copy_rect[0] = (uint16_t)x; f->copy_rect[1] = (uint16_t)y; f->copy_rect[2] = (uint16_t)w; f->copy_rect[3] = (uint16_t)h;
@@ -539,6 +614,9 @@ static void bp_write(uint32_t word) {
     bp[reg] = (bp[reg] & ~bp_mask) | (val & bp_mask);
     bp_mask = 0xFFFFFF;
     switch (reg) {
+    case 0xE0: case 0xE1: case 0xE2: case 0xE3: case 0xE4: case 0xE5: case 0xE6: case 0xE7:
+        tev_color_write(reg, val);
+        break;
     case 0x47: case 0x48: /* PE token: GXReadDrawSync reads it back from PE_TOKEN */
         rt_mmio_set(0x100E, val & 0xFFFF, 2);
         break;

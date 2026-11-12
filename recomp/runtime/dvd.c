@@ -122,7 +122,7 @@ static void disc_read(uint32_t offset, uint32_t dest, uint32_t len) {
         uint64_t hi64 = (uint64_t)offset + len < (uint64_t)df->offset + df->size ? (uint64_t)offset + len
                                                                                    : (uint64_t)df->offset + df->size;
         if (lo >= hi64) continue;
-        if (g_reads <= 200)
+        if (g_reads <= 5000)
             printf("[dvd] read %s +0x%X (%u bytes) -> %08X\n", df->path, lo - df->offset, (unsigned)(hi64 - lo), dest);
         FILE *f = fopen(df->path, "rb");
         if (!f) rt_fatal("cannot open %s", df->path);

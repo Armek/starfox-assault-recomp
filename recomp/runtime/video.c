@@ -8,6 +8,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdarg.h>
+#include <stddef.h>
 #include <SDL.h>
 #include "gx.h"
 #include "runtime.h"
@@ -43,6 +45,7 @@ typedef ptrdiff_t GLsizeiptr, GLintptr;
     X(void, glAttachShader, GLuint, GLuint) X(void, glLinkProgram, GLuint) X(void, glUseProgram, GLuint) \
     X(GLint, glGetUniformLocation, GLuint, const GLchar *) X(void, glUniform1i, GLint, GLint) \
     X(void, glUniform1f, GLint, GLfloat) X(void, glGenBuffers, GLsizei, GLuint *) \
+    X(void, glUniform4fv, GLint, GLsizei, const GLfloat *) X(void, glUniform2f, GLint, GLfloat, GLfloat) \
     X(void, glBindBuffer, GLenum, GLuint) X(void, glBufferData, GLenum, GLsizeiptr, const void *, GLenum) \
     X(void, glGenVertexArrays, GLsizei, GLuint *) X(void, glBindVertexArray, GLuint) \
     X(void, glEnableVertexAttribArray, GLuint) \
@@ -217,6 +220,10 @@ static void free_frame(GxFrame *f) {
 }
 
 void video_submit(GxFrame *frame) {
+    if (!g_qlock) { /* --no-video: nothing renders, drop the frame */
+        free_frame(frame);
+        return;
+    }
     SDL_LockMutex(g_qlock);
     if (g_pending_frame) { /* renderer is behind: keep its uploads, drop the old frame's draws */
         GxFrame *old = g_pending_frame;
@@ -237,27 +244,149 @@ void video_submit(GxFrame *frame) {
 
 /* ---- renderer --------------------------------------------------------------------------------- */
 static SDL_Window *g_window;
-static GLuint g_prog, g_vao, g_vbo, g_efb_fbo, g_efb_color, g_efb_depth;
-static GLint g_u_mode, g_u_alpha_test, g_u_alpha_ref;
+static GLuint g_vao, g_vbo, g_efb_fbo, g_efb_color, g_efb_depth, g_white;
 static GLuint *g_textures; /* GxTexture id -> GL name */
 static uint32_t g_ntextures;
 
+/* ---- TEV: one generated fragment shader per distinct GxTevConfig ------------------------------- */
 static const char *k_vs =
     "#version 330 core\n"
-    "layout(location=0) in vec4 pos; layout(location=1) in vec4 col; layout(location=2) in vec2 uv;\n"
-    "out vec4 v_col; out vec2 v_uv;\n"
-    "void main() { gl_Position = pos; v_col = col; v_uv = uv; }\n";
-static const char *k_fs =
-    "#version 330 core\n"
-    "in vec4 v_col; in vec2 v_uv; out vec4 o;\n"
-    "uniform sampler2D tex; uniform int mode; uniform int alpha_test; uniform float alpha_ref;\n"
-    "void main() {\n"
-    "  vec4 c = v_col;\n"
-    "  if (mode == 1) c = texture(tex, v_uv) * v_col;\n"
-    "  else if (mode == 2) c = texture(tex, v_uv);\n"
-    "  if (alpha_test == 1 && c.a < alpha_ref) discard;\n"
-    "  o = c;\n"
-    "}\n";
+    "layout(location=0) in vec4 pos; layout(location=1) in vec4 c0; layout(location=2) in vec4 c1;\n"
+    "layout(location=3) in vec2 t0; layout(location=4) in vec2 t1; layout(location=5) in vec2 t2;\n"
+    "layout(location=6) in vec2 t3; layout(location=7) in vec2 t4; layout(location=8) in vec2 t5;\n"
+    "layout(location=9) in vec2 t6; layout(location=10) in vec2 t7;\n"
+    "out vec4 v_c0, v_c1; out vec2 v_t0, v_t1, v_t2, v_t3, v_t4, v_t5, v_t6, v_t7;\n"
+    "void main() { gl_Position = pos; v_c0 = c0; v_c1 = c1; v_t0 = t0; v_t1 = t1; v_t2 = t2; v_t3 = t3;\n"
+    "  v_t4 = t4; v_t5 = t5; v_t6 = t6; v_t7 = t7; }\n";
+
+typedef struct {
+    GxTevConfig cfg;
+    GLuint prog;
+    GLint u_konst, u_reg, u_aref;
+} TevProgram;
+static TevProgram *g_progs;
+static unsigned g_nprogs, g_cap_progs;
+
+typedef struct { char *p; size_t n, cap; } Str;
+static void sadd(Str *s, const char *fmt, ...) {
+    va_list ap;
+    for (;;) {
+        va_start(ap, fmt);
+        int k = vsnprintf(s->p + s->n, s->cap - s->n, fmt, ap);
+        va_end(ap);
+        if (k >= 0 && (size_t)k < s->cap - s->n) { s->n += (size_t)k; return; }
+        s->cap = s->cap ? s->cap * 2 : 8192;
+        s->p = realloc(s->p, s->cap);
+    }
+}
+
+static const char *k_color_in[16] = {"prev.rgb", "prev.aaa", "r0.rgb", "r0.aaa", "r1.rgb", "r1.aaa", "r2.rgb", "r2.aaa",
+                                     "tx.rgb", "tx.aaa", "ras.rgb", "ras.aaa", "vec3(1.0)", "vec3(0.5)", "kc", "vec3(0.0)"};
+static const char *k_alpha_in[8] = {"prev.a", "r0.a", "r1.a", "r2.a", "tx.a", "ras.a", "ka", "0.0"};
+static const char *k_dest[4] = {"prev", "r0", "r1", "r2"};
+static const char *k_konst_frac[8] = {"1.0", "0.875", "0.75", "0.625", "0.5", "0.375", "0.25", "0.125"};
+
+static void konst_color(Str *s, int sel) {
+    if (sel < 8) sadd(s, "vec3(%s)", k_konst_frac[sel]);
+    else if (sel < 12) sadd(s, "vec3(0.0)");
+    else if (sel < 16) sadd(s, "u_konst[%d].rgb", sel - 12);
+    else sadd(s, "u_konst[%d].%c%c%c", sel & 3, "rgba"[(sel - 16) / 4], "rgba"[(sel - 16) / 4], "rgba"[(sel - 16) / 4]);
+}
+static void konst_alpha(Str *s, int sel) {
+    if (sel < 8) sadd(s, "%s", k_konst_frac[sel]);
+    else if (sel < 16) sadd(s, "0.0");
+    else sadd(s, "u_konst[%d].%c", sel & 3, "rgba"[(sel - 16) / 4]);
+}
+static void swizzle(char out[5], const GxTevConfig *t, int table) {
+    uint32_t a = t->ksel[table * 2], b = t->ksel[table * 2 + 1];
+    out[0] = "rgba"[a & 3]; out[1] = "rgba"[(a >> 2) & 3]; out[2] = "rgba"[b & 3]; out[3] = "rgba"[(b >> 2) & 3]; out[4] = 0;
+}
+static const char *alpha_cmp(int f) {
+    static const char *k[8] = {"false", "(A < R)", "(A == R)", "(A <= R)", "(A > R)", "(A != R)", "(A >= R)", "true"};
+    return k[f & 7];
+}
+
+static char *tev_fragment_source(const GxTevConfig *t) {
+    Str s = {0};
+    sadd(&s, "#version 330 core\n"
+             "in vec4 v_c0, v_c1; in vec2 v_t0, v_t1, v_t2, v_t3, v_t4, v_t5, v_t6, v_t7; out vec4 o;\n"
+             "uniform sampler2D tex0, tex1, tex2, tex3, tex4, tex5, tex6, tex7;\n"
+             "uniform vec4 u_konst[4]; uniform vec4 u_reg[4]; uniform vec2 u_aref;\n"
+             "float q8(float x) { return floor(clamp(x, 0.0, 1.0) * 255.0 + 0.5) / 255.0; }\n"
+             "vec3 q8(vec3 x) { return floor(clamp(x, 0.0, 1.0) * 255.0 + 0.5) / 255.0; }\n"
+             "void main() {\n"
+             "  vec4 prev = u_reg[0], r0 = u_reg[1], r1 = u_reg[2], r2 = u_reg[3];\n"
+             "  vec4 tx = vec4(1.0), ras = vec4(0.0); vec3 kc; float ka;\n");
+    static const float scale[4] = {1.0f, 2.0f, 4.0f, 0.5f};
+    static const char *bias[3] = {"0.0", "0.5", "-0.5"};
+    int last_cdest = 0, last_adest = 0;
+    for (int i = 0; i < t->nstages && i < 16; i++) {
+        uint32_t tr = (t->tref[i / 2] >> ((i & 1) * 12)) & 0xFFF, ce = t->color_env[i], ae = t->alpha_env[i];
+        uint32_t ks = t->ksel[i / 2];
+        int map = tr & 7, tc = (tr >> 3) & 7, ten = (tr >> 6) & 1, chan = (tr >> 7) & 7;
+        int kcs = (i & 1) ? (ks >> 14) & 31 : (ks >> 4) & 31, kas = (i & 1) ? (ks >> 19) & 31 : (ks >> 9) & 31;
+        char rsw[5], tsw[5];
+        swizzle(rsw, t, ae & 3);
+        swizzle(tsw, t, (ae >> 2) & 3);
+        sadd(&s, "  // stage %d\n", i);
+        if (ten) sadd(&s, "  tx = texture(tex%d, v_t%d).%s;\n", map, tc, tsw);
+        else sadd(&s, "  tx = vec4(1.0);\n");
+        sadd(&s, "  ras = %s;\n", chan == 0 ? "v_c0" : chan == 1 ? "v_c1" : "vec4(0.0)");
+        if (chan <= 1) sadd(&s, "  ras = ras.%s;\n", rsw);
+        sadd(&s, "  kc = "); konst_color(&s, kcs); sadd(&s, "; ka = "); konst_alpha(&s, kas); sadd(&s, ";\n");
+
+        /* color */
+        int cd = ce & 15, cc = (ce >> 4) & 15, cb = (ce >> 8) & 15, ca = (ce >> 12) & 15;
+        int cbias = (ce >> 16) & 3, csub = (ce >> 18) & 1, cclamp = (ce >> 19) & 1, cscale = (ce >> 20) & 3, cdest = (ce >> 22) & 3;
+        if (cbias != 3) {
+            sadd(&s, "  vec3 cr%d = (%s %c mix(q8(%s), q8(%s), q8(%s)) + vec3(%s)) * %.3f;\n", i, k_color_in[cd],
+                 csub ? '-' : '+', k_color_in[ca], k_color_in[cb], k_color_in[cc], bias[cbias], scale[cscale]);
+        } else { /* compare mode: d + (a OP b ? c : 0) */
+            int op = (cscale << 1) | csub;
+            const char *A = k_color_in[ca], *B = k_color_in[cb];
+            switch (op) {
+            case 0: case 1: sadd(&s, "  bool cm%d = q8(%s).r %s q8(%s).r;\n", i, A, op & 1 ? "==" : ">", B); break;
+            case 2: case 3: sadd(&s, "  bool cm%d = dot(q8(%s).rg, vec2(1.0, 256.0)) %s dot(q8(%s).rg, vec2(1.0, 256.0));\n", i, A, op & 1 ? "==" : ">", B); break;
+            case 4: case 5: sadd(&s, "  bool cm%d = dot(q8(%s), vec3(1.0, 256.0, 65536.0)) %s dot(q8(%s), vec3(1.0, 256.0, 65536.0));\n", i, A, op & 1 ? "==" : ">", B); break;
+            default: break;
+            }
+            if (op >= 6)
+                sadd(&s, "  vec3 cr%d = %s + mix(vec3(0.0), %s, vec3(%s(q8(%s), q8(%s))));\n", i, k_color_in[cd],
+                     k_color_in[cc], op & 1 ? "equal" : "greaterThan", A, B);
+            else
+                sadd(&s, "  vec3 cr%d = %s + (cm%d ? %s : vec3(0.0));\n", i, k_color_in[cd], i, k_color_in[cc]);
+        }
+        sadd(&s, "  cr%d = clamp(cr%d, %s);\n", i, i, cclamp ? "0.0, 1.0" : "-4.0, 4.0");
+
+        /* alpha */
+        int ad = (ae >> 4) & 7, ac = (ae >> 7) & 7, ab = (ae >> 10) & 7, aa = (ae >> 13) & 7;
+        int abias = (ae >> 16) & 3, asub = (ae >> 18) & 1, aclamp = (ae >> 19) & 1, ascale = (ae >> 20) & 3, adest = (ae >> 22) & 3;
+        if (abias != 3) {
+            sadd(&s, "  float ar%d = (%s %c mix(q8(%s), q8(%s), q8(%s)) + %s) * %.3f;\n", i, k_alpha_in[ad], asub ? '-' : '+',
+                 k_alpha_in[aa], k_alpha_in[ab], k_alpha_in[ac], bias[abias], scale[ascale]);
+        } else {
+            int op = (ascale << 1) | asub;
+            sadd(&s, "  float ar%d = %s + ((q8(%s) %s q8(%s)) ? %s : 0.0);\n", i, k_alpha_in[ad], k_alpha_in[aa],
+                 op & 1 ? "==" : ">", k_alpha_in[ab], k_alpha_in[ac]);
+        }
+        sadd(&s, "  ar%d = clamp(ar%d, %s);\n", i, i, aclamp ? "0.0, 1.0" : "-4.0, 4.0");
+        sadd(&s, "  %s.rgb = cr%d; %s.a = ar%d;\n", k_dest[cdest], i, k_dest[adest], i);
+        last_cdest = cdest;
+        last_adest = adest;
+    }
+    sadd(&s, "  vec4 outc = vec4(%s.rgb, %s.a);\n", k_dest[last_cdest], k_dest[last_adest]);
+    int comp0 = (t->alpha_cmp >> 16) & 7, comp1 = (t->alpha_cmp >> 19) & 7, logic = (t->alpha_cmp >> 22) & 3;
+    static const char *logic_op[4] = {"&&", "||", "!=", "=="};
+    char c0[64], c1[64];
+    snprintf(c0, sizeof c0, "%s", alpha_cmp(comp0));
+    snprintf(c1, sizeof c1, "%s", alpha_cmp(comp1));
+    sadd(&s, "  float A = floor(clamp(outc.a, 0.0, 1.0) * 255.0 + 0.5);\n");
+    sadd(&s, "  bool p0, p1; { float R = floor(u_aref.x * 255.0 + 0.5); p0 = %s; }\n", c0);
+    sadd(&s, "  { float R = floor(u_aref.y * 255.0 + 0.5); p1 = %s; }\n", c1);
+    sadd(&s, "  if (!(p0 %s p1)) discard;\n", logic_op[logic]);
+    sadd(&s, "  o = clamp(outc, 0.0, 1.0);\n}\n");
+    return s.p;
+}
 
 static GLuint compile(GLenum type, const char *src) {
     GLuint s = glCreateShader(type);
@@ -266,35 +395,67 @@ static GLuint compile(GLenum type, const char *src) {
     GLint ok;
     glGetShaderiv(s, GL_COMPILE_STATUS, &ok);
     if (!ok) {
-        char log[1024];
+        char log[2048];
         glGetShaderInfoLog(s, sizeof log, NULL, log);
+        fprintf(stderr, "%s\n", src);
         rt_fatal("shader compile failed: %s", log);
     }
     return s;
 }
 
+static GLuint g_vs_shader;
+
+static TevProgram *tev_program(const GxTevConfig *cfg) {
+    for (unsigned i = 0; i < g_nprogs; i++)
+        if (!memcmp(&g_progs[i].cfg, cfg, sizeof *cfg)) return &g_progs[i];
+    if (g_nprogs == g_cap_progs) {
+        g_cap_progs = g_cap_progs ? g_cap_progs * 2 : 64;
+        g_progs = realloc(g_progs, sizeof *g_progs * g_cap_progs);
+    }
+    TevProgram *p = &g_progs[g_nprogs++];
+    p->cfg = *cfg;
+    char *fs = tev_fragment_source(cfg);
+    p->prog = glCreateProgram();
+    glAttachShader(p->prog, g_vs_shader);
+    glAttachShader(p->prog, compile(GL_FRAGMENT_SHADER, fs));
+    free(fs);
+    glLinkProgram(p->prog);
+    glUseProgram(p->prog);
+    for (int i = 0; i < 8; i++) {
+        char name[8];
+        snprintf(name, sizeof name, "tex%d", i);
+        glUniform1i(glGetUniformLocation(p->prog, name), i);
+    }
+    p->u_konst = glGetUniformLocation(p->prog, "u_konst");
+    p->u_reg = glGetUniformLocation(p->prog, "u_reg");
+    p->u_aref = glGetUniformLocation(p->prog, "u_aref");
+    return p;
+}
+
 static void gl_setup(void) {
     GL_FUNCS(GL_LOAD)
-    g_prog = glCreateProgram();
-    glAttachShader(g_prog, compile(GL_VERTEX_SHADER, k_vs));
-    glAttachShader(g_prog, compile(GL_FRAGMENT_SHADER, k_fs));
-    glLinkProgram(g_prog);
-    glUseProgram(g_prog);
-    glUniform1i(glGetUniformLocation(g_prog, "tex"), 0);
-    g_u_mode = glGetUniformLocation(g_prog, "mode");
-    g_u_alpha_test = glGetUniformLocation(g_prog, "alpha_test");
-    g_u_alpha_ref = glGetUniformLocation(g_prog, "alpha_ref");
+    g_vs_shader = compile(GL_VERTEX_SHADER, k_vs);
 
     glGenVertexArrays(1, &g_vao);
     glBindVertexArray(g_vao);
     glGenBuffers(1, &g_vbo);
     glBindBuffer(GL_ARRAY_BUFFER, g_vbo);
     glEnableVertexAttribArray(0);
+    glVertexAttribPointer(0, 4, GL_FLOAT, 0, sizeof(GxVertex), (void *)offsetof(GxVertex, x));
     glEnableVertexAttribArray(1);
+    glVertexAttribPointer(1, 4, GL_FLOAT, 0, sizeof(GxVertex), (void *)offsetof(GxVertex, c0));
     glEnableVertexAttribArray(2);
-    glVertexAttribPointer(0, 4, GL_FLOAT, 0, sizeof(GxVertex), (void *)0);
-    glVertexAttribPointer(1, 4, GL_FLOAT, 0, sizeof(GxVertex), (void *)(4 * sizeof(float)));
-    glVertexAttribPointer(2, 2, GL_FLOAT, 0, sizeof(GxVertex), (void *)(8 * sizeof(float)));
+    glVertexAttribPointer(2, 4, GL_FLOAT, 0, sizeof(GxVertex), (void *)offsetof(GxVertex, c1));
+    for (int i = 0; i < 8; i++) {
+        glEnableVertexAttribArray(3 + i);
+        glVertexAttribPointer(3 + i, 2, GL_FLOAT, 0, sizeof(GxVertex), (void *)(offsetof(GxVertex, uv) + i * 2 * sizeof(float)));
+    }
+
+    /* 1x1 white texture for texture maps that have nothing bound */
+    static const uint8_t white[4] = {255, 255, 255, 255};
+    glGenTextures(1, &g_white);
+    glBindTexture(GL_TEXTURE_2D, g_white);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, 1, 1, 0, GL_RGBA, GL_UNSIGNED_BYTE, white);
 
     /* the EFB */
     glGenTextures(1, &g_efb_color);
@@ -357,17 +518,26 @@ static void apply_state(const GxState *s) {
         glEnable(GL_CULL_FACE);
         glCullFace(s->cull == 1 ? GL_FRONT : s->cull == 2 ? GL_BACK : GL_FRONT_AND_BACK);
     }
-    glUniform1i(g_u_mode, s->texture ? s->tev_mode : 0);
-    glUniform1i(g_u_alpha_test, s->alpha_test);
-    glUniform1f(g_u_alpha_ref, s->alpha_ref);
-    if (s->texture && s->texture < g_ntextures && g_textures[s->texture]) {
-        static const GLint wrap[4] = {GL_CLAMP_TO_EDGE, GL_REPEAT, GL_MIRRORED_REPEAT, GL_REPEAT};
-        glBindTexture(GL_TEXTURE_2D, g_textures[s->texture]);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, wrap[s->tex_wrap_s & 3]);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, wrap[s->tex_wrap_t & 3]);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, s->tex_linear ? GL_LINEAR : GL_NEAREST);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, s->tex_linear ? GL_LINEAR : GL_NEAREST);
+    TevProgram *p = tev_program(&s->tev);
+    glUseProgram(p->prog);
+    glUniform4fv(p->u_konst, 4, &s->konst[0][0]);
+    glUniform4fv(p->u_reg, 4, &s->reg[0][0]);
+    glUniform2f(p->u_aref, s->alpha_ref[0], s->alpha_ref[1]);
+    static const GLint wrap[4] = {GL_CLAMP_TO_EDGE, GL_REPEAT, GL_MIRRORED_REPEAT, GL_REPEAT};
+    for (int m = 0; m < 8; m++) {
+        glActiveTexture(GL_TEXTURE0 + (GLenum)m);
+        uint32_t id = s->texture[m];
+        if (id && id < g_ntextures && g_textures[id]) {
+            glBindTexture(GL_TEXTURE_2D, g_textures[id]);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, wrap[s->wrap_s[m] & 3]);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, wrap[s->wrap_t[m] & 3]);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, s->linear[m] ? GL_LINEAR : GL_NEAREST);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, s->linear[m] ? GL_LINEAR : GL_NEAREST);
+        } else {
+            glBindTexture(GL_TEXTURE_2D, g_white);
+        }
     }
+    glActiveTexture(GL_TEXTURE0);
 }
 
 static void write_bmp(const char *path, const uint8_t *rgba, int w, int h) {
@@ -400,7 +570,6 @@ static void render(GxFrame *f) {
     for (uint32_t i = 0; i < f->nuploads; i++) upload(&f->uploads[i]);
     glBindFramebuffer(GL_FRAMEBUFFER, g_efb_fbo);
     glViewport(0, 0, EFB_WIDTH, EFB_HEIGHT);
-    glUseProgram(g_prog);
     glBindVertexArray(g_vao);
     glBindBuffer(GL_ARRAY_BUFFER, g_vbo);
     glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(sizeof(GxVertex) * f->nverts), f->verts, GL_STREAM_DRAW);

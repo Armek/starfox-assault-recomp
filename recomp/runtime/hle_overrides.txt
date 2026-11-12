@@ -22,3 +22,7 @@ GXDrawDone
 
 # Controllers come from the host (SDL later); for now port 1 is a connected pad with nothing pressed.
 PADRead
+
+# REL modules: record where the SDK linked each module so its recompiled code can find it (runtime.c).
+OSNotifyLink
+OSNotifyUnlink

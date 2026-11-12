@@ -10,14 +10,36 @@ host runtime into a native executable. This is the route toward a PC / Linux / S
 - **Milestone 2:** `__start` → `OSInit` → `main` runs from recompiled code, and the Dolphin OS banner prints.
 - **Milestone 2b:** the game runs its threaded main loop at 60 Hz, starts CRI's ADX threads and loads files
   from the disc ([docs/boot_trace.md](../docs/boot_trace.md)).
-- **Milestone 3 (so far):** `sfa` opens a window and renders the game's GX output with OpenGL.
+- **Milestone 3 (so far):** `sfa` opens a window and renders the game's GX output with OpenGL, including
+  code from the REL modules.
   - The **"WARNING – HEALTH AND SAFETY"** screen draws correctly. With a button press (keyboard, a game
     controller, or `--auto-press`) the game moves on.
-  - The **Sofdec logo** draws correctly. The game streams `movie/loop_demo.sfd` through the recompiled CRI
-    Sofdec decoder, but movie frames come out black: the YUV→RGB conversion uses multi-stage TEV, which isn't
-    implemented yet.
-  - It then loads `m4.rel`, links it with the SDK's own `OSLink`, and stops on the first call into the module.
-    REL code isn't translated yet.
+  - The **Sofdec logo** and the full **"NOW LOADING…" screen** draw correctly. The loading screen has the
+    Star Fox emblem, curved text, the progress bar and "SEARCHING FOR TARGETS… TARGET ACQUIRED".
+  - The game loads and links `m4.rel` and `m2.rel` and runs their recompiled code, then loads `m3.rel`,
+    `m5.rel` and `fpc/select.fpc`.
+  - **Current stop:** a dialog box (most likely the memory-card check) whose text texture
+    (`0x814761A0`, CMPR 528×24) is still all zero when drawn. It isn't written by DVD, ARAM DMA or an EFB
+    copy, so it's probably generated at run time from a memory-card result or by a loader that is waiting.
+    Next step: emulate a memory card in slot A.
+
+### REL modules
+
+The 22 `.rel` level modules (every module except `m009`, which the game never loads) are translated
+together with `main.dol`. That's 2,282 functions, 52 of them code that dtk left as gaps, with 0
+untranslated instructions.
+- **Addresses:** each module's code gets a virtual address range (`0x90000000 + n × 4 MB`), so its functions
+  have unique names (`f_91400104` is `m4:_prolog`) and its internal branches resolve when the C is generated.
+- **Relocations:** the 59,585 code relocations become runtime expressions. `ADDR16_HA/HI/LO` immediates read
+  `g_rel[module].sec[section] + addend`, and DOL targets fold to constants. `REL24`/`REL14` branches become
+  direct C calls into the DOL, the module itself, or the module it imports (m2/m3/m5 → m4,
+  mb02/mb10a → m8). Note that `ADDR16` relocations point at the 16-bit field, i.e. instruction + 2.
+- **Jump tables:** read through the 4,966 data relocations. The `switch` maps the runtime `CTR` back to
+  generated addresses.
+- **Linking:** the SDK's own `OSLink`/`Link`/`Relocate` run unchanged. `OSNotifyLink`/`OSNotifyUnlink` are
+  HLE hooks that recognise the module (by ID and section sizes) and record its real section addresses. After
+  that, `rt_call`/`rt_jump` map pointers into the module (vtables, `_prolog`, callbacks) to its generated
+  functions.
 
 ### Graphics and input (milestone 3)
 
@@ -26,10 +48,12 @@ host runtime into a native executable. This is the route toward a PC / Linux / S
 | **Command processor** | Bytes written to the write-gather pipe (`0xCC008000`) are parsed as soon as a command is complete. It handles CP/XF/BP register loads (with the BP mask register), indexed XF loads, `CALL_DL` display lists from guest memory, and all 8 primitive types. | `gx.c` |
 | **Vertices** | Every attribute (matrix indices, position, normal/NBT, two colors, eight texcoords) in direct, 8-bit and 16-bit indexed modes, all component formats and color formats. They're transformed on the CPU: position matrix, perspective/orthographic projection and viewport, written as clip-space vertices so GL still clips and interpolates with perspective correction. Texcoords go through the texgen source row and texture matrix (ST/STQ). | `gx.c` |
 | **Textures** | I4, I8, IA4, IA8, RGB565, RGB5A3, RGBA8, CI4, CI8, CI14X2 (TLUT loads into a TMEM model) and CMPR. Decoded to RGBA8 and cached by address/format/size/palette, then re-decoded when the source bytes' hash changes (checked once per frame). | `gx.c` |
-| **Render state** | Blend factors/subtract, color/alpha write masks, depth test/function/write, scissor, alpha test. TEV stage 0 is approximated as texture × rasterized color, texture only, or color only. | `gx.c`, `video.c` |
+| **TEV** | Full: up to 16 stages with every color/alpha combiner input, bias/scale/clamp/subtract and compare modes, the TEV color registers and konst colors (BP `0xE0`–`0xE7`, split by bit 23), konst selectors, swap tables, both raster color channels and 8 texture maps. The alpha compare uses both references and its logic op. Each distinct configuration becomes a generated GLSL fragment shader, compiled once and cached. | `gx.c`, `video.c` |
+| **Render state** | Blend factors/subtract, color/alpha write masks, depth test/function/write, scissor. | `gx.c`, `video.c` |
+| **Color channels** | Material/vertex color and ambient per channel. Lighting is still an estimate (ambient + 0.6), since normals aren't used yet. | `gx.c` |
 | **Frames** | Each frame's batches are built on the guest threads and handed to a **render thread** that owns the SDL window and an OpenGL 3.3 core context. It draws into a 640×528 EFB framebuffer and scales the XFB-copy rectangle into the window. EFB clears requested by copies are applied in order. | `video.c` |
 | **Input** | Port 1 merges the keyboard and the first SDL game controller (Steam Deck included) into `PADRead`. `--auto-press` taps START and A every 4 seconds for unattended testing. | `video.c`, `hle.c` |
-| **Diagnostics** | `--dump-frames` saves every 15th presented frame to `build/GF7E01/frames/*.bmp`. `--no-video` runs headless. | `video.c` |
+| **Diagnostics** | `--dump-frames` saves every 15th presented frame to `build/GF7E01/frames/*.bmp`. `--no-video` runs headless. With `SFA_GX_DEBUG=1`, each new draw configuration, texture upload (with how many source bytes are non-zero), EFB-to-texture copy and ARAM DMA is logged, and decoded textures are saved to `build/GF7E01/textures/`. | `video.c`, `gx.c` |
 
 Keyboard: arrows/WASD = control stick, Enter = START, Space/J = A, K/Backspace = B, L = X, I = Y,
 Q/E = L/R, Z = Z, numpad 8/4/6/2 = C-stick.
@@ -53,17 +77,12 @@ The generator also emits **extra entry points** for calls into the middle of a f
 
 ## Next
 
-1. **REL modules (the current blocker).** Translate the 22 `.rel` files. Their load address is only known
-   at run time, so the generator has to emit relocation-aware code: module-relative addresses become
-   `module_base + offset`, and DOL references resolve statically. Hook `OSLink`/`OSUnlink` to register
-   each module's base addresses and its functions with the dispatcher.
-2. **Full TEV:** all 16 stages, the color/alpha combiners, konst colors, TEV registers, swap tables and
-   indirect textures, generated as GLSL per TEV configuration. This is needed for movies (YUV→RGB) and
-   almost all 3D effects.
+1. **Memory card (the current blocker).** Emulate a card in slot A backed by a file, either as an EXI
+   device or by HLE of the `CARD*` API. Then find out what fills the dialog's text texture.
+2. **Indirect textures** (the TEV indirect stages, BP `0x10`–`0x27`), for warps and effects.
 3. **Lighting:** XF light channels (diffuse/specular/attenuation) using the decoded normals.
 4. **EFB copies to textures:** render-to-texture, used for effects and the pause screen.
-5. **Memory card:** emulate a card in slot A (EXI) backed by a file, or HLE the `CARD*` API.
-6. **Audio:** AX/DSP HLE, then CRI ADX (already recompiled) and AI out through SDL audio.
+5. **Audio:** AX/DSP HLE, then CRI ADX (already recompiled) and AI out through SDL audio.
 
 ## Build
 
