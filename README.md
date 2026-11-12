@@ -60,6 +60,12 @@ On Linux, `wine` or `wibo` is downloaded automatically for the compilers.
   See [docs/](docs/) for the full workflow, including `objdiff` and decomp.me.
 - Add C/C++ units to `config.libs` in `configure.py` as they are decompiled.
 
+## Static recompilation (PC port)
+
+[recomp/](recomp/README.md) translates `main.dol` to C and links it into a native executable.
+Milestone 1 is done: all 4,403 game-side functions translate and compile, and recompiled MSL code
+passes a self-test against the host C library. Booting the game is next.
+
 ## See also
 
 - `recomp-probe/REPORT.md`: why the GCRecomp static recompiler can't handle this game yet.
