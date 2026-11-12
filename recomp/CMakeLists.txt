@@ -18,7 +18,7 @@ if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE RelWithDebInfo)
 endif()
 
-add_executable(sfa runtime/runtime.c runtime/hle.c runtime/threads.c runtime/dvd.c runtime/gx.c runtime/video.c ${GENERATED_SOURCES})
+add_executable(sfa runtime/runtime.c runtime/hle.c runtime/threads.c runtime/dvd.c runtime/gx.c runtime/video.c runtime/card.c ${GENERATED_SOURCES})
 target_include_directories(sfa PRIVATE runtime "${GENERATED_DIR}")
 
 if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
@@ -29,6 +29,12 @@ if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
     target_link_libraries(sfa PRIVATE m)
   endif()
 endif()
+# -DRT_WATCH=ON: debug build with a memory write watchpoint (SFA_WATCH=<addr>:<len>)
+option(RT_WATCH "Compile the guest memory write watchpoint" OFF)
+if(RT_WATCH)
+  target_compile_definitions(sfa PRIVATE RT_WATCH)
+endif()
+
 find_package(Threads REQUIRED)
 target_link_libraries(sfa PRIVATE Threads::Threads)
 

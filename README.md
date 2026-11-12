@@ -63,10 +63,10 @@ On Linux, `wine` or `wibo` is downloaded automatically for the compilers.
 ## Static recompilation (PC port)
 
 [recomp/](recomp/README.md) translates `main.dol` to C and links it into a native executable.
-Milestones 1, 2 and 2b are done, and milestone 3 is under way. The recompiled game, including its REL
-level modules, runs its threaded frame loop in a window and renders its health-and-safety, Sofdec and
-"NOW LOADING" screens through an OpenGL GX renderer with full TEV. It takes keyboard and controller input.
-Memory-card emulation is next.
+Milestones 1-3 are done. The recompiled game, REL level modules included, runs in a window with
+an OpenGL GX renderer (full TEV), keyboard and controller input, and an emulated memory card. It
+gets through the title screen, save creation, name entry, controller settings and the Mission 1
+briefing. Audio (AX/DSP HLE) is next; the mission load waits on streamed music.
 
 ## See also
 

@@ -166,6 +166,21 @@ static uint32_t texture_for_map(int n) {
     uint32_t img0 = bp[base_image0];
     uint32_t w = (img0 & 0x3FF) + 1, h = ((img0 >> 10) & 0x3FF) + 1, fmt = (img0 >> 20) & 15;
     uint32_t addr = 0x80000000u | ((bp[base_image3] & 0xFFFFFF) << 5);
+    if (getenv("SFA_GX_TEXADDR") && strtoul(getenv("SFA_GX_TEXADDR"), NULL, 16) == addr) {
+        static unsigned shown;
+        if (shown++ < 6) {
+            printf("[gx-texaddr] frame %u map %d fmt %u %ux%u bound by:", g_frame_number, n, fmt, w, h);
+            for (uint32_t i = 12; i >= 1; i--) printf(" %s", rt_func_name(g_trace_ring[(g_trace_pos - i) & (RT_TRACE_RING - 1)]));
+            printf("\n");
+        }
+    }
+    if (getenv("SFA_GX_DEBUG")) {
+        uint32_t img1 = bp[n < 4 ? 0x8C + n : 0xAC + (n - 4)];
+        static unsigned n_pre;
+        if (((img1 >> 21) & 1) && n_pre++ < 20)
+            printf("[gx-preloaded] frame %u map %d uses TMEM %05X (fmt %u %ux%u, image addr %08X)\n", g_frame_number, n,
+                   (img1 & 0x7FFF) << 5, fmt, w, h, addr);
+    }
     if (!ppc_is_ram(addr)) return 0;
     uint32_t tlut = bp[base_tlut], tlut_fmt = (tlut >> 10) & 3;
     const uint8_t *pal = tmem_tlut + (((tlut & 0x3FF) << 9) & (sizeof tmem_tlut - 1));
@@ -185,8 +200,10 @@ static uint32_t texture_for_map(int n) {
     }
     if (!e) e = &g_tex[key & (TEX_CACHE - 1)]; /* evict */
     int fresh = !(e->id && e->addr == addr && e->fmt == fmt && e->w == w && e->h == h && e->tlut_hash == tlut_hash);
-    if (!fresh && e->checked_frame == g_frame_number) return e->id;
     uint32_t size = tex_size(fmt, w, h);
+    /* Small textures are re-checked on every use: games rewrite scratch buffers (one font glyph at a
+     * time, for example) between draws in the same frame. Big ones are checked once per frame. */
+    if (!fresh && size > 0x10000 && e->checked_frame == g_frame_number) return e->id;
     uint32_t hash = fnv(ppc_ram(addr), (addr & 0x01FFFFFF) + size <= PPC_MEM_SIZE ? size : 0, 2166136261u);
     if (fresh) {
         e->addr = addr; e->fmt = fmt; e->w = w; e->h = h; e->tlut_hash = tlut_hash;
@@ -590,6 +607,24 @@ static void efb_copy(uint32_t v) {
     if (to_xfb) {
         GxFrame *f = frame();
         f->copy_rect[0] = (uint16_t)x; f->copy_rect[1] = (uint16_t)y; f->copy_rect[2] = (uint16_t)w; f->copy_rect[3] = (uint16_t)h;
+        static int dump_frame = -2;
+        if (dump_frame == -2) dump_frame = getenv("SFA_GX_FRAMEDUMP") ? atoi(getenv("SFA_GX_FRAMEDUMP")) : -1;
+        if ((int)f->number == dump_frame) { /* list every batch of one frame */
+            printf("[frame %u] %u batches, %u vertices\n", f->number, f->nbatches, f->nverts);
+            for (uint32_t b = 0; b < f->nbatches; b++) {
+                const GxBatch *bt = &f->batches[b];
+                const GxState *s = &bt->state;
+                const GxVertex *v0 = &f->verts[bt->first];
+                printf("  #%u kind %d verts %u stages %u tex[0..2] %u %u %u blend %u(%u,%u) zen %u aref %.2f/%.2f acmp %06X "
+                       "C0 %06X A0 %06X tref0 %03X reg0 %.2f,%.2f,%.2f,%.2f k0 %.2f,%.2f,%.2f,%.2f c0 %.2f,%.2f,%.2f,%.2f "
+                       "pos %.1f,%.1f w %.2f uv %.3f,%.3f\n",
+                       b, bt->kind, bt->count, s->tev.nstages, s->texture[0], s->texture[1], s->texture[2], s->blend_enable,
+                       s->blend_src, s->blend_dst, s->z_enable, s->alpha_ref[0], s->alpha_ref[1], s->tev.alpha_cmp,
+                       s->tev.color_env[0], s->tev.alpha_env[0], s->tev.tref[0] & 0xFFF, s->reg[0][0], s->reg[0][1],
+                       s->reg[0][2], s->reg[0][3], s->konst[0][0], s->konst[0][1], s->konst[0][2], s->konst[0][3],
+                       v0->c0[0], v0->c0[1], v0->c0[2], v0->c0[3], v0->x / v0->w, v0->y / v0->w, v0->w, v0->uv[0][0], v0->uv[0][1]);
+            }
+        }
         g_frame = NULL;
         g_frame_number++;
         video_submit(f);
@@ -622,6 +657,15 @@ static void bp_write(uint32_t word) {
         break;
     case 0x52:
         efb_copy(bp[0x52]);
+        break;
+    case 0x63: /* TX_LOADBLOCK3: preload a texture into TMEM */
+        if (getenv("SFA_GX_DEBUG")) {
+            static unsigned n;
+            if (n++ < 20)
+                printf("[gx-preload] frame %u src %08X tmem even %05X odd %05X count %u (32B)\n", g_frame_number,
+                       0x80000000u | ((bp[0x60] & 0xFFFFFF) << 5), (bp[0x61] & 0x7FFF) << 5, (bp[0x62] & 0x7FFF) << 5,
+                       val & 0x7FFF);
+        }
         break;
     case 0x65: { /* load TLUT: from main memory (BP 0x64) into TMEM */
         uint32_t src = 0x80000000u | ((bp[0x64] & 0xFFFFFF) << 5);
@@ -686,7 +730,16 @@ static size_t run_commands(const uint8_t *b, size_t n, uint32_t guest_addr, int 
             break;
         }
         case 0x40: call_display_list(be32(c + 1), be32(c + 5), depth); break;
-        case 0x61: bp_write(be32(c + 1)); break;
+        case 0x61:
+            if (guest_addr && getenv("SFA_GX_TEXADDR")) { /* where does a display list set this texture address? */
+                uint32_t w = be32(c + 1), r = w >> 24, want = (uint32_t)strtoul(getenv("SFA_GX_TEXADDR"), NULL, 16);
+                static unsigned shown;
+                if (((r >= 0x94 && r <= 0x97) || (r >= 0xB4 && r <= 0xB7)) && (w & 0xFFFFFF) == ((want & 0x01FFFFFF) >> 5) && shown++ < 8)
+                    printf("[gx-texaddr] display list at %08X: BP %02X image address field at %08X\n", guest_addr,
+                           r, guest_addr + (uint32_t)i + 2);
+            }
+            bp_write(be32(c + 1));
+            break;
         default: { /* primitive */
             uint32_t count = (uint32_t)((c[1] << 8) | c[2]);
             if (guest_addr) {
@@ -708,7 +761,32 @@ static size_t run_commands(const uint8_t *b, size_t n, uint32_t guest_addr, int 
 static uint8_t *g_fifo;
 static size_t g_fifo_len, g_fifo_cap;
 
+/* ---- display list recording -----------------------------------------------------------------
+ * GXBeginDisplayList points the CPU FIFO (PI registers 0x300C base / 0x3010 end / 0x3014 write
+ * pointer) at a RAM buffer while the GPU FIFO (CP 0x20/0x22 base) stays where it was. Pipe writes
+ * then go to that buffer instead of being executed; GXEndDisplayList reads the write pointer back
+ * to learn the list's size. */
+static uint32_t g_dl_ptr; /* physical write pointer while recording */
+
+void gx_pi_wptr_write(uint32_t v) { g_dl_ptr = v & 0x03FFFFE0u; }
+
+uint32_t gx_pi_wptr_read(void) {
+    /* the write-gather pipe drains in 32-byte bursts: pad the tail with NOPs */
+    while (g_dl_ptr & 31) wr8(0x80000000u | g_dl_ptr++, 0);
+    return g_dl_ptr & 0x03FFFFE0u;
+}
+
+static int recording_display_list(void) {
+    uint32_t pi_base = rt_mmio_get(0x300C, 4) & 0x03FFFFFFu;
+    uint32_t cp_base = (rt_mmio_get(0x20, 2) | rt_mmio_get(0x22, 2) << 16) & 0x03FFFFFFu;
+    return pi_base && cp_base && pi_base != cp_base;
+}
+
 void gx_fifo_write(uint32_t value, int size) {
+    if (recording_display_list()) {
+        for (int i = size - 1; i >= 0; i--) wr8(0x80000000u | g_dl_ptr++, (uint8_t)(value >> (i * 8)));
+        return;
+    }
     if (g_fifo_len + 8 > g_fifo_cap) {
         g_fifo_cap = g_fifo_cap ? g_fifo_cap * 2 : 1 << 16;
         g_fifo = realloc(g_fifo, g_fifo_cap);

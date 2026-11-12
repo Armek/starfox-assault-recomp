@@ -36,3 +36,6 @@ compile_commands.json
 
 # Recompiler probe output (contains raw game code)
 recomp-probe/sample_generated.rs
+
+# Saves and other per-user data written by the recompiled game
+user/

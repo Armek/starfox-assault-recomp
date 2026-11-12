@@ -84,17 +84,29 @@ PPC_INLINE uint32_t rd32(uint32_t a) {
 }
 PPC_INLINE uint64_t rd64(uint32_t a) { return ((uint64_t)rd32(a) << 32) | rd32(a + 4); }
 
+/* Debug builds (-DRT_WATCH): report writes to the range set by SFA_WATCH=<hex addr>:<hex len>. */
+#ifdef RT_WATCH
+extern uint32_t g_watch_lo, g_watch_len;
+void rt_watch_hit(uint32_t addr, uint32_t value, int size);
+#define RT_WATCH_CHECK(a, v, n) do { if (PPC_UNLIKELY(((a) & 0x01FFFFFFu) - g_watch_lo < g_watch_len)) rt_watch_hit((a), (v), (n)); } while (0)
+#else
+#define RT_WATCH_CHECK(a, v, n) ((void)0)
+#endif
+
 PPC_INLINE void wr8(uint32_t a, uint8_t v) {
     if (PPC_UNLIKELY(!ppc_is_ram(a))) { rt_slow_write(a, v, 1); return; }
+    RT_WATCH_CHECK(a, v, 1);
     *ppc_ram(a) = v;
 }
 PPC_INLINE void wr16(uint32_t a, uint16_t v) {
     if (PPC_UNLIKELY(!ppc_is_ram(a))) { rt_slow_write(a, v, 2); return; }
+    RT_WATCH_CHECK(a, v, 2);
     v = bswap16(v);
     memcpy(ppc_ram(a), &v, 2);
 }
 PPC_INLINE void wr32(uint32_t a, uint32_t v) {
     if (PPC_UNLIKELY(!ppc_is_ram(a))) { rt_slow_write(a, v, 4); return; }
+    RT_WATCH_CHECK(a, v, 4);
     v = bswap32(v);
     memcpy(ppc_ram(a), &v, 4);
 }

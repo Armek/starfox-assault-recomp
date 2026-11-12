@@ -62,6 +62,34 @@ void rt_console_putc(char ch) { fputc(ch, stdout); if (ch == '\n') fflush(stdout
 
 /* ---- function lookup --------------------------------------------------------------------------- */
 
+#ifdef RT_WATCH
+/* Write watchpoint (debug builds only): SFA_WATCH=<hex address>:<hex length>. */
+uint32_t g_watch_lo = 0xFFFFFFFFu, g_watch_len = 0;
+void rt_watch_hit(uint32_t addr, uint32_t value, int size) {
+    static unsigned hits, zero;
+    if (!value) { /* zero fills (heap clears) are summarised, not listed */
+        if ((++zero & 0xFFF) == 1) printf("[watch] %u zero writes so far (latest %08X)\n", zero, addr);
+        return;
+    }
+    if (++hits > 60) return;
+    printf("[watch] write%d %08X = %0*X in", size * 8, addr, size * 2, value);
+    for (uint32_t i = 4; i >= 1; i--) printf(" %s", rt_func_name(g_trace_ring[(g_trace_pos - i) & (RT_TRACE_RING - 1)]));
+    printf("\n");
+}
+static void watch_init(void) {
+    const char *w = getenv("SFA_WATCH");
+    if (!w) return;
+    unsigned lo, len;
+    if (sscanf(w, "%x:%x", &lo, &len) == 2) {
+        g_watch_lo = lo & 0x01FFFFFFu;
+        g_watch_len = len;
+        printf("[watch] watching writes to %08X-%08X\n", lo, lo + len - 1);
+    }
+}
+#else
+static void watch_init(void) {}
+#endif
+
 /* A runtime address inside a linked REL module's code -> the address its code was generated at. */
 static uint32_t rel_to_generated(uint32_t addr) {
     for (unsigned i = 0; i < RT_NUM_RELS; i++) {
@@ -286,6 +314,7 @@ uint32_t rt_slow_read(uint32_t a, int size) {
     uint32_t v;
     if (dsp_read(off, &v)) return v;
     if (off == AR_MODE) return 1; /* ARAM controller initialized */
+    if (off == 0x3014 && size == 4) return gx_pi_wptr_read(); /* CPU FIFO write pointer */
     poll_watchdog(a);
     return mmio_get(off, size);
 }
@@ -303,6 +332,7 @@ void rt_slow_write(uint32_t a, uint32_t v, int size) {
         return;
     }
     if (rt_dvd_write(off, v, size)) return;
+    if (off == 0x3014 && size == 4) gx_pi_wptr_write(v);
     switch (off) {
     case 0x680C: case 0x6820: case 0x6834: /* EXI channel 0-2 control: TSTART completes at once */
     case 0x6434:                           /* SI communication control: TSTART */
@@ -520,6 +550,7 @@ int main(int argc, char **argv) {
     g_mem = calloc(1, PPC_MEM_SIZE);
     g_lc = calloc(1, PPC_LC_SIZE);
     if (!g_mem || !g_lc) rt_fatal("out of memory");
+    watch_init();
     rt_boot_setup(root);
     printf("[recomp] %u guest functions linked\n", g_func_count);
     if (run_selftest) return selftest();

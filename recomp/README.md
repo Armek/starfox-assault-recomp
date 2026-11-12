@@ -3,25 +3,42 @@
 Translates the Gekko (PowerPC 750CL) machine code in `main.dol` into portable C, then links it with a
 host runtime into a native executable. This is the route toward a PC / Linux / Steam Deck build.
 
-## Status: milestone 3 in progress (the game draws its first screens)
+## Status: milestone 3 done (title screen, menus and mission briefing render); audio is next
 
 - **Milestone 1:** all of `main.dol` translates to C with 0 untranslated instructions. It compiles with
   clang 19 with no errors or warnings, and `sfa --selftest` passes 5/5.
 - **Milestone 2:** `__start` → `OSInit` → `main` runs from recompiled code, and the Dolphin OS banner prints.
 - **Milestone 2b:** the game runs its threaded main loop at 60 Hz, starts CRI's ADX threads and loads files
   from the disc ([docs/boot_trace.md](../docs/boot_trace.md)).
-- **Milestone 3 (so far):** `sfa` opens a window and renders the game's GX output with OpenGL, including
-  code from the REL modules.
-  - The **"WARNING – HEALTH AND SAFETY"** screen draws correctly. With a button press (keyboard, a game
-    controller, or `--auto-press`) the game moves on.
-  - The **Sofdec logo** and the full **"NOW LOADING…" screen** draw correctly. The loading screen has the
-    Star Fox emblem, curved text, the progress bar and "SEARCHING FOR TARGETS… TARGET ACQUIRED".
-  - The game loads and links `m4.rel` and `m2.rel` and runs their recompiled code, then loads `m3.rel`,
-    `m5.rel` and `fpc/select.fpc`.
-  - **Current stop:** a dialog box (most likely the memory-card check) whose text texture
-    (`0x814761A0`, CMPR 528×24) is still all zero when drawn. It isn't written by DVD, ARAM DMA or an EFB
-    copy, so it's probably generated at run time from a memory-card result or by a loader that is waiting.
-    Next step: emulate a memory card in slot A.
+- **Milestone 3:** `sfa` opens a window and renders the game's GX output with OpenGL, including code from
+  the REL modules. With a button press (keyboard, a game controller, or `--auto-press`) it gets through:
+  - the health-and-safety warning, the Sofdec logo and the "NOW LOADING…" screen
+  - the **3D title screen** (Arwings in the hangar) and the **STAR FOX ASSAULT logo**
+  - save-file creation on the emulated memory card, the **NAME ENTRY** and **CONTROLLER SETTING** screens
+  - the **Mission 1 briefing** ("Mission 1: Take Out Oikonny"), loading `m9.rel`, `fpc/s_01_01.fpc` and the map data.
+- **Current stop:** the Mission 1 load never completes. It streams the first 7 chunks of the mission music
+  (`bgm/A00017.dsp`) into ARAM and then waits. The most likely reason is that nothing plays audio: the
+  DSP's AX microcode would advance the voices and drive the AI DMA interrupt, and the streamer refills only
+  as playback consumes. Next step: AX/DSP audio HLE (see below).
+- **Known rendering gap:** some generated dialog boxes still show no text.
+
+### Memory card
+
+`card.c` reimplements the 20 `CARD*` functions the game uses (everything except `CARDInit`).
+- **Slot A** is a 59-block card, and slot B reports no card.
+- **Saves** are standard `.gci` files (64-byte directory entry + data, compatible with Dolphin and save
+  tools) in `user/GF7E01/card_a/`, which git ignores. The game's own save is
+  `GF7E01-starfox.dat.gci` (5 blocks).
+- **`CARDGetStatus`** computes the banner and icon offsets the way the SDK's `__CARDUpdateIconOffsets` does.
+- **Async calls** complete immediately and call their callback.
+
+### Display lists built at run time
+
+`GXBeginDisplayList` points the CPU FIFO (PI `0xCC00300C`–`0x3014`) at a RAM buffer while the GPU FIFO
+(CP `0x20`/`0x22`) stays put. While those differ, pipe writes are **recorded** into RAM at the PI write
+pointer instead of executed. Reading `0x3014` (as `GXEndDisplayList` does) pads the list to 32 bytes with
+NOPs, like the write-gather pipe draining. Before this, recorded lists held stale memory. That's what left
+the dynamic menu text, the title logo and other generated UI pieces blank.
 
 ### REL modules
 
@@ -77,12 +94,25 @@ The generator also emits **extra entry points** for calls into the middle of a f
 
 ## Next
 
-1. **Memory card (the current blocker).** Emulate a card in slot A backed by a file, either as an EXI
-   device or by HLE of the `CARD*` API. Then find out what fills the dialog's text texture.
+1. **Audio (milestone 4, the current blocker).** HLE the DSP's AX microcode:
+   - read the voice parameter blocks the CPU sends each frame and advance the playback positions
+   - decode DSP-ADPCM/PCM8/PCM16 from ARAM
+   - mix the voices and output through SDL audio
+   - raise the AI DMA interrupt every audio frame, so the game's sound engine and CRI ADX streaming run.
 2. **Indirect textures** (the TEV indirect stages, BP `0x10`–`0x27`), for warps and effects.
 3. **Lighting:** XF light channels (diffuse/specular/attenuation) using the decoded normals.
 4. **EFB copies to textures:** render-to-texture, used for effects and the pause screen.
-5. **Audio:** AX/DSP HLE, then CRI ADX (already recompiled) and AI out through SDL audio.
+5. **The remaining blank dialog text.**
+
+### Debugging aids
+
+- **`--dump-frames`, `--no-video`, `--auto-press`.**
+- **`SFA_GX_DEBUG=1`** logs draw configurations, textures (with how many source bytes are non-zero),
+  TMEM preloads, EFB-to-texture copies and ARAM DMA, and saves decoded textures as images.
+- **`SFA_GX_FRAMEDUMP=<n>`** lists every batch of frame *n*.
+- **`SFA_GX_TEXADDR=<hex>`** shows which code binds that texture address and which display list sets it.
+- **Write watchpoint:** a build with `-DRT_WATCH=ON` (in its own build folder) and
+  `SFA_WATCH=<hex addr>:<hex len>` logs every non-zero write to that range with the functions that made it.
 
 ## Build
 

@@ -26,3 +26,25 @@ PADRead
 # REL modules: record where the SDK linked each module so its recompiled code can find it (runtime.c).
 OSNotifyLink
 OSNotifyUnlink
+
+# Memory card: slot A is a 59-block card stored as .gci files in user/GF7E01/card_a (card.c).
+CARDProbeEx
+CARDMountAsync
+CARDUnmount
+CARDGetResultCode
+CARDCheckAsync
+CARDCheckExAsync
+CARDGetSerialNo
+CARDFreeBlocks
+CARDOpen
+CARDClose
+CARDCreateAsync
+CARDDeleteAsync
+CARDFormatAsync
+CARDRead
+CARDReadAsync
+CARDWrite
+CARDWriteAsync
+CARDGetStatus
+CARDSetStatus
+CARDSetStatusAsync
