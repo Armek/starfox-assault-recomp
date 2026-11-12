@@ -1,0 +1,63 @@
+Total instructions decoded: 835329
+Unknown (untranslatable) instructions: 47354 (5.67%)
+Decode errors: 0
+
+Unknown instructions by primary opcode:
+  opcode  4: 816
+  opcode  7: 2960
+  opcode  8: 1369
+  opcode 31: 7637
+  opcode 56: 3145
+  opcode 57: 56
+  opcode 59: 27493
+  opcode 60: 2976
+  opcode 61: 35
+  opcode 63: 867
+
+Decoded instruction categories:
+  Arithmetic         232919
+  Branch             147164
+  Compare            49039
+  ConditionRegister  89
+  FloatingPoint      107304
+  Load               111092
+  Move               2
+  Rotate             21614
+  Shift              3505
+  Store              97715
+  System             17532
+  Unknown            47354
+
+Functions (bl-target heuristic): 4706
+  codegen succeeded: 4706
+  codegen failed: 0
+  containing untranslatable instructions: 2181 (46.3%)
+
+Codegen failure reasons:
+
+Per code section:
+main.dol text0             2368 instrs    0.08% not translatable
+main.dol text1           510800 instrs    6.94% not translatable
+m0.rel sec1                4664 instrs    3.13% not translatable
+m009.rel sec1              5314 instrs    5.97% not translatable
+m1.rel sec1                1236 instrs    0.00% not translatable
+m10.rel sec1              10544 instrs    5.19% not translatable
+m2.rel sec1               24632 instrs    5.94% not translatable
+m3.rel sec1                9922 instrs    4.05% not translatable
+m4.rel sec1               84062 instrs    0.69% not translatable
+m5.rel sec1                2987 instrs    3.38% not translatable
+m6.rel sec1                2482 instrs    3.42% not translatable
+m7.rel sec1                 125 instrs    0.00% not translatable
+m8.rel sec1               68849 instrs    5.17% not translatable
+m9.rel sec1               44033 instrs    6.16% not translatable
+mb01a.rel sec1             3570 instrs    2.72% not translatable
+mb01b.rel sec1             6076 instrs    4.82% not translatable
+mb02.rel sec1              5655 instrs    6.08% not translatable
+mb05.rel sec1             11635 instrs    3.81% not translatable
+mb10a.rel sec1             6547 instrs    3.76% not translatable
+mbg0.rel sec1              9834 instrs    1.87% not translatable
+mbg1.rel sec1              9834 instrs    1.87% not translatable
+mbg2.rel sec1              9842 instrs    1.87% not translatable
+md0.rel sec1                106 instrs    0.00% not translatable
+md1.rel sec1                106 instrs    0.00% not translatable
+md2.rel sec1                106 instrs    0.00% not translatable

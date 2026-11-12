@@ -1,0 +1,7 @@
+[package]
+name = "sfa_recomp_probe"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+gcrecomp-core = { version = "=0.0.1-alpha" }
