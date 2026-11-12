@@ -157,9 +157,11 @@ class FuncGen:
     def inside(self, t):
         return self.start <= t < self.end
 
-    def jump(self, t):
+    def jump(self, t, pc=None):
         if self.inside(t):
             self.labels.add(t)
+            if pc is not None and t <= pc:  # loop back-edge: let the runtime deliver interrupts
+                return f"{{ RT_SAFEPOINT(c); goto L_{t:08X}; }}"
             return f"goto L_{t:08X};"
         if t in self.ctx.func_starts:
             return f"{{ f_{t:08X}(c); return; }}"
@@ -226,7 +228,7 @@ class FuncGen:
             bd = sx16(w & 0xFFFC)
             t = (bd if w & 2 else pc + bd) & 0xFFFFFFFF
             pre, cond = self.bc_cond(bo, bi)
-            action = ("{ " + self.call(t, pc) + " }") if w & 1 else self.jump(t)
+            action = ("{ " + self.call(t, pc) + " }") if w & 1 else self.jump(t, pc)
             return self.branch_cond(pre, cond, action)
         if op == 17:
             return f"rt_syscall(c, {hx(pc)});"
@@ -235,7 +237,7 @@ class FuncGen:
             if li & 0x02000000:
                 li -= 0x04000000
             t = (li if w & 2 else pc + li) & 0xFFFFFFFF
-            return self.call(t, pc) if w & 1 else self.jump(t)
+            return self.call(t, pc) if w & 1 else self.jump(t, pc)
         if op == 19:
             return self.op19(w, pc)
         if op == 20:  # rlwimi
@@ -448,6 +450,8 @@ class FuncGen:
                 return f"{R(d)} = c->gqr[{spr - 912}];"
             if spr in (268, 269):
                 return f"{R(d)} = (uint32_t)(rt_timebase() >> {32 if spr == 269 else 0});"
+            if spr == 22:  # DEC: the decrementer is a runtime timer
+                return f"{R(d)} = rt_get_dec(c);"
             return f"{R(d)} = c->spr[{spr}];"
         if xo == 467:  # mtspr
             if spr == 1:
@@ -458,6 +462,8 @@ class FuncGen:
                 return f"c->ctr = {R(d)};"
             if 912 <= spr <= 919:
                 return f"c->gqr[{spr - 912}] = {R(d)};"
+            if spr == 22:
+                return f"rt_set_dec(c, {R(d)});"
             return f"c->spr[{spr}] = {R(d)};"
         if xo == 371:  # mftb
             return f"{R(d)} = (uint32_t)(rt_timebase() >> {32 if spr == 269 else 0});"
@@ -578,7 +584,9 @@ class FuncGen:
         raise Unsupported(f"op4 xo {xo10}")
 
     # ---- whole function
-    def generate(self):
+    def generate(self, entry=None):
+        """Emit the function. With `entry`, emit an extra C function that starts at that
+        instruction (for code called in the middle, like the _savefpr_NN helpers)."""
         img = self.ctx.img
         lines, last = [], None
         for pc in range(self.start, self.end, 4):
@@ -591,9 +599,14 @@ class FuncGen:
                 code = f"rt_illegal(c, {hx(pc)}, {hx(w)});"
             lines.append((pc, w, code))
             last = w
-        out = [f"/* {self.name} */", f"void f_{self.start:08X}(Ctx *c) {{"]
+        fn_addr = entry if entry is not None else self.start
+        label = self.name if entry is None else f"{self.name}+0x{entry - self.start:X}"
+        out = [f"/* {label} */", f"void f_{fn_addr:08X}(Ctx *c) {{"]
         sdk = SDK_RANGE[0] <= self.start < SDK_RANGE[1]
-        out.append(f"    {'RT_ENTER_SDK' if sdk else 'RT_ENTER'}(c, {hx(self.start)});")
+        out.append(f"    {'RT_ENTER_SDK' if sdk else 'RT_ENTER'}(c, {hx(fn_addr)});")
+        if entry is not None:
+            self.labels.add(entry)
+            out.append(f"    goto L_{entry:08X};")
         for pc, w, code in lines:
             if pc in self.labels:
                 out.append(f"L_{pc:08X}:;")
@@ -619,6 +632,31 @@ class Context:
                 t = img.word(addr + o)
                 if t is not None and t in range(0x80003100, 0x80200000):
                     self.jt_targets.add(t)
+        # Calls (bl/bcl) that land inside another function need their own entry point.
+        starts = sorted(funcs)
+        import bisect
+        keys = [a for a, _, _, _ in starts]
+        self.mid_entries = defaultdict(set)
+        for a, s, _, _ in starts:
+            for pc in range(a, a + s, 4):
+                w = img.word(pc)
+                if w is None or not w & 1:
+                    continue
+                op = w >> 26
+                if op == 18 and not w & 2:
+                    li = w & 0x03FFFFFC
+                    t = (pc + (li - 0x04000000 if li & 0x02000000 else li)) & 0xFFFFFFFF
+                elif op == 16 and not w & 2:
+                    t = (pc + sx16(w & 0xFFFC)) & 0xFFFFFFFF
+                else:
+                    continue
+                if t in self.func_starts or t == pc + 4:
+                    continue
+                i = bisect.bisect_right(keys, t) - 1
+                if i >= 0 and starts[i][0] < t < starts[i][0] + starts[i][1]:
+                    self.mid_entries[starts[i][0]].add(t)
+        for es in self.mid_entries.values():
+            self.func_starts |= es
 
 # ---------------------------------------------------------------------------------------------- main
 
@@ -657,10 +695,14 @@ def main():
     recomp = [f for f in funcs if f[2] not in overrides and not is_stub(f[0])]
     hle = [f for f in funcs if f[2] not in overrides and is_stub(f[0])]
     os.makedirs(args.out, exist_ok=True)
+    recomp_starts = {a for a, _, _, _ in recomp}
+    extra = sorted((e, f"{n}+0x{e - a:X}") for a, _, n, _ in funcs if a in recomp_starts
+                   for e in ctx.mid_entries.get(a, ()))
+    all_entries = sorted([(a, n) for a, _, n, _ in funcs] + extra)
 
     with open(os.path.join(args.out, "funcs.h"), "w", newline="\n") as fh:
         fh.write("/* Generated by recomp/tools/ppcrecomp.py - do not edit. */\n#pragma once\n#include \"ppc.h\"\n\n")
-        for a, _, n, _ in funcs:
+        for a, n in all_entries:
             fh.write(f"void f_{a:08X}(Ctx *c); /* {n} */\n")
         fh.write(f"\n#define GUEST_ENTRY 0x{entry:08X}u\n")
         fh.write("\n/* Named access to guest functions: G_<name> is the address, F_<name> the C function. */\n")
@@ -679,6 +721,8 @@ def main():
                 g = FuncGen(ctx, a, s, n)
                 fc.write(g.generate() + "\n\n")
                 total_unknown += g.unknown
+                for e in sorted(ctx.mid_entries.get(a, ())):
+                    fc.write(FuncGen(ctx, a, s, n).generate(entry=e) + "\n\n")
 
     with open(os.path.join(args.out, "hle_stubs.c"), "w", newline="\n") as fc:
         fc.write("/* Generated by recomp/tools/ppcrecomp.py - do not edit.\n"
@@ -690,8 +734,8 @@ def main():
     with open(os.path.join(args.out, "func_table.c"), "w", newline="\n") as fc:
         fc.write("/* Generated by recomp/tools/ppcrecomp.py - do not edit. */\n#include \"funcs.h\"\n\n")
         fc.write("typedef struct { uint32_t addr; GuestFn fn; const char *name; } FuncEntry;\n")
-        fc.write(f"const unsigned g_func_count = {len(funcs)};\nconst FuncEntry g_funcs[] = {{\n")
-        for a, _, n, _ in funcs:
+        fc.write(f"const unsigned g_func_count = {len(all_entries)};\nconst FuncEntry g_funcs[] = {{\n")
+        for a, n in all_entries:
             fc.write(f"    {{ 0x{a:08X}u, f_{a:08X}, {c_string(n)} }},\n")
         fc.write("};\n")
 
@@ -701,6 +745,7 @@ def main():
     print(f"functions: {len(funcs)} total, {len(recomp)} recompiled, {len(overrides)} HLE overrides, "
           f"{len(hle)} stubs")
     print(f"jump tables: {len(tables)} from symbols ({len(ctx.jt_targets)} targets), {ctx.found_tables} bctr sites resolved by pattern")
+    print(f"extra entry points (calls into the middle of a function): {len(extra)}")
     print(f"untranslated instructions: {total_unknown}")
     for k, v in sorted(ctx.unsupported.items(), key=lambda x: -x[1]):
         print(f"  {v:6}  {k}")

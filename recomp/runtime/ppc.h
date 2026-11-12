@@ -209,6 +209,11 @@ extern uint32_t g_trace_pos;
 extern int g_trace_sdk;                      /* log every Dolphin SDK call */
 void rt_sdk_enter(Ctx *c, uint32_t addr);
 
+/* Loop back-edges call RT_SAFEPOINT so the runtime can deliver interrupts to spinning code. */
+extern int g_safepoint_budget;
+void rt_safepoint(Ctx *c);
+#define RT_SAFEPOINT(c) do { if (PPC_UNLIKELY(--g_safepoint_budget <= 0)) rt_safepoint(c); } while (0)
+
 #define RT_ENTER(c, a) (g_trace_ring[g_trace_pos++ & (RT_TRACE_RING - 1)] = (a))
 #define RT_ENTER_SDK(c, a) do { RT_ENTER(c, a); if (g_trace_sdk) rt_sdk_enter((c), (a)); } while (0)
 
@@ -225,5 +230,7 @@ void rt_dcbz(uint32_t addr);
 void rt_lswi(Ctx *c, uint32_t ea, int rd, int nb);
 void rt_stswi(Ctx *c, uint32_t ea, int rs, int nb);
 void rt_icache_invalidate(uint32_t addr);
+void rt_set_dec(Ctx *c, uint32_t value);           /* mtdec */
+uint32_t rt_get_dec(Ctx *c);                       /* mfdec */
 
 #endif /* PPC_H */

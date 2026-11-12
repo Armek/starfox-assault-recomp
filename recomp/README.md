@@ -3,40 +3,46 @@
 Translates the Gekko (PowerPC 750CL) machine code in `main.dol` into portable C, then links it with a
 host runtime into a native executable. This is the route toward a PC / Linux / Steam Deck build.
 
-## Status: milestone 2 done (boots into `main`)
+## Status: milestone 2b done (the game runs its frame loop)
 
 - **Milestone 1:** all of `main.dol` translates to C with 0 untranslated instructions. It compiles with
-  clang 19 with no errors or warnings, and `sfa --selftest` passes 5/5 (recompiled `memset`, `strlen`,
-  `sprintf` checked against the host C library).
-- **Milestone 2:** `sfa` boots the game.
-  - It runs the recompiled `__start` → `OSInit` → `main`. The Dolphin OS banner prints from the game's own code
-    ("Kernel built : May 21 2004", "Console Type : Retail 3", "Memory 24 MB", arena range).
-  - It then runs the game's video and engine initialization.
-  - It stops after **949 SDK calls to 246 distinct functions**, when `GXDrawDone` sleeps waiting for a
-    GPU interrupt. See [docs/boot_trace.md](../docs/boot_trace.md).
-- **The SDK is recompiled too**, except for the 5 functions in `runtime/hle_overrides.txt`, which are
-  reimplemented in `runtime/hle.c`:
-  - console output (`__write_console`)
-  - audio DSP init
-  - memory protection
-  - `VIWaitForRetrace`, paced at 60 Hz.
+  clang 19 with no errors or warnings, and `sfa --selftest` passes 5/5.
+- **Milestone 2:** `__start` → `OSInit` → `main` runs from recompiled code, and the Dolphin OS banner prints.
+- **Milestone 2b:** `sfa` runs the game's main loop at 60 Hz with no GPU or audio output yet.
+  - It starts CRI's ADX threads (`adxm_vsync_proc`, `adxm_fs_proc`, `adxm_mwidle_proc`).
+  - It loads its first files from the disc: `effect/effect.efb`, `tex_pack_00.nut`, `nud_pack_00.pac`, `ns_logos.nut`.
+  - It submits display lists every frame.
+  - In 30 seconds it makes 615,000 SDK calls to 368 distinct functions ([docs/boot_trace.md](../docs/boot_trace.md)).
+  - It appears to wait at the startup logos or the memory-card check. Memory cards aren't emulated and the pad
+    has no buttons pressed yet.
 
-  Each SDK call is logged to `build/GF7E01/sdk_trace.txt`. The MetroTRK debugger is stubbed.
-- **Jump tables:** the generator also finds them by pattern (`lis`/`addi`/`lwzx`/`mtctr`/`bctr`), not just
-  from dtk's `jumptable_` symbols. That resolves 162 more `bctr` sites.
-- **Watchdog:** a guest polling one hardware register 2,000,000 times stops with a report of the last 24
-  functions entered.
+### How the runtime provides the hardware
 
-## Next: milestone 2b (threads and interrupts)
+| Piece | How | Where |
+|---|---|---|
+| **Threads** | Each guest thread runs on its own host thread with its own `Ctx`, and a baton lets one run at a time. `OSSaveContext`/`OSLoadContext` are HLE: saving records the context a host thread owns, and loading hands the baton to its owner, starting a host thread the first time an `OSCreateThread` context is loaded. The SDK's own `SelectThread` does all scheduling. | `threads.c` |
+| **Exceptions/interrupts** | The generator puts `RT_SAFEPOINT` on every loop back-edge (3,700+). When an interrupt or the decrementer is due and MSR[EE] is set, the runtime saves registers into the current `OSContext` (marked EXC) and calls the SDK's registered handler with the `__OSDispatchInterrupt` sequence. `OSLoadContext` of that context `longjmp`s back, like `rfi`, which also works when another thread later switches back to it. | `threads.c` |
+| **Decrementer** | `mtdec`/`mfdec` become a host timer, so `OSAlarm` (timeouts, `OSSleepTicks`, DVD retries) works through the recompiled `DecrementerExceptionCallback`. | `threads.c` |
+| **VI** | A 59.94 Hz retrace sets the VI interrupt bit and runs `__VIRetraceHandler`, which wakes `VIWaitForRetrace` sleepers and runs the game's retrace callbacks. | `runtime.c` |
+| **Hardware registers** | `0xCC000000` is a register file, so reads return what was written. EXI/SI transfers complete instantly. The AI sample counter runs at 48 kHz. | `runtime.c` |
+| **ARAM** | 16 MB with instant DMA and the ARAM interrupt. | `runtime.c` |
+| **DSP** | A fake mailbox completes the SDK task loader's handshake (`0x8071FEED`, then "task init" `0xDCD10000` via the DSP interrupt). No microcode runs, so there's no audio yet. | `runtime.c` |
+| **Disc drive (DI)** | The disc is rebuilt virtually from `orig/GF7E01` (`boot.bin`, `bi2.bin`, apploader, DOL, FST and all 960+ files at their FST offsets). Read, disc-ID read, inquiry and status commands complete immediately with the DI interrupt, and the SDK's DVD driver runs unchanged. | `dvd.c` |
+| **HLE overrides** | Console output, DSP boot, MMU setup, context switching, `GXDrawDone` (no GPU) and `PADRead` (port 1 connected and neutral). | `hle.c` |
 
-The boot stops at the first place the game sleeps a thread to wait for hardware. Getting further needs:
-1. **Thread switching.** `OSSaveContext`/`OSLoadContext` switch stacks with `rfi`, which compiled code can't
-   do. Run each guest thread on its own host thread or coroutine, and let only one run at a time.
-2. **Interrupt delivery** from the runtime: VI retrace (60 Hz), PE finish/token (from the GX layer),
-   DVD transfer complete, AI/DSP. These should call the SDK's own recompiled handlers (`__VIRetraceHandler`, …).
-3. **DVD reads** served from `orig/GF7E01/files` through the FST (`DVDReadAbsAsyncPrio` / the low-level layer).
-4. **A GX command stream sink** at `0xCC008000`. For now it only needs to raise the draw-done/token interrupts.
-   Real rendering comes later.
+The generator also emits **extra entry points** for calls into the middle of a function (8, all in
+`__save_fpr`/`__restore_fpr`), and the timebase uses a high-resolution clock (`__AI_SRC_INIT` measures 1/48000 s).
+
+## Next: milestone 3 (see something)
+
+1. **GX → OpenGL/Vulkan.** Decode the command stream the game writes to `0xCC008000` and the display lists
+   (`GXCallDisplayList`), and draw them. This is the largest piece. Reusing an existing GX
+   implementation (for example Aurora, or Dolphin's video code as a reference) will save a lot of work.
+   PE draw-done/token interrupts come with it.
+2. **Window and input:** SDL2 for the window, VI frame presentation and `PADRead` from real controllers.
+3. **Memory card:** emulate a card in slot A (EXI) backed by a file, or HLE the `CARD*` API.
+4. **REL modules:** translate the 22 `.rel` files and replace `OSLink` so levels can load.
+5. **Audio:** HLE the AX/DSP microcode, CRI ADX decoding (already recompiled), and AI to SDL audio.
 
 ## Build
 

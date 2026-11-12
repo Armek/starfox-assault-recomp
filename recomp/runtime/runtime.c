@@ -48,8 +48,10 @@ void rt_fatal(const char *fmt, ...) {
     vfprintf(stderr, fmt, ap);
     fputc('\n', stderr);
     va_end(ap);
-    fprintf(stderr, "[recomp] pc trail: r1=%08X lr=%08X ctr=%08X r3=%08X r4=%08X r5=%08X\n",
-            g_ctx.r[1], g_ctx.lr, g_ctx.ctr, g_ctx.r[3], g_ctx.r[4], g_ctx.r[5]);
+    Ctx *c = rt_current_ctx();
+    if (!c) c = &g_ctx;
+    fprintf(stderr, "[recomp] registers: r1=%08X lr=%08X ctr=%08X r3=%08X r4=%08X r5=%08X msr=%08X\n",
+            c->r[1], c->lr, c->ctr, c->r[3], c->r[4], c->r[5], c->msr);
     rt_dump_trace();
     if (g_sdk_log) fflush(g_sdk_log);
     exit(1);
@@ -115,9 +117,21 @@ void rt_hle_unimplemented(Ctx *c, uint32_t addr, const char *name) {
     c->r[3] = 0;
 }
 
+/* Gekko timebase: bus clock / 4 = 40.5 MHz, from a high-resolution monotonic host clock.
+ * (The SDK times hardware events with it, e.g. __AI_SRC_INIT measures 1/48000 s.) */
 uint64_t rt_timebase(void) {
-    /* Gekko timebase runs at bus clock / 4 = 40.5 MHz. */
-    return (uint64_t)((double)clock() / CLOCKS_PER_SEC * 40500000.0);
+#ifdef _WIN32
+    static LARGE_INTEGER freq, start;
+    LARGE_INTEGER t;
+    if (!freq.QuadPart) { QueryPerformanceFrequency(&freq); QueryPerformanceCounter(&start); }
+    QueryPerformanceCounter(&t);
+    uint64_t ticks = (uint64_t)(t.QuadPart - start.QuadPart);
+    return ticks / (uint64_t)freq.QuadPart * 40500000u + ticks % (uint64_t)freq.QuadPart * 40500000u / (uint64_t)freq.QuadPart;
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 40500000u + (uint64_t)ts.tv_nsec * 405u / 10000u;
+#endif
 }
 
 void rt_dcbz(uint32_t addr) {
@@ -168,15 +182,70 @@ static void poll_watchdog(uint32_t a) {
     }
 }
 
+/* Hardware registers at 0xCC000000-0xCC007FFF: a plain register file, so the SDK reads back what it
+ * wrote. Devices that need behaviour (status bits, interrupts) poke values into it. */
+static uint8_t g_mmio[0x10000];
+
+static uint32_t mmio_get(uint32_t off, int size) {
+    uint8_t *p = g_mmio + off;
+    return size == 1 ? p[0] : size == 2 ? (uint32_t)(p[0] << 8 | p[1])
+                                        : (uint32_t)p[0] << 24 | p[1] << 16 | p[2] << 8 | p[3];
+}
+
+static void mmio_set(uint32_t off, uint32_t v, int size) {
+    for (int i = 0; i < size; i++) g_mmio[off + i] = (uint8_t)(v >> ((size - 1 - i) * 8));
+}
+
+uint32_t rt_mmio_get(uint32_t off, int size) { return mmio_get(off, size); }
+void rt_mmio_set(uint32_t off, uint32_t v, int size) { mmio_set(off, v, size); }
+
+/* ARAM: 16 MB of auxiliary memory reached only by DMA (0xCC005020 main address, 0x5024 ARAM
+ * address, 0x5028 count with bit 31 = ARAM->main). Transfers finish instantly and raise the
+ * ARAM interrupt; 0x5016 bit 0 reports the ARAM controller as ready. */
+#define ARAM_SIZE 0x01000000u
+#define AR_MODE 0x5016u
+#define OS_INTERRUPT_DSP_ARAM 6
+static uint8_t *g_aram;
+
+static void aram_dma(void) {
+    uint32_t mm = (uint32_t)mmio_get(0x5020, 4) & 0x03FFFFE0u;
+    uint32_t ar = (uint32_t)mmio_get(0x5024, 4) & 0x03FFFFE0u;
+    uint32_t cnt = (uint32_t)mmio_get(0x5028, 4);
+    uint32_t len = cnt & 0x03FFFFE0u;
+    if (!g_aram) g_aram = calloc(1, ARAM_SIZE);
+    for (uint32_t i = 0; i < len; i++) {
+        uint32_t a = (ar + i) & (ARAM_SIZE - 1), m = 0x80000000u | (mm + i);
+        if (!ppc_is_ram(m)) rt_fatal("ARAM DMA outside main RAM: 0x%08X", m);
+        if (cnt & 0x80000000u) *ppc_ram(m) = g_aram[a];
+        else g_aram[a] = *ppc_ram(m);
+    }
+    mmio_set(0x500A, mmio_get(0x500A, 2) | 0x20u, 2); /* AR interrupt status */
+    rt_raise_interrupt(OS_INTERRUPT_DSP_ARAM);
+}
+
+/* fake DSP mailbox (defined below) */
+#define DSP_MBOX_IN_H 0x5000u  /* CPU -> DSP */
+#define DSP_MBOX_IN_L 0x5002u
+#define DSP_CSR 0x500Au
+static int dsp_read(uint32_t off, uint32_t *out);
+static void dsp_receive(uint32_t mail);
+static void dsp_send(uint32_t mail);
+
 uint32_t rt_slow_read(uint32_t a, int size) {
     if ((a & 0xFFFFC000u) == 0xE0000000u) {
         uint8_t *p = g_lc + (a & (PPC_LC_SIZE - 1));
         return size == 1 ? p[0] : size == 2 ? (uint32_t)(p[0] << 8 | p[1])
                                             : (uint32_t)p[0] << 24 | p[1] << 16 | p[2] << 8 | p[3];
     }
+    if ((a >> 16) != 0xCC00) rt_fatal("read%d from unmapped address 0x%08X", size * 8, a);
+    uint32_t off = a & 0xFFFF;
+    if (off == 0x6C08) /* AI sample counter: runs at 48 kHz */
+        return (uint32_t)(rt_timebase() / (40500000 / 48000));
+    uint32_t v;
+    if (dsp_read(off, &v)) return v;
+    if (off == AR_MODE) return 1; /* ARAM controller initialized */
     poll_watchdog(a);
-    if ((a >> 24) != 0xCC) rt_fatal("read%d from unmapped address 0x%08X", size * 8, a);
-    return 0;
+    return mmio_get(off, size);
 }
 
 void rt_slow_write(uint32_t a, uint32_t v, int size) {
@@ -185,8 +254,74 @@ void rt_slow_write(uint32_t a, uint32_t v, int size) {
         for (int i = 0; i < size; i++) p[i] = (uint8_t)(v >> ((size - 1 - i) * 8));
         return;
     }
-    if ((a >> 24) != 0xCC) rt_fatal("write%d 0x%08X to unmapped address 0x%08X", size * 8, v, a);
+    if ((a >> 16) != 0xCC00) rt_fatal("write%d 0x%08X to unmapped address 0x%08X", size * 8, v, a);
+    uint32_t off = a & 0xFFFF;
+    if (off >= 0x8000) return; /* GX write-gather pipe: no GPU yet */
+    if (rt_dvd_write(off, v, size)) return;
+    switch (off) {
+    case 0x680C: case 0x6820: case 0x6834: /* EXI channel 0-2 control: TSTART completes at once */
+    case 0x6434:                           /* SI communication control: TSTART */
+        v &= ~1u;
+        break;
+    case DSP_MBOX_IN_L: /* the mail is complete; the fake DSP consumes it at once */
+        dsp_receive(mmio_get(DSP_MBOX_IN_H, 2) << 16 | (v & 0xFFFF));
+        mmio_set(DSP_MBOX_IN_H, mmio_get(DSP_MBOX_IN_H, 2) & 0x7FFF, 2);
+        break;
+    case DSP_CSR: /* writing 1 to the interrupt bits acknowledges them */
+        v = (v & ~0xA8u) | (mmio_get(DSP_CSR, 2) & 0xA8u & ~(v & 0xA8u));
+        break;
+    }
+    mmio_set(off, v, size);
+    if ((off == 0x5028 && size == 4) || off == 0x502A) aram_dma(); /* writing the count starts it */
 }
+
+/* ---- fake DSP mailbox ---------------------------------------------------------------------------
+ * Enough of the DSP side of the mailbox protocol for the SDK's task loader (__DSP_boot_task) and
+ * __DSPHandler: greet with 0x8071FEED, accept CPU mails instantly, and once a task's boot sequence
+ * ends (0x80F3B002 followed by its argument) report "task initialized" (0xDCD10000) via a DSP
+ * interrupt. No microcode runs, so audio stays silent. */
+#define DSP_MBOX_IN_H 0x5000u  /* CPU -> DSP */
+#define DSP_MBOX_IN_L 0x5002u
+#define DSP_MBOX_OUT_H 0x5004u /* DSP -> CPU */
+#define DSP_MBOX_OUT_L 0x5006u
+#define DSP_CSR 0x500Au
+#define DSP_CSR_DSPINT 0x80u
+#define OS_INTERRUPT_DSP_DSP 7
+
+static uint32_t g_dsp_out[16];
+static unsigned g_dsp_out_head, g_dsp_out_tail;
+static int g_dsp_boot_stage; /* 1 = saw 0x80F3B002, next mail ends the boot sequence */
+static unsigned long g_dsp_mails_in;
+
+static void dsp_send(uint32_t mail) { g_dsp_out[g_dsp_out_tail++ & 15] = mail; }
+
+static void dsp_receive(uint32_t mail) {
+    g_dsp_mails_in++;
+    if (g_dsp_boot_stage == 1) {
+        g_dsp_boot_stage = 0;
+        dsp_send(0xDCD10000u); /* task init done */
+        mmio_set(DSP_CSR, mmio_get(DSP_CSR, 2) | DSP_CSR_DSPINT, 2);
+        rt_raise_interrupt(OS_INTERRUPT_DSP_DSP);
+    } else if (mail == 0x80F3B002u) {
+        g_dsp_boot_stage = 1;
+    }
+}
+
+static int dsp_read(uint32_t off, uint32_t *out) {
+    int has = g_dsp_out_head != g_dsp_out_tail;
+    if (off == DSP_MBOX_OUT_H) { *out = has ? g_dsp_out[g_dsp_out_head & 15] >> 16 : 0; return 1; }
+    if (off == DSP_MBOX_OUT_L) {
+        *out = has ? g_dsp_out[g_dsp_out_head++ & 15] & 0xFFFF : 0;
+        return 1;
+    }
+    return 0;
+}
+
+/* ---- devices ------------------------------------------------------------------------------------ */
+
+#define VI_DI0 0x2030u /* VI display interrupt 0: bit 15 = interrupt pending */
+
+void rt_vi_retrace(void) { mmio_set(VI_DI0, mmio_get(VI_DI0, 2) | 0x8000u, 2); }
 
 /* ---- loading ----------------------------------------------------------------------------------- */
 
@@ -249,6 +384,8 @@ void rt_boot_setup(const char *root) {
     wr32(0x800000F0u, PPC_MEM_SIZE);  /* simulated memory size */
     wr32(0x800000F8u, 162000000u);    /* bus clock */
     wr32(0x800000FCu, 486000000u);    /* CPU clock */
+    dsp_send(0x8071FEEDu);            /* the DSP greets the task loader after reset */
+    rt_dvd_init(root);
     printf("[recomp] boot: FST at 0x%08X (%ld bytes), arena hi 0x%08X\n", fst_addr, size, fst_addr);
 }
 
@@ -341,6 +478,7 @@ int main(int argc, char **argv) {
 
     if (*sdk_log && (g_sdk_log = fopen(sdk_log, "w"))) g_trace_sdk = 1;
     printf("[recomp] booting: __start at 0x%08X (SDK call log: %s)\n", G___start, *sdk_log ? sdk_log : "off");
+    rt_threads_init(&g_ctx);
     F___start(&g_ctx);
     printf("[recomp] __start returned\n");
     if (g_sdk_log) fclose(g_sdk_log);

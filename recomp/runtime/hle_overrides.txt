@@ -12,5 +12,13 @@ __OSInitAudioSystem
 # Configures BATs and the memory interface via real mode + rfi. Host memory needs no protection setup.
 __OSInitMemoryProtection
 
-# Video: no VI interrupt yet, so waiting for retrace would idle forever. Pace at 60 Hz instead.
-VIWaitForRetrace
+
+# Thread switching: each guest thread runs on its own host thread (see threads.c).
+OSSaveContext
+OSLoadContext
+
+# No GPU yet, so drawing is always already done. (Waiting would need the PE finish interrupt.)
+GXDrawDone
+
+# Controllers come from the host (SDL later); for now port 1 is a connected pad with nothing pressed.
+PADRead

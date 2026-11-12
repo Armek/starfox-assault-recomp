@@ -16,4 +16,19 @@ void rt_sleep_us(unsigned us);
 /* Boot */
 void rt_boot_setup(const char *root);
 
+/* Threads and interrupts (threads.c) */
+void rt_threads_init(Ctx *main_ctx);
+Ctx *rt_current_ctx(void);
+void rt_raise_interrupt(int n);
+
+/* Devices (runtime.c) */
+void rt_vi_retrace(void);
+uint32_t rt_mmio_get(uint32_t off, int size);
+void rt_mmio_set(uint32_t off, uint32_t v, int size);
+
+/* Disc drive (dvd.c) */
+void rt_dvd_init(const char *root);
+int rt_dvd_write(uint32_t off, uint32_t v, int size);
+void rt_dvd_stats(unsigned long *reads, unsigned long *bytes);
+
 #endif

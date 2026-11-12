@@ -21,11 +21,19 @@ HLE(__OSInitAudioSystem) { (void)c; }
 /* void __OSInitMemoryProtection(void): MMU/BAT and MI setup through RealMode()/rfi. */
 HLE(__OSInitMemoryProtection) { (void)c; }
 
-/* void VIWaitForRetrace(void). Until the VI interrupt is emulated, advance the SDK's retrace
- * counter (read by VIGetRetraceCount, lbl_80386664) and sleep one 60 Hz frame. */
-#define VI_RETRACE_COUNT 0x80386664u
-HLE(VIWaitForRetrace) {
-    (void)c;
-    wr32(VI_RETRACE_COUNT, rd32(VI_RETRACE_COUNT) + 1);
-    rt_sleep_us(16683);
+/* void GXDrawDone(void): flush and wait for the GPU. With no GPU, the work is done immediately. */
+HLE(GXDrawDone) { F_GXFlush(c); }
+
+/* u32 PADRead(PADStatus status[4]). PADStatus (12 bytes): u16 button; s8 stickX, stickY,
+ * substickX, substickY; u8 triggerL, triggerR, analogA, analogB; s8 err. */
+#define PAD_ERR_NONE 0
+#define PAD_ERR_NO_CONTROLLER (-1)
+HLE(PADRead) {
+    uint32_t status = c->r[3];
+    for (uint32_t port = 0; port < 4; port++) {
+        uint32_t p = status + port * 12;
+        for (uint32_t i = 0; i < 12; i++) wr8(p + i, 0);
+        wr8(p + 10, (uint8_t)(port == 0 ? PAD_ERR_NONE : PAD_ERR_NO_CONTROLLER));
+    }
+    c->r[3] = 0; /* no motor/reset bits */
 }
