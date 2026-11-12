@@ -18,7 +18,7 @@ if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE RelWithDebInfo)
 endif()
 
-add_executable(sfa runtime/runtime.c runtime/hle.c runtime/threads.c runtime/dvd.c ${GENERATED_SOURCES})
+add_executable(sfa runtime/runtime.c runtime/hle.c runtime/threads.c runtime/dvd.c runtime/gx.c runtime/video.c ${GENERATED_SOURCES})
 target_include_directories(sfa PRIVATE runtime "${GENERATED_DIR}")
 
 if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
@@ -31,6 +31,18 @@ if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
 endif()
 find_package(Threads REQUIRED)
 target_link_libraries(sfa PRIVATE Threads::Threads)
+
+# SDL2 for the window, OpenGL context and input. On Windows, point SDL2_DIR at the official
+# SDL2-devel-*-VC package (default: build/deps/SDL2-2.32.10/cmake); elsewhere use the system SDL2.
+if(WIN32 AND NOT SDL2_DIR)
+  set(SDL2_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../build/deps/SDL2-2.32.10/cmake")
+endif()
+find_package(SDL2 REQUIRED CONFIG)
+target_link_libraries(sfa PRIVATE SDL2::SDL2)
+if(WIN32)
+  add_custom_command(TARGET sfa POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different
+    $<TARGET_FILE:SDL2::SDL2> $<TARGET_FILE_DIR:sfa>)
+endif()
 if(WIN32)
   target_compile_definitions(sfa PRIVATE _CRT_SECURE_NO_WARNINGS)
 endif()

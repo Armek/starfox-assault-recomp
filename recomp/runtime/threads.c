@@ -24,6 +24,7 @@
 #include <time.h>
 #include "funcs.h"
 #include "runtime.h"
+#include "gx.h"
 
 #ifdef _WIN32
 #include <windows.h>
@@ -293,6 +294,7 @@ static void exception(Ctx *c, uint32_t fn, int code, int is_interrupt) {
 
 void rt_safepoint(Ctx *c) {
     g_safepoint_budget = 4096;
+    if (video_quit_requested()) { printf("[recomp] window closed\n"); exit(0); }
     double t = now_s();
     if (t >= g_next_vi) {
         if (g_next_vi == 0) g_next_vi = t;

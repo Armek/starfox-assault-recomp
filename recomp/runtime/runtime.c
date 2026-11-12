@@ -14,6 +14,7 @@
 #endif
 #include "funcs.h"
 #include "runtime.h"
+#include "gx.h"
 
 typedef struct { uint32_t addr; GuestFn fn; const char *name; } FuncEntry;
 extern const unsigned g_func_count;
@@ -256,7 +257,10 @@ void rt_slow_write(uint32_t a, uint32_t v, int size) {
     }
     if ((a >> 16) != 0xCC00) rt_fatal("write%d 0x%08X to unmapped address 0x%08X", size * 8, v, a);
     uint32_t off = a & 0xFFFF;
-    if (off >= 0x8000) return; /* GX write-gather pipe: no GPU yet */
+    if (off >= 0x8000) { /* GX write-gather pipe */
+        if (off < 0x9000) gx_fifo_write(v, size);
+        return;
+    }
     if (rt_dvd_write(off, v, size)) return;
     switch (off) {
     case 0x680C: case 0x6820: case 0x6834: /* EXI channel 0-2 control: TSTART completes at once */
@@ -462,11 +466,14 @@ static int selftest(void) {
 
 int main(int argc, char **argv) {
     const char *root = "orig/GF7E01", *sdk_log = "build/GF7E01/sdk_trace.txt";
-    int run_selftest = 0;
+    int run_selftest = 0, dump_frames = 0, no_video = 0;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--selftest")) run_selftest = 1;
         else if (!strncmp(argv[i], "--sdk-log=", 10)) sdk_log = argv[i] + 10;
         else if (!strncmp(argv[i], "--sdk-log-limit=", 16)) g_sdk_log_limit = strtoul(argv[i] + 16, NULL, 0);
+        else if (!strcmp(argv[i], "--dump-frames")) dump_frames = 1;
+        else if (!strcmp(argv[i], "--no-video")) no_video = 1;
+        else if (!strcmp(argv[i], "--auto-press")) video_set_auto_press(1);
         else root = argv[i];
     }
     g_mem = calloc(1, PPC_MEM_SIZE);
@@ -478,6 +485,8 @@ int main(int argc, char **argv) {
 
     if (*sdk_log && (g_sdk_log = fopen(sdk_log, "w"))) g_trace_sdk = 1;
     printf("[recomp] booting: __start at 0x%08X (SDK call log: %s)\n", G___start, *sdk_log ? sdk_log : "off");
+    gx_init();
+    if (!no_video) video_start(dump_frames);
     rt_threads_init(&g_ctx);
     F___start(&g_ctx);
     printf("[recomp] __start returned\n");

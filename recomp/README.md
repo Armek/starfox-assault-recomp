@@ -3,18 +3,36 @@
 Translates the Gekko (PowerPC 750CL) machine code in `main.dol` into portable C, then links it with a
 host runtime into a native executable. This is the route toward a PC / Linux / Steam Deck build.
 
-## Status: milestone 2b done (the game runs its frame loop)
+## Status: milestone 3 in progress (the game draws its first screens)
 
 - **Milestone 1:** all of `main.dol` translates to C with 0 untranslated instructions. It compiles with
   clang 19 with no errors or warnings, and `sfa --selftest` passes 5/5.
 - **Milestone 2:** `__start` → `OSInit` → `main` runs from recompiled code, and the Dolphin OS banner prints.
-- **Milestone 2b:** `sfa` runs the game's main loop at 60 Hz with no GPU or audio output yet.
-  - It starts CRI's ADX threads (`adxm_vsync_proc`, `adxm_fs_proc`, `adxm_mwidle_proc`).
-  - It loads its first files from the disc: `effect/effect.efb`, `tex_pack_00.nut`, `nud_pack_00.pac`, `ns_logos.nut`.
-  - It submits display lists every frame.
-  - In 30 seconds it makes 615,000 SDK calls to 368 distinct functions ([docs/boot_trace.md](../docs/boot_trace.md)).
-  - It appears to wait at the startup logos or the memory-card check. Memory cards aren't emulated and the pad
-    has no buttons pressed yet.
+- **Milestone 2b:** the game runs its threaded main loop at 60 Hz, starts CRI's ADX threads and loads files
+  from the disc ([docs/boot_trace.md](../docs/boot_trace.md)).
+- **Milestone 3 (so far):** `sfa` opens a window and renders the game's GX output with OpenGL.
+  - The **"WARNING – HEALTH AND SAFETY"** screen draws correctly. With a button press (keyboard, a game
+    controller, or `--auto-press`) the game moves on.
+  - The **Sofdec logo** draws correctly. The game streams `movie/loop_demo.sfd` through the recompiled CRI
+    Sofdec decoder, but movie frames come out black: the YUV→RGB conversion uses multi-stage TEV, which isn't
+    implemented yet.
+  - It then loads `m4.rel`, links it with the SDK's own `OSLink`, and stops on the first call into the module.
+    REL code isn't translated yet.
+
+### Graphics and input (milestone 3)
+
+| Piece | How | Where |
+|---|---|---|
+| **Command processor** | Bytes written to the write-gather pipe (`0xCC008000`) are parsed as soon as a command is complete. It handles CP/XF/BP register loads (with the BP mask register), indexed XF loads, `CALL_DL` display lists from guest memory, and all 8 primitive types. | `gx.c` |
+| **Vertices** | Every attribute (matrix indices, position, normal/NBT, two colors, eight texcoords) in direct, 8-bit and 16-bit indexed modes, all component formats and color formats. They're transformed on the CPU: position matrix, perspective/orthographic projection and viewport, written as clip-space vertices so GL still clips and interpolates with perspective correction. Texcoords go through the texgen source row and texture matrix (ST/STQ). | `gx.c` |
+| **Textures** | I4, I8, IA4, IA8, RGB565, RGB5A3, RGBA8, CI4, CI8, CI14X2 (TLUT loads into a TMEM model) and CMPR. Decoded to RGBA8 and cached by address/format/size/palette, then re-decoded when the source bytes' hash changes (checked once per frame). | `gx.c` |
+| **Render state** | Blend factors/subtract, color/alpha write masks, depth test/function/write, scissor, alpha test. TEV stage 0 is approximated as texture × rasterized color, texture only, or color only. | `gx.c`, `video.c` |
+| **Frames** | Each frame's batches are built on the guest threads and handed to a **render thread** that owns the SDL window and an OpenGL 3.3 core context. It draws into a 640×528 EFB framebuffer and scales the XFB-copy rectangle into the window. EFB clears requested by copies are applied in order. | `video.c` |
+| **Input** | Port 1 merges the keyboard and the first SDL game controller (Steam Deck included) into `PADRead`. `--auto-press` taps START and A every 4 seconds for unattended testing. | `video.c`, `hle.c` |
+| **Diagnostics** | `--dump-frames` saves every 15th presented frame to `build/GF7E01/frames/*.bmp`. `--no-video` runs headless. | `video.c` |
+
+Keyboard: arrows/WASD = control stick, Enter = START, Space/J = A, K/Backspace = B, L = X, I = Y,
+Q/E = L/R, Z = Z, numpad 8/4/6/2 = C-stick.
 
 ### How the runtime provides the hardware
 
@@ -33,16 +51,19 @@ host runtime into a native executable. This is the route toward a PC / Linux / S
 The generator also emits **extra entry points** for calls into the middle of a function (8, all in
 `__save_fpr`/`__restore_fpr`), and the timebase uses a high-resolution clock (`__AI_SRC_INIT` measures 1/48000 s).
 
-## Next: milestone 3 (see something)
+## Next
 
-1. **GX → OpenGL/Vulkan.** Decode the command stream the game writes to `0xCC008000` and the display lists
-   (`GXCallDisplayList`), and draw them. This is the largest piece. Reusing an existing GX
-   implementation (for example Aurora, or Dolphin's video code as a reference) will save a lot of work.
-   PE draw-done/token interrupts come with it.
-2. **Window and input:** SDL2 for the window, VI frame presentation and `PADRead` from real controllers.
-3. **Memory card:** emulate a card in slot A (EXI) backed by a file, or HLE the `CARD*` API.
-4. **REL modules:** translate the 22 `.rel` files and replace `OSLink` so levels can load.
-5. **Audio:** HLE the AX/DSP microcode, CRI ADX decoding (already recompiled), and AI to SDL audio.
+1. **REL modules (the current blocker).** Translate the 22 `.rel` files. Their load address is only known
+   at run time, so the generator has to emit relocation-aware code: module-relative addresses become
+   `module_base + offset`, and DOL references resolve statically. Hook `OSLink`/`OSUnlink` to register
+   each module's base addresses and its functions with the dispatcher.
+2. **Full TEV:** all 16 stages, the color/alpha combiners, konst colors, TEV registers, swap tables and
+   indirect textures, generated as GLSL per TEV configuration. This is needed for movies (YUV→RGB) and
+   almost all 3D effects.
+3. **Lighting:** XF light channels (diffuse/specular/attenuation) using the decoded normals.
+4. **EFB copies to textures:** render-to-texture, used for effects and the pause screen.
+5. **Memory card:** emulate a card in slot A (EXI) backed by a file, or HLE the `CARD*` API.
+6. **Audio:** AX/DSP HLE, then CRI ADX (already recompiled) and AI out through SDL audio.
 
 ## Build
 

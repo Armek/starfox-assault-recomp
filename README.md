@@ -63,8 +63,9 @@ On Linux, `wine` or `wibo` is downloaded automatically for the compilers.
 ## Static recompilation (PC port)
 
 [recomp/](recomp/README.md) translates `main.dol` to C and links it into a native executable.
-Milestones 1, 2 and 2b are done: everything in main.dol translates and compiles, and the recompiled
-game runs its threaded frame loop at 60 Hz and loads files from the disc. Graphics are next.
+Milestones 1, 2 and 2b are done, and milestone 3 is under way. The recompiled game runs its threaded
+frame loop, opens a window, renders its health-and-safety and Sofdec logo screens through an OpenGL GX
+renderer, and takes keyboard and controller input. Translating the REL level modules is next.
 
 ## See also
 
