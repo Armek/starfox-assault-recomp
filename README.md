@@ -10,6 +10,19 @@ that rebuilds the original game exactly, which a native PC/Linux/Steam Deck port
 - `main.dol` and 22 of 23 REL modules are split into objects, and **all 23 rebuild byte-for-byte**
   (`config/GF7E01/build.sha1`).
 - 7,654 functions found (5,375 in the DOL, 2,279 in RELs). 0% decompiled so far.
+- Library functions identified (see [docs/sdk_boundary.md](docs/sdk_boundary.md) and `tools/symbol_id/`):
+  Dolphin SDK 777/811, MetroTRK 161/161, MSL/Runtime 96/198, CRI ADX/Sofdec 120/1088.
+
+### main.dol layout
+
+| Range | Contents |
+|---|---|
+| `0x8000DDA0`–`0x8012D438` | Game code (`main` at `0x8000DE88`) |
+| `0x8012D438`–`0x8015CA04` | Dolphin SDK (OS, EXI, SI, DB, DVD, VI, PAD, AI, AR, ARQ, AX, AXFX, MIX, DSP, CARD, GX) |
+| `0x8015CA04`–`0x80198B1C` | Namco engine libraries ("NU Sound" driver, BGM control, `dvdfs.c`, heaps) |
+| `0x80198B1C`–`0x801E8D48` | CRI middleware (ADX, LSC, SVM, SJ, Sofdec/MWSFD, SFX) |
+| `0x801E8D48`–`0x801EEFA0` | MetroTRK debugger |
+| `0x801EEFA0`–`0x80200B20` | MSL C library and CodeWarrior runtime |
 - Toolchain: Metrowerks CodeWarrior (MSL runtime). The linker is set to `GC/2.6`, which is assumed
   from the 2004 build dates and still needs confirming against compiled code.
 - Middleware: Dolphin SDK (OS, GX, AX, DSP, ARQ, CARD, DVD, PAD, VI), CRI ADX/Sofdec (Sep 2004).
