@@ -269,10 +269,67 @@ void rt_mmio_set(uint32_t off, uint32_t v, int size) { mmio_set(off, v, size); }
 /* ARAM: 16 MB of auxiliary memory reached only by DMA (0xCC005020 main address, 0x5024 ARAM
  * address, 0x5028 count with bit 31 = ARAM->main). Transfers finish instantly and raise the
  * ARAM interrupt; 0x5016 bit 0 reports the ARAM controller as ready. */
+#ifndef DSP_CSR
+#define DSP_CSR 0x500Au
+#endif
 #define ARAM_SIZE 0x01000000u
 #define AR_MODE 0x5016u
 #define OS_INTERRUPT_DSP_ARAM 6
 static uint8_t *g_aram;
+
+const uint8_t *rt_aram(void) { return g_aram; }
+
+/* ---- AI DMA: the DSP's audio interface plays a buffer from main memory --------------------------
+ * 0x5030/0x5032 start address, 0x5036 bit 15 = enable and bits 0-14 = length in 32-byte blocks,
+ * 0x503A = blocks left. When a buffer finishes (real time, 32 kHz stereo) the samples go to the
+ * host audio device, AIDINT (CSR 0x08) is raised and the next buffer is latched from the registers. */
+#define OS_INTERRUPT_DSP_AI 5
+static int g_ai_running;
+static uint32_t g_ai_addr, g_ai_len;
+static uint64_t g_ai_start, g_ai_end; /* timebase ticks */
+
+static void ai_latch(uint64_t now) {
+    g_ai_addr = 0x80000000u | ((mmio_get(0x5030, 2) << 16 | mmio_get(0x5032, 2)) & 0x03FFFFE0u);
+    g_ai_len = (mmio_get(0x5036, 2) & 0x7FFF) * 32;
+    g_ai_start = now;
+    g_ai_end = now + (uint64_t)g_ai_len / 4 * 40500000u / 32000u; /* stereo s16 frames at 32 kHz */
+    if (!g_ai_len) g_ai_end = now + 40500000u / 200;
+}
+
+void rt_ai_tick(void) {
+    int enabled = (mmio_get(0x5036, 2) >> 15) & 1;
+    uint64_t now = rt_timebase();
+    if (!enabled) { g_ai_running = 0; return; }
+    if (!g_ai_running) { g_ai_running = 1; ai_latch(now); return; }
+    if (now < g_ai_end) return;
+    /* this buffer finished playing */
+    static int16_t pcm[0x8000];
+    uint32_t frames = g_ai_len / 4;
+    if (frames > sizeof pcm / 4) frames = sizeof pcm / 4;
+    for (uint32_t i = 0; i < frames * 2; i++) pcm[i] = (int16_t)rd16(g_ai_addr + i * 2);
+    video_audio_push(pcm, (int)frames);
+    mmio_set(DSP_CSR, mmio_get(DSP_CSR, 2) | 0x08u, 2); /* AIDINT */
+    rt_raise_interrupt(OS_INTERRUPT_DSP_AI);
+    if (getenv("SFA_AX_DEBUG")) {
+        static unsigned long fires;
+        static uint64_t t0;
+        extern unsigned long g_ax_frames;
+        if (!t0) t0 = now;
+        if (++fires % 1000 == 0)
+            printf("[ai] %lu buffers done, %lu AX frames, %.1f s, buffer %u bytes, late by %.1f ms\n", fires, g_ax_frames,
+                   (double)(now - t0) / 40500000.0, g_ai_len, (double)(int64_t)(now - g_ai_end) / 40500.0);
+    }
+    ai_latch(g_ai_end > now - 40500000u / 20 ? g_ai_end : now); /* keep time unless far behind */
+}
+
+uint64_t rt_ai_next_deadline(void) { return g_ai_running ? g_ai_end : 0; }
+
+static uint32_t ai_blocks_left(void) {
+    if (!g_ai_running || g_ai_end <= g_ai_start) return 0;
+    uint64_t now = rt_timebase();
+    if (now >= g_ai_end) return 0;
+    return (uint32_t)((g_ai_end - now) * (g_ai_len / 32) / (g_ai_end - g_ai_start));
+}
 
 static void aram_dma(void) {
     uint32_t mm = (uint32_t)mmio_get(0x5020, 4) & 0x03FFFFE0u;
@@ -314,6 +371,7 @@ uint32_t rt_slow_read(uint32_t a, int size) {
     uint32_t v;
     if (dsp_read(off, &v)) return v;
     if (off == AR_MODE) return 1; /* ARAM controller initialized */
+    if (off == 0x503A) return ai_blocks_left();
     if (off == 0x3014 && size == 4) return gx_pi_wptr_read(); /* CPU FIFO write pointer */
     poll_watchdog(a);
     return mmio_get(off, size);
@@ -370,13 +428,27 @@ static unsigned long g_dsp_mails_in;
 
 static void dsp_send(uint32_t mail) { g_dsp_out[g_dsp_out_tail++ & 15] = mail; }
 
+static void dsp_interrupt(uint32_t mail) {
+    dsp_send(mail);
+    mmio_set(DSP_CSR, mmio_get(DSP_CSR, 2) | DSP_CSR_DSPINT, 2);
+    rt_raise_interrupt(OS_INTERRUPT_DSP_DSP);
+}
+
 static void dsp_receive(uint32_t mail) {
+    static int expect_cl; /* the AX microcode: 0xBABE0180, then the command list address */
     g_dsp_mails_in++;
-    if (g_dsp_boot_stage == 1) {
+    if (expect_cl) {
+        expect_cl = 0;
+        rt_ax_command_list(0x80000000u | (mail & 0x03FFFFFFu));
+        extern unsigned long g_ax_frames, g_ax_voices_played;
+        if (getenv("SFA_AX_DEBUG") && g_ax_frames % 1000 == 1)
+            printf("[ax] frame %lu, %lu voice-frames rendered so far\n", g_ax_frames, g_ax_voices_played);
+        dsp_interrupt(0xDCD10001u); /* frame done: the task "resumes" and AX may start the next frame */
+    } else if (mail == 0xBABE0180u) {
+        expect_cl = 1;
+    } else if (g_dsp_boot_stage == 1) {
         g_dsp_boot_stage = 0;
-        dsp_send(0xDCD10000u); /* task init done */
-        mmio_set(DSP_CSR, mmio_get(DSP_CSR, 2) | DSP_CSR_DSPINT, 2);
-        rt_raise_interrupt(OS_INTERRUPT_DSP_DSP);
+        dsp_interrupt(0xDCD10000u); /* task init done */
     } else if (mail == 0x80F3B002u) {
         g_dsp_boot_stage = 1;
     }

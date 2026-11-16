@@ -201,6 +201,36 @@ void video_get_pad(int port, PadState *out) {
     }
 }
 
+/* ---- audio output -------------------------------------------------------------------------------- */
+static SDL_AudioDeviceID g_audio;
+
+/* 32 kHz interleaved stereo from the AI DMA (host-endian samples). */
+void video_audio_push(const int16_t *pcm, int frames) {
+    static FILE *wav;
+    static uint32_t wav_frames;
+    if (getenv("SFA_DUMP_AUDIO") && frames > 0) { /* debugging: everything played, as a WAV file */
+        if (!wav) {
+            wav = fopen("build/GF7E01/audio.wav", "wb");
+            static const uint8_t hdr[44] = {'R','I','F','F',0,0,0,0,'W','A','V','E','f','m','t',' ',16,0,0,0,1,0,2,0,
+                0x00,0x7D,0,0, 0x00,0xF4,0x01,0, 4,0,16,0,'d','a','t','a',0,0,0,0};
+            if (wav) fwrite(hdr, 1, 44, wav);
+        }
+        if (wav) {
+            fwrite(pcm, 4, (size_t)frames, wav);
+            wav_frames += (uint32_t)frames;
+            uint32_t data = wav_frames * 4, riff = 36 + data;
+            long pos = ftell(wav);
+            fseek(wav, 4, SEEK_SET); fwrite(&riff, 4, 1, wav);
+            fseek(wav, 40, SEEK_SET); fwrite(&data, 4, 1, wav);
+            fseek(wav, pos, SEEK_SET);
+            fflush(wav);
+        }
+    }
+    if (!g_audio || frames <= 0) return;
+    if (SDL_GetQueuedAudioSize(g_audio) > 32000 * 4 / 6) return; /* > ~150 ms queued: drop, don't lag */
+    SDL_QueueAudio(g_audio, pcm, (Uint32)frames * 4);
+}
+
 /* ---- frame queue --------------------------------------------------------------------------------- */
 static SDL_mutex *g_qlock;
 static SDL_cond *g_qcond;
@@ -683,6 +713,20 @@ void video_start(int dump_frames) {
     g_dump = dump_frames;
     SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS | SDL_INIT_GAMECONTROLLER) != 0) rt_fatal("SDL_Init: %s", SDL_GetError());
+    if (SDL_InitSubSystem(SDL_INIT_AUDIO) == 0) {
+        SDL_AudioSpec want = {0}, have;
+        want.freq = 32000;
+        want.format = AUDIO_S16SYS;
+        want.channels = 2;
+        want.samples = 512;
+        g_audio = SDL_OpenAudioDevice(NULL, 0, &want, &have, 0);
+        if (g_audio) {
+            SDL_PauseAudioDevice(g_audio, 0);
+            printf("[audio] %d Hz stereo\n", have.freq);
+        } else {
+            printf("[audio] no audio device: %s\n", SDL_GetError());
+        }
+    }
     g_pad_lock = SDL_CreateMutex();
     g_qlock = SDL_CreateMutex();
     g_qcond = SDL_CreateCond();

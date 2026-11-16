@@ -3,7 +3,7 @@
 Translates the Gekko (PowerPC 750CL) machine code in `main.dol` into portable C, then links it with a
 host runtime into a native executable. This is the route toward a PC / Linux / Steam Deck build.
 
-## Status: milestone 3 done (title screen, menus and mission briefing render); audio is next
+## Status: milestone 4 done (Mission 1 is playable, with sound)
 
 - **Milestone 1:** all of `main.dol` translates to C with 0 untranslated instructions. It compiles with
   clang 19 with no errors or warnings, and `sfa --selftest` passes 5/5.
@@ -16,10 +16,11 @@ host runtime into a native executable. This is the route toward a PC / Linux / S
   - the **3D title screen** (Arwings in the hangar) and the **STAR FOX ASSAULT logo**
   - save-file creation on the emulated memory card, the **NAME ENTRY** and **CONTROLLER SETTING** screens
   - the **Mission 1 briefing** ("Mission 1: Take Out Oikonny"), loading `m9.rel`, `fpc/s_01_01.fpc` and the map data.
-- **Current stop:** the Mission 1 load never completes. It streams the first 7 chunks of the mission music
-  (`bgm/A00017.dsp`) into ARAM and then waits. The most likely reason is that nothing plays audio: the
-  DSP's AX microcode would advance the voices and drive the AI DMA interrupt, and the streamer refills only
-  as playback consumes. Next step: AX/DSP audio HLE (see below).
+- **Milestone 4:** audio, and the game reaches **Mission 1 gameplay** ("01 — A New Enemy — Fortuna").
+  - It shows the Arwing in combat with the fleet, the full HUD, wingman tags and the pause menu.
+  - Music and sound effects play through SDL.
+  - The frame rate is 25–29 fps in the mission, which looks like a 30 fps cap: the game still idles
+    20–28% of the time waiting for the retrace.
 - **Known rendering gap:** some generated dialog boxes still show no text.
 
 ### Memory card
@@ -31,6 +32,41 @@ host runtime into a native executable. This is the route toward a PC / Linux / S
   `GF7E01-starfox.dat.gci` (5 blocks).
 - **`CARDGetStatus`** computes the banner and icon offsets the way the SDK's `__CARDUpdateIconOffsets` does.
 - **Async calls** complete immediately and call their callback.
+
+### Audio (milestone 4)
+
+`ax.c` is an HLE of the DSP's AX microcode. The SDK's AX library stays recompiled on the CPU side.
+- **AI DMA** (`runtime.c`): the audio interface plays each 0x280-byte buffer (160 stereo frames at 32 kHz,
+  5 ms) in real time, sends it to an SDL audio device, then raises AIDINT (interrupt 5). That runs
+  `__AXOutAiCallback`, the game's sound engine (NU Sound) and CRI ADX streaming.
+- **Mailbox:** `__AXOutNewFrame` mails `0xBABE0180` plus a command-list address. The fake DSP executes
+  the list and answers `0xDCD10001` with a DSP interrupt (`__AXDSPResumeCallback`).
+- **Command list:** studio setup, surround buffer, voice list (`2`), process voices (`3`), aux A/B
+  send/return (`4`/`5`), compressor, final output (`0xE`), end (`0xF`).
+- **Voices** (`AXPB`, 0xF4 bytes):
+  - per-millisecond parameter updates
+  - DSP-ADPCM, PCM16 and PCM8 from ARAM, with loop and end handling (restoring the loop ADPCM context
+    for non-stream voices)
+  - pitch resampling, the volume envelope and the one-pole low-pass filter
+  - mixing into main, aux A and aux B with volume ramps.
+
+  Positions, ADPCM history, envelopes and `state` are written back, so the game sees playback progress.
+  That's what lets the streamed mission music keep loading, which was what blocked the Mission 1 load.
+- **Idle sleep** also wakes for the next AI buffer, so audio interrupts keep their 200 Hz pace.
+
+### Performance
+
+`SFA_PROFILE=1` samples which guest function runs every millisecond and times the GX stages. A Mission 1
+frame has about 20,000 small draws (fleet, lasers, particles, HUD).
+- **The fixes that got it to 25–29 fps:**
+  - compile the runtime optimized (`CMakeLists.txt` now defaults to RelWithDebInfo *before* `project()`;
+    clang on Windows otherwise picks Debug and `-O0`)
+  - read debug environment variables once
+  - hash texture contents at most once per frame
+  - decode XF transform/channel/texgen setup once per draw
+  - batch by render-state serial number instead of comparing whole states.
+- **Further headroom:** move vertex transform to a GPU vertex shader, and cut per-draw state rebuilds
+  (the game rewrites BP registers between almost every draw).
 
 ### Display lists built at run time
 
@@ -94,15 +130,13 @@ The generator also emits **extra entry points** for calls into the middle of a f
 
 ## Next
 
-1. **Audio (milestone 4, the current blocker).** HLE the DSP's AX microcode:
-   - read the voice parameter blocks the CPU sends each frame and advance the playback positions
-   - decode DSP-ADPCM/PCM8/PCM16 from ARAM
-   - mix the voices and output through SDL audio
-   - raise the AI DMA interrupt every audio frame, so the game's sound engine and CRI ADX streaming run.
+1. **Lighting:** XF light channels (diffuse/specular/attenuation) using the decoded normals. Lit models
+   currently use an ambient + constant estimate.
 2. **Indirect textures** (the TEV indirect stages, BP `0x10`–`0x27`), for warps and effects.
-3. **Lighting:** XF light channels (diffuse/specular/attenuation) using the decoded normals.
-4. **EFB copies to textures:** render-to-texture, used for effects and the pause screen.
-5. **The remaining blank dialog text.**
+3. **EFB copies to textures:** render-to-texture, used for effects and the pause screen.
+4. **The remaining blank dialog text.**
+5. **Performance:** GPU-side vertex transform, toward a steady 30 (or unlocked 60) fps.
+6. **Packaging:** a release build layout, and a Linux/Steam Deck build and test.
 
 ### Debugging aids
 
@@ -110,6 +144,9 @@ The generator also emits **extra entry points** for calls into the middle of a f
 - **`SFA_GX_DEBUG=1`** logs draw configurations, textures (with how many source bytes are non-zero),
   TMEM preloads, EFB-to-texture copies and ARAM DMA, and saves decoded textures as images.
 - **`SFA_GX_FRAMEDUMP=<n>`** lists every batch of frame *n*.
+- **`SFA_PROFILE=1`** prints the hottest guest functions and the GX stage times every 10 s.
+- **`SFA_AX_DEBUG=1`** logs AX frame and AI buffer counts. **`SFA_DUMP_AUDIO=1`** writes everything
+  played to `build/GF7E01/audio.wav`.
 - **`SFA_GX_TEXADDR=<hex>`** shows which code binds that texture address and which display list sets it.
 - **Write watchpoint:** a build with `-DRT_WATCH=ON` (in its own build folder) and
   `SFA_WATCH=<hex addr>:<hex len>` logs every non-zero write to that range with the functions that made it.

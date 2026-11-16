@@ -28,6 +28,7 @@
 
 #ifdef _WIN32
 #include <windows.h>
+#include <mmsystem.h>
 typedef SRWLOCK Mutex;
 typedef CONDITION_VARIABLE Cond;
 #define MUTEX_INIT SRWLOCK_INIT
@@ -173,6 +174,57 @@ static HThread *new_thread(uint32_t ctx) {
     return t;
 }
 
+/* ---- sampling profiler (SFA_PROFILE=1) ------------------------------------------------------------
+ * Every millisecond, note the guest function entered most recently (and whether the CPU idles);
+ * every 10 s print the hottest. Host work (GX decoding, HLE) is charged to the guest caller. */
+#define PROF_SLOTS 8192
+static uint32_t g_prof_addr[PROF_SLOTS], g_prof_hits[PROF_SLOTS];
+static unsigned long g_prof_total, g_prof_idle;
+
+static void prof_sample(void) {
+    g_prof_total++;
+    if (rd32(OS_CURRENT_THREAD) == 0) { g_prof_idle++; return; }
+    uint32_t a = g_trace_ring[(g_trace_pos - 1) & (RT_TRACE_RING - 1)];
+    uint32_t h = (a * 2654435761u) >> 19;
+    for (int p = 0; p < 64; p++) {
+        uint32_t k = (h + (uint32_t)p) & (PROF_SLOTS - 1);
+        if (g_prof_addr[k] == a || !g_prof_addr[k]) { g_prof_addr[k] = a; g_prof_hits[k]++; return; }
+    }
+}
+
+static void prof_report(void) {
+    uint32_t idx[PROF_SLOTS];
+    unsigned n = 0;
+    for (unsigned k = 0; k < PROF_SLOTS; k++) if (g_prof_hits[k]) idx[n++] = k;
+    for (unsigned i = 0; i < n && i < 25; i++) /* partial selection sort: top 25 */
+        for (unsigned j = i + 1; j < n; j++)
+            if (g_prof_hits[idx[j]] > g_prof_hits[idx[i]]) { uint32_t t = idx[i]; idx[i] = idx[j]; idx[j] = t; }
+    printf("[prof] %lu samples, %.1f%% idle; hottest guest functions (last entered):\n", g_prof_total,
+           g_prof_total ? 100.0 * g_prof_idle / g_prof_total : 0.0);
+    for (unsigned i = 0; i < n && i < 25; i++)
+        printf("[prof] %5.1f%%  %08X %s\n", 100.0 * g_prof_hits[idx[i]] / g_prof_total, g_prof_addr[idx[i]],
+               rt_func_name(g_prof_addr[idx[i]]));
+    fflush(stdout);
+    memset(g_prof_hits, 0, sizeof g_prof_hits);
+    memset(g_prof_addr, 0, sizeof g_prof_addr);
+    g_prof_total = g_prof_idle = 0;
+}
+
+#ifdef _WIN32
+static DWORD WINAPI prof_thread(LPVOID arg)
+#else
+static void *prof_thread(void *arg)
+#endif
+{
+    (void)arg;
+    for (unsigned long tick = 1;; tick++) {
+        rt_sleep_us(1000);
+        prof_sample();
+        if (tick % 10000 == 0) { prof_report(); gx_profile_report(); }
+    }
+    return 0;
+}
+
 void rt_threads_init(Ctx *main_ctx) {
     HThread *t = calloc(1, sizeof *t);
     t->c = main_ctx;
@@ -180,6 +232,16 @@ void rt_threads_init(Ctx *main_ctx) {
     g_threads[g_thread_count++] = t;
     g_running = t;
     t_self = t;
+    if (getenv("SFA_PROFILE")) {
+#ifdef _WIN32
+        timeBeginPeriod(1);
+        CloseHandle(CreateThread(NULL, 0, prof_thread, NULL, 0, NULL));
+#else
+        pthread_t pt;
+        pthread_create(&pt, NULL, prof_thread, NULL);
+        pthread_detach(pt);
+#endif
+    }
 }
 
 /* u32 OSSaveContext(OSContext *context): returns 0 now; "returns 1" when the context is loaded. */
@@ -303,6 +365,7 @@ void rt_safepoint(Ctx *c) {
         rt_vi_retrace();
         g_pending |= 1u << 24;
     }
+    rt_ai_tick();
     if (!(c->msr & MSR_EE) || t_self->irq_depth != 0) return;
     if (g_dec_armed && rt_timebase() >= g_dec_deadline) {
         g_dec_armed = 0;
@@ -319,6 +382,11 @@ void rt_safepoint(Ctx *c) {
         if (g_dec_armed) {
             double dec_s = (double)(int64_t)(g_dec_deadline - rt_timebase()) / 40500000.0;
             if (dec_s < wait_s) wait_s = dec_s;
+        }
+        uint64_t ai = rt_ai_next_deadline(); /* the audio DMA needs servicing every 5 ms */
+        if (ai) {
+            double ai_s = (double)(int64_t)(ai - rt_timebase()) / 40500000.0;
+            if (ai_s < wait_s) wait_s = ai_s;
         }
         if (wait_s > 0.0005) rt_sleep_us((unsigned)(wait_s * 1e6));
         g_safepoint_budget = 0;

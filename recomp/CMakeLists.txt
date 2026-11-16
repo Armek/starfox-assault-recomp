@@ -1,4 +1,9 @@
 cmake_minimum_required(VERSION 3.16)
+# Default to an optimized build. (Must be set before project(): some toolchains, such as clang on
+# Windows, otherwise pick Debug and compile the runtime at -O0.)
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+  set(CMAKE_BUILD_TYPE RelWithDebInfo CACHE STRING "Build type" FORCE)
+endif()
 project(sfa_recomp C)
 
 # Generated sources come from: python recomp/tools/ppcrecomp.py
@@ -14,11 +19,8 @@ list(TRANSFORM GENERATED_SOURCES PREPEND "${GENERATED_DIR}/")
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
-if(NOT CMAKE_BUILD_TYPE)
-  set(CMAKE_BUILD_TYPE RelWithDebInfo)
-endif()
 
-add_executable(sfa runtime/runtime.c runtime/hle.c runtime/threads.c runtime/dvd.c runtime/gx.c runtime/video.c runtime/card.c ${GENERATED_SOURCES})
+add_executable(sfa runtime/runtime.c runtime/hle.c runtime/threads.c runtime/dvd.c runtime/gx.c runtime/video.c runtime/card.c runtime/ax.c ${GENERATED_SOURCES})
 target_include_directories(sfa PRIVATE runtime "${GENERATED_DIR}")
 
 if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
@@ -45,6 +47,9 @@ if(WIN32 AND NOT SDL2_DIR)
 endif()
 find_package(SDL2 REQUIRED CONFIG)
 target_link_libraries(sfa PRIVATE SDL2::SDL2)
+if(WIN32)
+  target_link_libraries(sfa PRIVATE winmm)  # timeBeginPeriod: 1 ms sleep resolution
+endif()
 if(WIN32)
   add_custom_command(TARGET sfa POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different
     $<TARGET_FILE:SDL2::SDL2> $<TARGET_FILE_DIR:sfa>)

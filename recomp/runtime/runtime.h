@@ -26,6 +26,14 @@ void rt_vi_retrace(void);
 uint32_t rt_mmio_get(uint32_t off, int size);
 void rt_mmio_set(uint32_t off, uint32_t v, int size);
 
+/* ARAM, audio interface and AX (runtime.c, ax.c) */
+#define RT_ARAM_SIZE 0x01000000u
+const uint8_t *rt_aram(void);
+void rt_ai_tick(void);
+uint64_t rt_ai_next_deadline(void);  /* timebase tick when the current AI buffer ends, 0 if idle */
+void rt_ax_command_list(uint32_t cl);
+void video_audio_push(const int16_t *interleaved_be_ok, int frames);
+
 /* Disc drive (dvd.c) */
 void rt_dvd_init(const char *root);
 int rt_dvd_write(uint32_t off, uint32_t v, int size);

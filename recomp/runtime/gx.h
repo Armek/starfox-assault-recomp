@@ -47,6 +47,7 @@ typedef struct {
 typedef struct {
     GxState state;
     GxPrimKind kind;
+    uint32_t serial;        /* render-state serial (gx.c): equal serial means equal state */
     uint32_t first, count;  /* into the frame's vertex array */
 } GxBatch;
 
@@ -96,5 +97,6 @@ void gx_fifo_write(uint32_t value, int size);  /* a write to the 0xCC008000 pipe
 void gx_init(void);
 void gx_pi_wptr_write(uint32_t v);   /* PI FIFO write pointer (0xCC003014) */
 uint32_t gx_pi_wptr_read(void);
+void gx_profile_report(void);
 
 #endif

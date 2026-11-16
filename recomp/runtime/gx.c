@@ -26,6 +26,16 @@ static GxFrame *g_frame;
 static uint32_t g_frame_number;
 static unsigned long g_stat_draws, g_stat_unknown;
 
+/* Debug switches, read once (getenv is slow and these are checked on hot paths). */
+static int g_dbg = -1;           /* SFA_GX_DEBUG */
+static uint32_t g_dbg_texaddr;   /* SFA_GX_TEXADDR, 0 = off */
+static void dbg_init(void) {
+    if (g_dbg >= 0) return;
+    g_dbg = getenv("SFA_GX_DEBUG") != NULL;
+    const char *t = getenv("SFA_GX_TEXADDR");
+    g_dbg_texaddr = t ? (uint32_t)strtoul(t, NULL, 16) : 0;
+}
+
 static float xff(uint32_t addr) { float f; memcpy(&f, &xf[addr], 4); return f; }
 
 /* ---- frame building ------------------------------------------------------------------------ */
@@ -166,7 +176,7 @@ static uint32_t texture_for_map(int n) {
     uint32_t img0 = bp[base_image0];
     uint32_t w = (img0 & 0x3FF) + 1, h = ((img0 >> 10) & 0x3FF) + 1, fmt = (img0 >> 20) & 15;
     uint32_t addr = 0x80000000u | ((bp[base_image3] & 0xFFFFFF) << 5);
-    if (getenv("SFA_GX_TEXADDR") && strtoul(getenv("SFA_GX_TEXADDR"), NULL, 16) == addr) {
+    if (g_dbg_texaddr && g_dbg_texaddr == addr) {
         static unsigned shown;
         if (shown++ < 6) {
             printf("[gx-texaddr] frame %u map %d fmt %u %ux%u bound by:", g_frame_number, n, fmt, w, h);
@@ -174,7 +184,7 @@ static uint32_t texture_for_map(int n) {
             printf("\n");
         }
     }
-    if (getenv("SFA_GX_DEBUG")) {
+    if (g_dbg) {
         uint32_t img1 = bp[n < 4 ? 0x8C + n : 0xAC + (n - 4)];
         static unsigned n_pre;
         if (((img1 >> 21) & 1) && n_pre++ < 20)
@@ -201,9 +211,8 @@ static uint32_t texture_for_map(int n) {
     if (!e) e = &g_tex[key & (TEX_CACHE - 1)]; /* evict */
     int fresh = !(e->id && e->addr == addr && e->fmt == fmt && e->w == w && e->h == h && e->tlut_hash == tlut_hash);
     uint32_t size = tex_size(fmt, w, h);
-    /* Small textures are re-checked on every use: games rewrite scratch buffers (one font glyph at a
-     * time, for example) between draws in the same frame. Big ones are checked once per frame. */
-    if (!fresh && size > 0x10000 && e->checked_frame == g_frame_number) return e->id;
+    /* contents are re-hashed at most once per frame */
+    if (!fresh && e->checked_frame == g_frame_number) return e->id;
     uint32_t hash = fnv(ppc_ram(addr), (addr & 0x01FFFFFF) + size <= PPC_MEM_SIZE ? size : 0, 2166136261u);
     if (fresh) {
         e->addr = addr; e->fmt = fmt; e->w = w; e->h = h; e->tlut_hash = tlut_hash;
@@ -219,7 +228,7 @@ static uint32_t texture_for_map(int n) {
     GxTextureUpload *u = &f->uploads[f->nuploads++];
     u->id = e->id; u->width = w; u->height = h;
     u->rgba = decode_texture(addr, fmt, w, h, pal, tlut_fmt);
-    if (getenv("SFA_GX_DEBUG")) {
+    if (g_dbg) {
         uint32_t nz = 0;
         for (uint32_t q = 0; q < size && q < 4096; q++) nz += rd8(addr + q) != 0;
         printf("[gx-tex] frame %u id %u addr %08X fmt %u %ux%u tlut %03X/%u nonzero %u/%u\n", g_frame_number, e->id, addr,
@@ -448,89 +457,125 @@ static void unpack_color(uint32_t rgba, float *c) {
     c[0] = (rgba >> 24) / 255.f; c[1] = ((rgba >> 16) & 255) / 255.f; c[2] = ((rgba >> 8) & 255) / 255.f; c[3] = (rgba & 255) / 255.f;
 }
 
-/* Color channel ch (0/1), color or alpha part, from XF channel control (no per-light model yet:
- * lit channels get the material color scaled by ambient plus a fixed directional estimate). */
-static float channel(const RawVertex *v, int ch, int alpha_part, int comp) {
-    uint32_t ctrl = xf[(alpha_part ? 0x1010 : 0x100E) + ch];
-    float mat[4], amb[4];
-    unpack_color(xf[0x100C + ch], mat);
-    unpack_color(xf[0x100A + ch], amb);
-    int vtx = ctrl & 1, light = (ctrl >> 1) & 1, amb_vtx = (ctrl >> 6) & 1;
-    int src = ch < 2 && v->has_col[ch] ? ch : (v->has_col[0] ? 0 : -1);
-    float m = vtx && src >= 0 ? v->col[src][comp] : mat[comp];
-    if (!light) return m;
-    float a = amb_vtx && src >= 0 ? v->col[src][comp] : amb[comp];
+/* Everything transform() needs that is constant for a whole draw, decoded once per draw. */
+typedef struct {
+    float p[6];          /* projection */
+    int ortho;
+    float sx, sy, sz, ox, oy, oz;
+    /* color channels: [channel][rgb/alpha] -> constant value, or a vertex color times a factor */
+    struct { int vtx; int src; int light; float konst[4]; float amb[4]; int amb_vtx; } ch[2][2];
+    uint32_t ntexgen;
+    struct { int src_row, proj, abc1; } tg[8];
+} XfSetup;
+
+static void xf_setup(XfSetup *s, const RawVertex *first) {
+    for (int i = 0; i < 6; i++) s->p[i] = xff(0x1020 + i);
+    s->ortho = xf[0x1026] & 1;
+    s->sx = xff(0x101A); s->sy = xff(0x101B); s->sz = xff(0x101C);
+    s->ox = xff(0x101D) - 342; s->oy = xff(0x101E) - 342; s->oz = xff(0x101F);
+    for (int ch = 0; ch < 2; ch++)
+        for (int part = 0; part < 2; part++) {
+            uint32_t ctrl = xf[(part ? 0x1010 : 0x100E) + ch];
+            s->ch[ch][part].vtx = ctrl & 1;
+            s->ch[ch][part].light = (ctrl >> 1) & 1;
+            s->ch[ch][part].amb_vtx = (ctrl >> 6) & 1;
+            unpack_color(xf[0x100C + ch], s->ch[ch][part].konst);
+            unpack_color(xf[0x100A + ch], s->ch[ch][part].amb);
+            s->ch[ch][part].src = first->has_col[ch] ? ch : (first->has_col[0] ? 0 : -1);
+        }
+    s->ntexgen = xf[0x103F] & 15;
+    for (uint32_t tc = 0; tc < 8; tc++) {
+        uint32_t g = xf[0x1040 + tc];
+        s->tg[tc].src_row = (g >> 7) & 31;
+        s->tg[tc].proj = (g >> 1) & 1;
+        s->tg[tc].abc1 = (g >> 2) & 1;
+    }
+}
+
+static inline float channel_value(const XfSetup *s, const RawVertex *v, int ch, int part, int comp) {
+    const typeof(s->ch[0][0]) *c = &s->ch[ch][part];
+    float m = c->vtx && c->src >= 0 ? v->col[c->src][comp] : c->konst[comp];
+    if (!c->light) return m;
+    /* no per-light model yet: material x (ambient + a fixed directional estimate) */
+    float a = c->amb_vtx && c->src >= 0 ? v->col[c->src][comp] : c->amb[comp];
     float lit = a + 0.6f;
     return m * (lit > 1.f ? 1.f : lit);
 }
 
 /* Position -> clip space (via the position matrix, projection and viewport); colors; texcoords. */
-static void transform(const RawVertex *v, GxVertex *o) {
-    uint32_t m = (uint32_t)v->pnmtx * 4;
+static void transform(const XfSetup *s, const RawVertex *v, GxVertex *o) {
+    const float *M = (const float *)&xf[(uint32_t)v->pnmtx * 4];
     float x = v->pos[0], y = v->pos[1], z = v->pos[2];
-    float vx = xff(m + 0) * x + xff(m + 1) * y + xff(m + 2) * z + xff(m + 3);
-    float vy = xff(m + 4) * x + xff(m + 5) * y + xff(m + 6) * z + xff(m + 7);
-    float vz = xff(m + 8) * x + xff(m + 9) * y + xff(m + 10) * z + xff(m + 11);
-    float p[6];
-    for (int i = 0; i < 6; i++) p[i] = xff(0x1020 + i);
+    float vx = M[0] * x + M[1] * y + M[2] * z + M[3];
+    float vy = M[4] * x + M[5] * y + M[6] * z + M[7];
+    float vz = M[8] * x + M[9] * y + M[10] * z + M[11];
+    const float *p = s->p;
     float cx, cy, cz, cw;
-    if (xf[0x1026] & 1) { cx = p[0] * vx + p[1]; cy = p[2] * vy + p[3]; cz = p[4] * vz + p[5]; cw = 1; }
+    if (s->ortho) { cx = p[0] * vx + p[1]; cy = p[2] * vy + p[3]; cz = p[4] * vz + p[5]; cw = 1; }
     else { cx = p[0] * vx + p[1] * vz; cy = p[2] * vy + p[3] * vz; cz = p[4] * vz + p[5]; cw = -vz; }
     /* viewport (applied in clip space so perspective-correct interpolation and clipping still work) */
-    float sx = xff(0x101A), sy = xff(0x101B), sz = xff(0x101C), ox = xff(0x101D) - 342, oy = xff(0x101E) - 342, oz = xff(0x101F);
-    float wx = cx * sx + ox * cw, wy = cy * sy + oy * cw, wz = (cz * sz + oz * cw) / 16777215.0f;
-    o->x = wx / (EFB_WIDTH / 2.0f) - cw;
-    o->y = cw - wy / (EFB_HEIGHT / 2.0f);
+    float wx = cx * s->sx + s->ox * cw, wy = cy * s->sy + s->oy * cw, wz = (cz * s->sz + s->oz * cw) * (1.0f / 16777215.0f);
+    o->x = wx * (2.0f / EFB_WIDTH) - cw;
+    o->y = cw - wy * (2.0f / EFB_HEIGHT);
     o->z = wz * 2.0f - cw;
     o->w = cw;
 
     for (int k = 0; k < 3; k++) {
-        o->c0[k] = channel(v, 0, 0, k);
-        o->c1[k] = channel(v, 1, 0, k);
+        o->c0[k] = channel_value(s, v, 0, 0, k);
+        o->c1[k] = channel_value(s, v, 1, 0, k);
     }
-    o->c0[3] = channel(v, 0, 1, 3);
-    o->c1[3] = channel(v, 1, 1, 3);
+    o->c0[3] = channel_value(s, v, 0, 1, 3);
+    o->c1[3] = channel_value(s, v, 1, 1, 3);
 
     /* texture coordinates: each texgen's source row, then its texture matrix */
-    uint32_t ntexgen = xf[0x103F] & 15;
     for (uint32_t tc = 0; tc < 8; tc++) {
-        if (tc >= ntexgen) { o->uv[tc][0] = o->uv[tc][1] = 0; continue; }
-        uint32_t tg = xf[0x1040 + tc];
-        int src_row = (tg >> 7) & 31, proj = (tg >> 1) & 1;
-        float in[4] = {0, 0, 1, 1};
-        if (src_row == 0) { in[0] = x; in[1] = y; in[2] = z; }
-        else if (src_row >= 5 && src_row <= 12) { in[0] = v->tex[src_row - 5][0]; in[1] = v->tex[src_row - 5][1]; }
-        if (!((tg >> 2) & 1)) in[2] = 1; /* AB11 */
-        uint32_t tm = (uint32_t)v->texmtx[tc] * 4;
-        float s_ = xff(tm + 0) * in[0] + xff(tm + 1) * in[1] + xff(tm + 2) * in[2] + xff(tm + 3);
-        float t_ = xff(tm + 4) * in[0] + xff(tm + 5) * in[1] + xff(tm + 6) * in[2] + xff(tm + 7);
-        if (proj) {
-            float q = xff(tm + 8) * in[0] + xff(tm + 9) * in[1] + xff(tm + 10) * in[2] + xff(tm + 11);
-            if (q != 0) { s_ /= q; t_ /= q; }
+        if (tc >= s->ntexgen) { o->uv[tc][0] = o->uv[tc][1] = 0; continue; }
+        int src_row = s->tg[tc].src_row;
+        float in0 = 0, in1 = 0, in2 = 1;
+        if (src_row == 0) { in0 = x; in1 = y; in2 = z; }
+        else if (src_row >= 5 && src_row <= 12) { in0 = v->tex[src_row - 5][0]; in1 = v->tex[src_row - 5][1]; }
+        if (!s->tg[tc].abc1) in2 = 1; /* AB11 */
+        const float *T = (const float *)&xf[(uint32_t)v->texmtx[tc] * 4];
+        float s_ = T[0] * in0 + T[1] * in1 + T[2] * in2 + T[3];
+        float t_ = T[4] * in0 + T[5] * in1 + T[6] * in2 + T[7];
+        if (s->tg[tc].proj) {
+            float q = T[8] * in0 + T[9] * in1 + T[10] * in2 + T[11];
+            if (q != 0) { float iq = 1.0f / q; s_ *= iq; t_ *= iq; }
         }
         o->uv[tc][0] = s_;
         o->uv[tc][1] = t_;
     }
 }
 
-static void emit(GxPrimKind kind, const GxState *stp, const GxVertex *vs, const uint32_t *idx, uint32_t n) {
+/* Render state is rebuilt only when a BP register changes (or a new frame starts); each rebuild
+ * gets a new serial, so batching compares serials instead of whole states. */
+static GxState g_state;
+static uint32_t g_state_serial;
+static int g_state_valid;
+
+static void emit(GxPrimKind kind, const GxState *st, uint32_t serial, const GxVertex *vs, const uint32_t *idx, uint32_t n) {
     if (!n) return;
     GxFrame *f = frame();
-    const GxState st = *stp;
     GxBatch *last = f->nbatches ? &f->batches[f->nbatches - 1] : NULL;
-    if (!last || last->kind != kind || memcmp(&last->state, &st, sizeof st) || last->first + last->count != f->nverts ||
-        (f->nclears && f->clears[f->nclears - 1].at_batch == f->nbatches)) {
+    int same = last && last->kind == kind && last->first + last->count == f->nverts &&
+               !(f->nclears && f->clears[f->nclears - 1].at_batch == f->nbatches) &&
+               (last->serial == serial || !memcmp(&last->state, st, sizeof *st));
+    if (!same) {
         GROW(f->batches, f->nbatches, f->cap_batches, 256);
         last = &f->batches[f->nbatches++];
-        last->state = st;
+        last->state = *st;
         last->kind = kind;
         last->first = f->nverts;
         last->count = 0;
     }
-    for (uint32_t i = 0; i < n; i++) {
-        GROW(f->verts, f->nverts, f->cap_verts, 4096);
-        f->verts[f->nverts++] = vs[idx[i]];
+    last->serial = serial;
+    if (f->nverts + n > f->cap_verts) {
+        while (f->nverts + n > f->cap_verts) f->cap_verts = f->cap_verts ? f->cap_verts * 2 : 4096;
+        f->verts = realloc(f->verts, sizeof *f->verts * f->cap_verts);
     }
+    GxVertex *dst = f->verts + f->nverts;
+    for (uint32_t i = 0; i < n; i++) dst[i] = vs[idx[i]];
+    f->nverts += n;
     last->count += n;
 }
 
@@ -539,7 +584,7 @@ static void debug_draw_config(void) {
     static int enabled = -1;
     static uint32_t seen[512];
     static unsigned nseen;
-    if (enabled < 0) enabled = getenv("SFA_GX_DEBUG") != NULL;
+    if (enabled < 0) enabled = g_dbg;
     if (!enabled) return;
     uint32_t tref = bp[0x28], map = tref & 7;
     uint32_t img0 = bp[map < 4 ? 0x88 + map : 0xA8 + (map - 4)], img3 = bp[map < 4 ? 0x94 + map : 0xB4 + (map - 4)];
@@ -552,12 +597,32 @@ static void debug_draw_config(void) {
            ((img0 >> 10) & 0x3FF) + 1, (img3 & 0xFFFFFF) << 5, bp[0xF6]);
 }
 
+/* SFA_PROFILE: time spent in each stage of draw(), reported with the guest profile. */
+static uint64_t g_t_state, g_t_vtx, g_t_emit, g_t_calls, g_t_verts;
+static int g_prof_on = -1;
+static uint64_t ticks(void) { /* stage timing only when profiling: the clock call is not free */
+    if (g_prof_on < 0) g_prof_on = getenv("SFA_PROFILE") != NULL;
+    return g_prof_on ? rt_timebase() : 0;
+}
+void gx_profile_report(void) {
+    if (!g_t_calls) return;
+    printf("[prof] gx: %llu draws, %llu vertices; state %.0f ms, vertices %.0f ms, batching %.0f ms (per 10 s)\n",
+           (unsigned long long)g_t_calls, (unsigned long long)g_t_verts, g_t_state / 40500.0, g_t_vtx / 40500.0,
+           g_t_emit / 40500.0);
+    g_t_state = g_t_vtx = g_t_emit = g_t_calls = g_t_verts = 0;
+}
+
 static void draw(uint8_t opcode, uint32_t p, uint32_t count) {
     debug_draw_config();
+    uint64_t t0 = ticks();
     VtxFormat fmt;
     vtx_format(opcode & 7, &fmt);
-    GxState st;
-    current_state(&st);
+    if (!g_state_valid) {
+        current_state(&g_state);
+        g_state_serial++;
+        g_state_valid = 1;
+    }
+    uint64_t t1 = ticks();
     static GxVertex *vs;
     static uint32_t *idx, cap;
     if (count * 6 > cap) {
@@ -565,12 +630,19 @@ static void draw(uint8_t opcode, uint32_t p, uint32_t count) {
         vs = realloc(vs, sizeof *vs * cap);
         idx = realloc(idx, sizeof *idx * cap);
     }
+    XfSetup xs;
     for (uint32_t i = 0; i < count; i++) {
         RawVertex rv;
         memset(&rv, 0, sizeof rv);
         read_vertex(&fmt, &p, &rv);
-        transform(&rv, &vs[i]);
+        if (i == 0) xf_setup(&xs, &rv);
+        transform(&xs, &rv, &vs[i]);
     }
+    uint64_t t2 = ticks();
+    g_t_state += t1 - t0;
+    g_t_vtx += t2 - t1;
+    g_t_calls++;
+    g_t_verts += count;
     uint32_t n = 0;
     GxPrimKind kind = GX_PRIM_TRIANGLES;
     switch (opcode & 0xF8) {
@@ -592,7 +664,9 @@ static void draw(uint8_t opcode, uint32_t p, uint32_t count) {
     case 0xB0: kind = GX_PRIM_LINES; for (uint32_t i = 0; i + 1 < count; i++) { idx[n++] = i; idx[n++] = i + 1; } break;
     default: kind = GX_PRIM_POINTS; for (uint32_t i = 0; i < count; i++) idx[n++] = i; break;
     }
-    emit(kind, &st, vs, idx, n);
+    uint64_t t3 = ticks();
+    emit(kind, &g_state, g_state_serial, vs, idx, n);
+    g_t_emit += ticks() - t3;
     g_stat_draws++;
 }
 
@@ -601,7 +675,7 @@ static void efb_copy(uint32_t v) {
     uint32_t tl = bp[0x49], wh = bp[0x4A];
     int x = (int)(tl & 0x3FF), y = (int)((tl >> 10) & 0x3FF), w = (int)(wh & 0x3FF) + 1, h = (int)((wh >> 10) & 0x3FF) + 1;
     int to_xfb = (v >> 14) & 1, clear = (v >> 11) & 1;
-    if (!to_xfb && getenv("SFA_GX_DEBUG"))
+    if (!to_xfb && g_dbg)
         printf("[gx-copy] frame %u EFB (%d,%d %dx%d) -> texture %08X fmt %u half %u\n", g_frame_number, x, y, w, h,
                0x80000000u | ((bp[0x4B] & 0xFFFFFF) << 5), (v >> 4) & 15 | ((v >> 3) & 1) << 4, (v >> 9) & 1);
     if (to_xfb) {
@@ -627,6 +701,7 @@ static void efb_copy(uint32_t v) {
         }
         g_frame = NULL;
         g_frame_number++;
+        g_state_valid = 0; /* re-check textures each frame */
         video_submit(f);
     }
     if (clear) {
@@ -647,6 +722,7 @@ static void bp_write(uint32_t word) {
     uint32_t reg = word >> 24, val = word & 0xFFFFFF;
     if (reg == 0xFE) { bp_mask = val; return; }
     bp[reg] = (bp[reg] & ~bp_mask) | (val & bp_mask);
+    g_state_valid = 0;
     bp_mask = 0xFFFFFF;
     switch (reg) {
     case 0xE0: case 0xE1: case 0xE2: case 0xE3: case 0xE4: case 0xE5: case 0xE6: case 0xE7:
@@ -659,7 +735,7 @@ static void bp_write(uint32_t word) {
         efb_copy(bp[0x52]);
         break;
     case 0x63: /* TX_LOADBLOCK3: preload a texture into TMEM */
-        if (getenv("SFA_GX_DEBUG")) {
+        if (g_dbg) {
             static unsigned n;
             if (n++ < 20)
                 printf("[gx-preload] frame %u src %08X tmem even %05X odd %05X count %u (32B)\n", g_frame_number,
@@ -731,8 +807,8 @@ static size_t run_commands(const uint8_t *b, size_t n, uint32_t guest_addr, int 
         }
         case 0x40: call_display_list(be32(c + 1), be32(c + 5), depth); break;
         case 0x61:
-            if (guest_addr && getenv("SFA_GX_TEXADDR")) { /* where does a display list set this texture address? */
-                uint32_t w = be32(c + 1), r = w >> 24, want = (uint32_t)strtoul(getenv("SFA_GX_TEXADDR"), NULL, 16);
+            if (guest_addr && g_dbg_texaddr) { /* where does a display list set this texture address? */
+                uint32_t w = be32(c + 1), r = w >> 24, want = g_dbg_texaddr;
                 static unsigned shown;
                 if (((r >= 0x94 && r <= 0x97) || (r >= 0xB4 && r <= 0xB7)) && (w & 0xFFFFFF) == ((want & 0x01FFFFFF) >> 5) && shown++ < 8)
                     printf("[gx-texaddr] display list at %08X: BP %02X image address field at %08X\n", guest_addr,
@@ -800,6 +876,7 @@ void gx_fifo_write(uint32_t value, int size) {
 }
 
 void gx_init(void) {
+    dbg_init();
     bp[0x41] = 0x18; /* color and alpha update */
     bp[0x40] = 0x17; /* z test LEQUAL with update */
 }
