@@ -18,6 +18,7 @@
 
 /* ---- state ------------------------------------------------------------------------------------- */
 static uint32_t cp[256];
+static uint32_t g_cp_serial = 1; /* bumped when a CP register changes */
 static uint32_t xf[0x1100]; /* 0x0000-0x0FFF memory (matrices, lights), 0x1000-0x10FF registers */
 static uint32_t bp[256];
 static uint32_t bp_mask = 0xFFFFFF;
@@ -817,8 +818,11 @@ static void draw(uint8_t opcode, uint32_t p, uint32_t count) {
         }
     }
     uint64_t t0 = ticks();
-    VtxFormat fmt;
-    vtx_format(opcode & 7, &fmt);
+    static VtxFormat fmt_cache[8];
+    static uint32_t fmt_serial[8];
+    int vat = opcode & 7;
+    if (fmt_serial[vat] != g_cp_serial) { vtx_format(vat, &fmt_cache[vat]); fmt_serial[vat] = g_cp_serial; }
+    const VtxFormat *fmtp = &fmt_cache[vat];
     if (!g_state_valid) {
         current_state(&g_state);
         g_state_serial++;
@@ -836,7 +840,7 @@ static void draw(uint8_t opcode, uint32_t p, uint32_t count) {
     static uint32_t xs_serial;
     for (uint32_t i = 0; i < count; i++) {
         RawVertex rv;
-        read_vertex(&fmt, &p, &rv);
+        read_vertex(fmtp, &p, &rv);
         if (i == 0 && xs_serial != g_xf_serial) { xf_setup(&xs, &rv); xs_serial = g_xf_serial; }
         transform(&xs, &rv, &vs[i]);
     }
@@ -1013,8 +1017,13 @@ static void efb_copy(uint32_t v) {
 static void bp_write(uint32_t word) {
     uint32_t reg = word >> 24, val = word & 0xFFFFFF;
     if (reg == 0xFE) { bp_mask = val; return; }
+    uint32_t old = bp[reg];
     bp[reg] = (bp[reg] & ~bp_mask) | (val & bp_mask);
-    g_state_valid = 0;
+    /* The game rewrites most registers before every draw, usually with the same value: only a change
+     * (or a register that acts as a command, like a TLUT load or the TEV color writes) needs a new
+     * render state. */
+    if (bp[reg] != old || reg == 0x52 || (reg >= 0x63 && reg <= 0x67) || (reg >= 0xE0 && reg <= 0xE7))
+        g_state_valid = 0;
     bp_mask = 0xFFFFFF;
     switch (reg) {
     case 0xE0: case 0xE1: case 0xE2: case 0xE3: case 0xE4: case 0xE5: case 0xE6: case 0xE7:
@@ -1084,7 +1093,11 @@ static size_t run_commands(const uint8_t *b, size_t n, uint32_t guest_addr, int 
         if (n - i < need) break;
         const uint8_t *c = b + i;
         switch (op) {
-        case 0x08: cp[c[1]] = be32(c + 2); break;
+        case 0x08: {
+            uint32_t v = be32(c + 2);
+            if (cp[c[1]] != v) { cp[c[1]] = v; g_cp_serial++; } /* vertex formats are cached by this serial */
+            break;
+        }
         case 0x10: {
             uint32_t hdr = be32(c + 1), addr = hdr & 0xFFFF, cnt = ((hdr >> 16) & 15) + 1;
             for (uint32_t k = 0; k < cnt; k++)
