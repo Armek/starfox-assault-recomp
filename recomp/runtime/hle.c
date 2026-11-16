@@ -3,6 +3,7 @@
  * Calling convention (PowerPC EABI): arguments in r3-r10 / f1-f8, return value in r3 (or f1).
  */
 #include <stdio.h>
+#include <stdlib.h>
 #include "funcs.h"
 #include "runtime.h"
 #include "gx.h"
@@ -47,4 +48,43 @@ HLE(PADRead) {
         wr8(p + 10, (uint8_t)(in.connected ? PAD_ERR_NONE : PAD_ERR_NO_CONTROLLER));
     }
     c->r[3] = 0; /* no motor/reset bits */
+}
+
+/* BOOL __OSReadROM(void *buffer, s32 length, s32 offset): read the boot ROM (IPL) over EXI.
+ * Games only read the system fonts from it: the SJIS font at 0x1AFF00 and the ANSI font at
+ * 0x1FCF00, Yay0-compressed. They come from user/GF7E01/ipl.bin (a dump of your own console's
+ * boot ROM) or, failing that, from free replacement fonts in user/fonts/ (Dolphin ships
+ * font_western.bin and font_japanese.bin, Apache 2.0, based on Droid Sans). */
+#define IPL_SIZE 0x200000u
+static uint8_t *g_ipl;
+
+static long load_into(const char *path, uint8_t *dst, uint32_t max) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return -1;
+    long n = (long)fread(dst, 1, max, f);
+    fclose(f);
+    return n;
+}
+
+static void ipl_init(void) {
+    if (g_ipl) return;
+    g_ipl = calloc(1, IPL_SIZE);
+    if (load_into("user/GF7E01/ipl.bin", g_ipl, IPL_SIZE) > 0) {
+        printf("[rom] using the boot ROM dump user/GF7E01/ipl.bin\n");
+        return;
+    }
+    long a = load_into("user/fonts/font_western.bin", g_ipl + 0x1FCF00, IPL_SIZE - 0x1FCF00);
+    long s = load_into("user/fonts/font_japanese.bin", g_ipl + 0x1AFF00, 0x1FCF00 - 0x1AFF00);
+    if (a > 0 || s > 0)
+        printf("[rom] system fonts from user/fonts (western %ld bytes, japanese %ld bytes)\n", a, s);
+    else
+        printf("[rom] no system font found: text drawn with OSGetFontTexture will be blank "
+               "(put font_western.bin in user/fonts or an IPL dump at user/GF7E01/ipl.bin)\n");
+}
+
+HLE(__OSReadROM) {
+    uint32_t buf = c->r[3], len = c->r[4], off = c->r[5];
+    ipl_init();
+    for (uint32_t i = 0; i < len; i++) wr8(buf + i, off + i < IPL_SIZE ? g_ipl[off + i] : 0);
+    c->r[3] = 1; /* TRUE */
 }

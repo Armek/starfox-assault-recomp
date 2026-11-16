@@ -23,7 +23,10 @@ host runtime into a native executable. This is the route toward a PC / Linux / S
     20–28% of the time waiting for the retrace.
   - Models are lit with the real GX lighting model (per-vertex lights, attenuation and diffuse functions).
   - The 3D comm portraits (Falco, Slippy, …) and the Arwing's shadow render through EFB-to-texture copies.
-- **Known rendering gap:** some generated dialog boxes still show no text.
+- **System font:** the SDK reads the console's boot-ROM font (`OSInitFont`/`OSLoadFont`). `__OSReadROM` is HLE and
+  serves it from `user/GF7E01/ipl.bin` (your own IPL dump) or from free replacement fonts in `user/fonts/`
+  (`font_western.bin`, `font_japanese.bin`, Apache 2.0, from Dolphin's `Sys/GC`). The mission briefing text uses it.
+- **Known rendering gap:** the comm subtitles and some file-select panels still show no text.
 
 ### Memory card
 
@@ -126,14 +129,14 @@ Q/E = L/R, Z = Z, numpad 8/4/6/2 = C-stick.
 | **ARAM** | 16 MB with instant DMA and the ARAM interrupt. | `runtime.c` |
 | **DSP** | A fake mailbox completes the SDK task loader's handshake (`0x8071FEED`, then "task init" `0xDCD10000` via the DSP interrupt). No microcode runs, so there's no audio yet. | `runtime.c` |
 | **Disc drive (DI)** | The disc is rebuilt virtually from `orig/GF7E01` (`boot.bin`, `bi2.bin`, apploader, DOL, FST and all 960+ files at their FST offsets). Read, disc-ID read, inquiry and status commands complete immediately with the DI interrupt, and the SDK's DVD driver runs unchanged. | `dvd.c` |
-| **HLE overrides** | Console output, DSP boot, MMU setup, context switching, `GXDrawDone` (no GPU) and `PADRead` (port 1 connected and neutral). | `hle.c` |
+| **HLE overrides** | Console output, DSP boot, MMU setup, context switching, `GXDrawDone` (no GPU), `PADRead` (host input), `__OSReadROM` (system font), `OSNotifyLink`/`OSNotifyUnlink` and the `CARD` API. | `hle.c` |
 
 The generator also emits **extra entry points** for calls into the middle of a function (8, all in
 `__save_fpr`/`__restore_fpr`), and the timebase uses a high-resolution clock (`__AI_SRC_INIT` measures 1/48000 s).
 
 ## Next
 
-1. **The remaining blank text:** some dialog boxes and the comm subtitles.
+1. **The remaining blank text:** the comm subtitles and some file-select panels (not the system font).
 2. **Indirect textures** (the TEV indirect stages, BP `0x10`–`0x27`). Unused through the front end and Mission 1
    (0 of 27 million draws), so this waits until a later stage needs it.
 3. **Performance:** render-to-texture read-backs are synchronous (about 25 fps instead of 28–30); use PBOs

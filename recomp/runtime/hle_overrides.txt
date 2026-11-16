@@ -48,3 +48,6 @@ CARDWriteAsync
 CARDGetStatus
 CARDSetStatus
 CARDSetStatusAsync
+
+# Boot ROM reads: the SDK loads the system font from the IPL ROM (OSInitFont/OSLoadFont).
+__OSReadROM
