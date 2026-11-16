@@ -11,6 +11,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
 #include "funcs.h"
 #include "runtime.h"
 #include "gx.h"
@@ -324,8 +325,9 @@ typedef struct {
     float pos[3];
     float col[2][4];
     float tex[8][2];
+    float nrm[3];
     int pnmtx, texmtx[8];
-    int has_col[2];
+    int has_col[2], has_nrm;
 } RawVertex;
 
 /* Inline vertex data that arrived through the write-gather pipe lives in a host buffer; it is
@@ -432,10 +434,19 @@ static void read_vertex(const VtxFormat *f, uint32_t *p, RawVertex *v) {
         for (int i = 0; i < comps; i++) v->pos[i] = read_comp(&a, f->pos_fmt, f->pos_shift);
         if (comps == 2) v->pos[2] = 0;
     }
-    if (f->nrm) { /* normals are skipped until lighting is implemented */
+    if (f->nrm) { /* the normal (binormal/tangent of NBT are skipped: no bump mapping yet) */
         int comps = f->nrm_cnt ? 9 : 3;
-        if (f->nrm >= 2 && f->nrm_cnt && f->nrm_idx3) *p += 3 * (f->nrm == 2 ? 1 : 2);
-        else attr_addr(f->nrm, 1, p, comps * k_comp_size[f->nrm_fmt]);
+        /* s8 normals have 6 fractional bits, s16 have 14 */
+        int shift = f->nrm_fmt == 1 || f->nrm_fmt == 0 ? 6 : f->nrm_fmt == 3 || f->nrm_fmt == 2 ? 14 : 0;
+        uint32_t a;
+        if (f->nrm >= 2 && f->nrm_cnt && f->nrm_idx3) { /* three separate indices; the first is the normal */
+            a = attr_addr(f->nrm, 1, p, 0);
+            *p += 2 * (f->nrm == 2 ? 1 : 2);
+        } else {
+            a = attr_addr(f->nrm, 1, p, comps * k_comp_size[f->nrm_fmt]);
+        }
+        for (int i = 0; i < 3; i++) v->nrm[i] = read_comp(&a, f->nrm_fmt, shift);
+        v->has_nrm = 1;
     }
     for (int i = 0; i < 2; i++) {
         v->has_col[i] = 0;
@@ -459,30 +470,63 @@ static void unpack_color(uint32_t rgba, float *c) {
 
 /* Everything transform() needs that is constant for a whole draw, decoded once per draw. */
 typedef struct {
+    float color[4];
+    float pos[3], dir[3];
+    float a[3], k[3]; /* angle (cos) and distance attenuation coefficients */
+} XfLight;
+
+typedef struct {
+    int vtx_mat, vtx_amb, light, mask, diffuse, atten, spot;
+    float mat[4], amb[4];
+} XfChannel;
+
+typedef struct {
     float p[6];          /* projection */
     int ortho;
     float sx, sy, sz, ox, oy, oz;
-    /* color channels: [channel][rgb/alpha] -> constant value, or a vertex color times a factor */
-    struct { int vtx; int src; int light; float konst[4]; float amb[4]; int amb_vtx; } ch[2][2];
+    XfChannel ch[2][2];  /* [channel 0/1][color/alpha] */
+    int any_light;
+    XfLight light[8];
     uint32_t ntexgen;
     struct { int src_row, proj, abc1; } tg[8];
 } XfSetup;
 
 static void xf_setup(XfSetup *s, const RawVertex *first) {
+    (void)first;
     for (int i = 0; i < 6; i++) s->p[i] = xff(0x1020 + i);
     s->ortho = xf[0x1026] & 1;
     s->sx = xff(0x101A); s->sy = xff(0x101B); s->sz = xff(0x101C);
     s->ox = xff(0x101D) - 342; s->oy = xff(0x101E) - 342; s->oz = xff(0x101F);
+    /* channel controls: 0 MatSrc, 1 LightFunc, 2-5 lights 0-3, 6 AmbSrc, 7-8 DiffuseAtten,
+     * 9 AttnEnable, 10 AttnSelect (1 = spot), 11-14 lights 4-7 */
+    s->any_light = 0;
     for (int ch = 0; ch < 2; ch++)
         for (int part = 0; part < 2; part++) {
             uint32_t ctrl = xf[(part ? 0x1010 : 0x100E) + ch];
-            s->ch[ch][part].vtx = ctrl & 1;
-            s->ch[ch][part].light = (ctrl >> 1) & 1;
-            s->ch[ch][part].amb_vtx = (ctrl >> 6) & 1;
-            unpack_color(xf[0x100C + ch], s->ch[ch][part].konst);
-            unpack_color(xf[0x100A + ch], s->ch[ch][part].amb);
-            s->ch[ch][part].src = first->has_col[ch] ? ch : (first->has_col[0] ? 0 : -1);
+            XfChannel *c = &s->ch[ch][part];
+            c->vtx_mat = ctrl & 1;
+            c->light = (ctrl >> 1) & 1;
+            c->mask = (int)(((ctrl >> 2) & 15) | (((ctrl >> 11) & 15) << 4));
+            c->vtx_amb = (ctrl >> 6) & 1;
+            c->diffuse = (ctrl >> 7) & 3;
+            c->atten = (ctrl >> 9) & 1;
+            c->spot = (ctrl >> 10) & 1;
+            unpack_color(xf[0x100C + ch], c->mat);
+            unpack_color(xf[0x100A + ch], c->amb);
+            if (c->light && c->mask) s->any_light |= c->mask;
         }
+    for (int l = 0; l < 8; l++) {
+        if (!(s->any_light & (1 << l))) continue;
+        uint32_t b = 0x600u + (uint32_t)l * 16;
+        XfLight *L = &s->light[l];
+        unpack_color(xf[b + 3], L->color);
+        for (int i = 0; i < 3; i++) {
+            L->a[i] = xff(b + 4 + (uint32_t)i);
+            L->k[i] = xff(b + 7 + (uint32_t)i);
+            L->pos[i] = xff(b + 10 + (uint32_t)i);
+            L->dir[i] = xff(b + 13 + (uint32_t)i);
+        }
+    }
     s->ntexgen = xf[0x103F] & 15;
     for (uint32_t tc = 0; tc < 8; tc++) {
         uint32_t g = xf[0x1040 + tc];
@@ -492,14 +536,62 @@ static void xf_setup(XfSetup *s, const RawVertex *first) {
     }
 }
 
-static inline float channel_value(const XfSetup *s, const RawVertex *v, int ch, int part, int comp) {
-    const typeof(s->ch[0][0]) *c = &s->ch[ch][part];
-    float m = c->vtx && c->src >= 0 ? v->col[c->src][comp] : c->konst[comp];
-    if (!c->light) return m;
-    /* no per-light model yet: material x (ambient + a fixed directional estimate) */
-    float a = c->amb_vtx && c->src >= 0 ? v->col[c->src][comp] : c->amb[comp];
-    float lit = a + 0.6f;
-    return m * (lit > 1.f ? 1.f : lit);
+/* One color channel part (rgb or alpha) for one vertex, with the GX lighting model:
+ * out = material * clamp(ambient + sum over enabled lights of color * diffuse * attenuation). */
+static void light_channel(const XfSetup *s, const RawVertex *v, int ch, int part, const float *vpos, const float *n,
+                          float *out) {
+    const XfChannel *c = &s->ch[ch][part];
+    int src = v->has_col[ch] ? ch : (v->has_col[0] ? 0 : -1);
+    const float *mat = c->vtx_mat && src >= 0 ? v->col[src] : c->mat;
+    int k0 = part ? 3 : 0, k1 = part ? 4 : 3;
+    if (!c->light) {
+        for (int k = k0; k < k1; k++) out[k] = mat[k];
+        return;
+    }
+    const float *amb = c->vtx_amb && src >= 0 ? v->col[src] : c->amb;
+    float acc[4] = {amb[0], amb[1], amb[2], amb[3]};
+    for (int l = 0; l < 8; l++) {
+        if (!(c->mask & (1 << l))) continue;
+        const XfLight *L = &s->light[l];
+        float ld[3] = {L->pos[0] - vpos[0], L->pos[1] - vpos[1], L->pos[2] - vpos[2]};
+        float d2 = ld[0] * ld[0] + ld[1] * ld[1] + ld[2] * ld[2];
+        float d = sqrtf(d2);
+        if (d > 0) { ld[0] /= d; ld[1] /= d; ld[2] /= d; }
+        float attn = 1.0f;
+        if (c->atten) {
+            if (c->spot) { /* spot: angle attenuation over distance attenuation */
+                float cs = ld[0] * L->dir[0] + ld[1] * L->dir[1] + ld[2] * L->dir[2];
+                if (cs < 0) cs = 0;
+                float num = L->a[0] + L->a[1] * cs + L->a[2] * cs * cs;
+                float den = L->k[0] + L->k[1] * d + L->k[2] * d2;
+                attn = num > 0 && den > 0 ? num / den : 0;
+            } else { /* specular: light direction is the half-angle vector, position holds direction */
+                float hl = sqrtf(L->pos[0] * L->pos[0] + L->pos[1] * L->pos[1] + L->pos[2] * L->pos[2]);
+                float nl = hl > 0 ? (n[0] * L->pos[0] + n[1] * L->pos[1] + n[2] * L->pos[2]) / hl : 0;
+                if (nl <= 0) { attn = 0; }
+                else {
+                    float nh = n[0] * L->dir[0] + n[1] * L->dir[1] + n[2] * L->dir[2];
+                    if (nh < 0) nh = 0;
+                    float num = L->a[0] + L->a[1] * nh + L->a[2] * nh * nh;
+                    float den = L->k[0] + L->k[1] * nh + L->k[2] * nh * nh;
+                    attn = num > 0 && den > 0 ? num / den : 0;
+                }
+                ld[0] = L->pos[0]; ld[1] = L->pos[1]; ld[2] = L->pos[2];
+                if (hl > 0) { ld[0] /= hl; ld[1] /= hl; ld[2] /= hl; }
+            }
+        }
+        float diff = 1.0f;
+        if (c->diffuse) {
+            diff = n[0] * ld[0] + n[1] * ld[1] + n[2] * ld[2];
+            if (c->diffuse == 2 && diff < 0) diff = 0; /* clamp */
+        }
+        float f = attn * diff;
+        for (int k = k0; k < k1; k++) acc[k] += L->color[k] * f;
+    }
+    for (int k = k0; k < k1; k++) {
+        float a = acc[k] < 0 ? 0 : acc[k] > 1 ? 1 : acc[k];
+        out[k] = mat[k] * a;
+    }
 }
 
 /* Position -> clip space (via the position matrix, projection and viewport); colors; texcoords. */
@@ -520,12 +612,20 @@ static void transform(const XfSetup *s, const RawVertex *v, GxVertex *o) {
     o->z = wz * 2.0f - cw;
     o->w = cw;
 
-    for (int k = 0; k < 3; k++) {
-        o->c0[k] = channel_value(s, v, 0, 0, k);
-        o->c1[k] = channel_value(s, v, 1, 0, k);
+    /* lighting works in view space: transform the normal by the normal matrix */
+    float vpos[3] = {vx, vy, vz}, n[3] = {0, 0, 1};
+    if (s->any_light && v->has_nrm) {
+        const float *N = (const float *)&xf[0x400u + ((uint32_t)v->pnmtx & 31) * 3];
+        n[0] = N[0] * v->nrm[0] + N[1] * v->nrm[1] + N[2] * v->nrm[2];
+        n[1] = N[3] * v->nrm[0] + N[4] * v->nrm[1] + N[5] * v->nrm[2];
+        n[2] = N[6] * v->nrm[0] + N[7] * v->nrm[1] + N[8] * v->nrm[2];
+        float len = sqrtf(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
+        if (len > 0) { n[0] /= len; n[1] /= len; n[2] /= len; }
     }
-    o->c0[3] = channel_value(s, v, 0, 1, 3);
-    o->c1[3] = channel_value(s, v, 1, 1, 3);
+    light_channel(s, v, 0, 0, vpos, n, o->c0);
+    light_channel(s, v, 0, 1, vpos, n, o->c0);
+    light_channel(s, v, 1, 0, vpos, n, o->c1);
+    light_channel(s, v, 1, 1, vpos, n, o->c1);
 
     /* texture coordinates: each texgen's source row, then its texture matrix */
     for (uint32_t tc = 0; tc < 8; tc++) {

@@ -19,8 +19,9 @@ host runtime into a native executable. This is the route toward a PC / Linux / S
 - **Milestone 4:** audio, and the game reaches **Mission 1 gameplay** ("01 — A New Enemy — Fortuna").
   - It shows the Arwing in combat with the fleet, the full HUD, wingman tags and the pause menu.
   - Music and sound effects play through SDL.
-  - The frame rate is 25–29 fps in the mission, which looks like a 30 fps cap: the game still idles
+  - The frame rate is 28–30 fps in the mission, which looks like a 30 fps cap: the game still idles
     20–28% of the time waiting for the retrace.
+  - Models are lit with the real GX lighting model (per-vertex lights, attenuation and diffuse functions).
 - **Known rendering gap:** some generated dialog boxes still show no text.
 
 ### Memory card
@@ -103,7 +104,7 @@ untranslated instructions.
 | **Textures** | I4, I8, IA4, IA8, RGB565, RGB5A3, RGBA8, CI4, CI8, CI14X2 (TLUT loads into a TMEM model) and CMPR. Decoded to RGBA8 and cached by address/format/size/palette, then re-decoded when the source bytes' hash changes (checked once per frame). | `gx.c` |
 | **TEV** | Full: up to 16 stages with every color/alpha combiner input, bias/scale/clamp/subtract and compare modes, the TEV color registers and konst colors (BP `0xE0`–`0xE7`, split by bit 23), konst selectors, swap tables, both raster color channels and 8 texture maps. The alpha compare uses both references and its logic op. Each distinct configuration becomes a generated GLSL fragment shader, compiled once and cached. | `gx.c`, `video.c` |
 | **Render state** | Blend factors/subtract, color/alpha write masks, depth test/function/write, scissor. | `gx.c`, `video.c` |
-| **Color channels** | Material/vertex color and ambient per channel. Lighting is still an estimate (ambient + 0.6), since normals aren't used yet. | `gx.c` |
+| **Lighting** | GX per-vertex lighting for both color channels (color and alpha separately). Normals are decoded (s8/s16/float, including the NBT index form) and transformed by the normal matrix (XF `0x400`). Ambient plus up to 8 lights from XF `0x600`: color, position, direction, spot (angle/distance) or specular attenuation, and the none/sign/clamp diffuse functions, multiplied by the material color from a register or the vertex. | `gx.c` |
 | **Frames** | Each frame's batches are built on the guest threads and handed to a **render thread** that owns the SDL window and an OpenGL 3.3 core context. It draws into a 640×528 EFB framebuffer and scales the XFB-copy rectangle into the window. EFB clears requested by copies are applied in order. | `video.c` |
 | **Input** | Port 1 merges the keyboard and the first SDL game controller (Steam Deck included) into `PADRead`. `--auto-press` taps START and A every 4 seconds for unattended testing. | `video.c`, `hle.c` |
 | **Diagnostics** | `--dump-frames` saves every 15th presented frame to `build/GF7E01/frames/*.bmp`. `--no-video` runs headless. With `SFA_GX_DEBUG=1`, each new draw configuration, texture upload (with how many source bytes are non-zero), EFB-to-texture copy and ARAM DMA is logged, and decoded textures are saved to `build/GF7E01/textures/`. | `video.c`, `gx.c` |
@@ -130,13 +131,11 @@ The generator also emits **extra entry points** for calls into the middle of a f
 
 ## Next
 
-1. **Lighting:** XF light channels (diffuse/specular/attenuation) using the decoded normals. Lit models
-   currently use an ambient + constant estimate.
-2. **Indirect textures** (the TEV indirect stages, BP `0x10`–`0x27`), for warps and effects.
-3. **EFB copies to textures:** render-to-texture, used for effects and the pause screen.
-4. **The remaining blank dialog text.**
-5. **Performance:** GPU-side vertex transform, toward a steady 30 (or unlocked 60) fps.
-6. **Packaging:** a release build layout, and a Linux/Steam Deck build and test.
+1. **Indirect textures** (the TEV indirect stages, BP `0x10`–`0x27`), for warps and effects.
+2. **EFB copies to textures:** render-to-texture, used for effects and the pause screen.
+3. **The remaining blank dialog text.**
+4. **Performance:** GPU-side vertex transform, toward a steady 30 (or unlocked 60) fps.
+5. **Packaging:** a release build layout, and a Linux/Steam Deck build and test.
 
 ### Debugging aids
 
