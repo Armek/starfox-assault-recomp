@@ -74,8 +74,13 @@ frame has about 20,000 small draws (fleet, lasers, particles, HUD).
   reuses memory that is already allocated and paged in instead of growing ~17 MB of vertices from zero.
   Batching fell from about 2.6 s to 0.45 s per 10 s, and the game builds about 50% more frames in the same
   time (82 vs 53 GX frames per 10 s in Mission 1, as counted by the profiler).
-- **Where the time goes now** (Mission 1, per 10 s): vertex transform about 5 s, state rebuilds about 1 s,
-  waiting on EFB-to-texture copies about 1.5 s (3–4 copies a frame), batching about 0.45 s.
+- **Vertex fast paths:** attributes are read through host pointers resolved once per span (not byte by
+  byte through guest-memory checks), fixed-point scales are precomputed multipliers, the per-draw XF setup
+  is reused until an XF light or register write bumps a serial, and a channel's color and alpha halves share
+  their per-light terms when their light setup matches. Vertex cost fell from about 120 to 72 ns per vertex,
+  and the game builds about 90–99 frames per 10 s (from 82–89).
+- **Where the time goes now** (Mission 1, per 10 s, as profiled): vertices about 3.5 s, state rebuilds
+  about 1.3 s, waiting on EFB-to-texture copies about 1.7 s (3–4 copies a frame), batching about 0.5 s.
 - **Further headroom:** move vertex transform to a GPU vertex shader, and cut per-draw state rebuilds
   (the game rewrites BP registers between almost every draw).
 
@@ -143,7 +148,8 @@ The generator also emits **extra entry points** for calls into the middle of a f
 
 ## Next
 
-1. **Performance:** GPU-side vertex transform (now the largest cost, about half of the guest's time).
+1. **Performance:** GPU-side vertex transform (still the largest cost after the CPU fast paths), and fewer
+   per-draw state rebuilds (the game rewrites BP registers between almost every draw).
 2. **Performance:** keep EFB-to-texture copies on the GPU instead of reading them back synchronously
    (about 15% of the guest's time).
 3. **Indirect textures** (the TEV indirect stages, BP `0x10`–`0x27`). Unused through the front end and Mission 1

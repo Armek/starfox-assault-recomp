@@ -343,28 +343,37 @@ static uint32_t vrd32(uint32_t a) { return (uint32_t)vrd16(a) << 16 | vrd16(a + 
 #define rd16 vrd16
 #define rd32 vrd32
 
-static float read_comp(uint32_t *a, int fmt, int shift) {
-    float v;
+/* Vertex attributes are read through host pointers: vspan() resolves a guest span once (the
+ * write-gather staging buffer or RAM), falling back to a byte-by-byte copy for anything else. */
+static const uint8_t *vspan(uint32_t a, uint32_t n, uint8_t *tmp) {
+    if (a - STAGE_BASE < 0x10000000u) return g_stage + (a - STAGE_BASE);
+    if (ppc_is_ram(a) && ppc_is_ram(a + n - 1) && (a & 0x01FFFFFFu) < ((a + n - 1) & 0x01FFFFFFu) + 1) return ppc_ram(a);
+    for (uint32_t i = 0; i < n; i++) tmp[i] = vrd8(a + i);
+    return tmp;
+}
+static inline uint32_t be16p(const uint8_t *q) { return (uint32_t)q[0] << 8 | q[1]; }
+static inline uint32_t be32p(const uint8_t *q) { return (uint32_t)q[0] << 24 | (uint32_t)q[1] << 16 | (uint32_t)q[2] << 8 | q[3]; }
+
+/* n components of format fmt from q, times scale (1 / 2^shift; ignored for floats). */
+static inline void read_comps(const uint8_t *q, int fmt, float scale, int n, float *out) {
     switch (fmt) {
-    case 0: v = rd8(*a); *a += 1; break;
-    case 1: v = (int8_t)rd8(*a); *a += 1; break;
-    case 2: v = rd16(*a); *a += 2; break;
-    case 3: v = (int16_t)rd16(*a); *a += 2; break;
-    default: v = u2f(rd32(*a)); *a += 4; return v;
+    case 0: for (int i = 0; i < n; i++) out[i] = q[i] * scale; break;
+    case 1: for (int i = 0; i < n; i++) out[i] = (int8_t)q[i] * scale; break;
+    case 2: for (int i = 0; i < n; i++) out[i] = be16p(q + 2 * i) * scale; break;
+    case 3: for (int i = 0; i < n; i++) out[i] = (int16_t)be16p(q + 2 * i) * scale; break;
+    default: for (int i = 0; i < n; i++) out[i] = u2f(be32p(q + 4 * i)); break;
     }
-    return v / (float)(1 << shift);
 }
 
-static void read_color(uint32_t *a, int fmt, float *c) {
+static inline void read_color(const uint8_t *q, int fmt, float *c) {
     uint32_t v;
     switch (fmt) {
-    case 0: v = rd16(*a); *a += 2; c[0] = ((v >> 11) & 31) / 31.f; c[1] = ((v >> 5) & 63) / 63.f; c[2] = (v & 31) / 31.f; c[3] = 1; break;
-    case 1: c[0] = rd8(*a) / 255.f; c[1] = rd8(*a + 1) / 255.f; c[2] = rd8(*a + 2) / 255.f; c[3] = 1; *a += 3; break;
-    case 2: c[0] = rd8(*a) / 255.f; c[1] = rd8(*a + 1) / 255.f; c[2] = rd8(*a + 2) / 255.f; c[3] = 1; *a += 4; break;
-    case 3: v = rd16(*a); *a += 2; c[0] = ((v >> 12) & 15) / 15.f; c[1] = ((v >> 8) & 15) / 15.f; c[2] = ((v >> 4) & 15) / 15.f; c[3] = (v & 15) / 15.f; break;
-    case 4: v = (uint32_t)rd8(*a) << 16 | rd8(*a + 1) << 8 | rd8(*a + 2); *a += 3;
+    case 0: v = be16p(q); c[0] = ((v >> 11) & 31) / 31.f; c[1] = ((v >> 5) & 63) / 63.f; c[2] = (v & 31) / 31.f; c[3] = 1; break;
+    case 1: case 2: c[0] = q[0] / 255.f; c[1] = q[1] / 255.f; c[2] = q[2] / 255.f; c[3] = 1; break;
+    case 3: v = be16p(q); c[0] = ((v >> 12) & 15) / 15.f; c[1] = ((v >> 8) & 15) / 15.f; c[2] = ((v >> 4) & 15) / 15.f; c[3] = (v & 15) / 15.f; break;
+    case 4: v = (uint32_t)q[0] << 16 | q[1] << 8 | q[2];
         c[0] = ((v >> 18) & 63) / 63.f; c[1] = ((v >> 12) & 63) / 63.f; c[2] = ((v >> 6) & 63) / 63.f; c[3] = (v & 63) / 63.f; break;
-    default: c[0] = rd8(*a) / 255.f; c[1] = rd8(*a + 1) / 255.f; c[2] = rd8(*a + 2) / 255.f; c[3] = rd8(*a + 3) / 255.f; *a += 4; break;
+    default: c[0] = q[0] / 255.f; c[1] = q[1] / 255.f; c[2] = q[2] / 255.f; c[3] = q[3] / 255.f; break;
     }
 }
 
@@ -374,7 +383,11 @@ static const int k_color_size[8] = {2, 3, 4, 2, 3, 4, 4, 4};
 typedef struct {
     int pnmtx, texmtx[8], pos, nrm, col[2], tex[8];
     int pos_cnt, pos_fmt, pos_shift, nrm_cnt, nrm_fmt, nrm_idx3, col_fmt[2], tex_cnt[8], tex_fmt[8], tex_shift[8];
+    float pos_scale, nrm_scale, tex_scale[8];
+    int size; /* bytes per vertex in the stream */
 } VtxFormat;
+
+static int vtx_size(const VtxFormat *f);
 
 static void vtx_format(int vat, VtxFormat *f) {
     uint32_t lo = cp[0x50], hi = cp[0x60], a = cp[0x70 + vat], b = cp[0x80 + vat], c = cp[0x90 + vat];
@@ -396,6 +409,11 @@ static void vtx_format(int vat, VtxFormat *f) {
     f->tex_cnt[5] = (c >> 5) & 1; f->tex_fmt[5] = (c >> 6) & 7; f->tex_shift[5] = (c >> 9) & 31;
     f->tex_cnt[6] = (c >> 14) & 1; f->tex_fmt[6] = (c >> 15) & 7; f->tex_shift[6] = (c >> 18) & 31;
     f->tex_cnt[7] = (c >> 23) & 1; f->tex_fmt[7] = (c >> 24) & 7; f->tex_shift[7] = (c >> 27) & 31;
+    f->pos_scale = 1.0f / (float)(1u << f->pos_shift);
+    /* s8 normals have 6 fractional bits, s16 have 14 */
+    f->nrm_scale = f->nrm_fmt <= 1 ? 1.0f / 64 : f->nrm_fmt <= 3 ? 1.0f / 16384 : 1.0f;
+    for (int i = 0; i < 8; i++) f->tex_scale[i] = 1.0f / (float)(1u << f->tex_shift[i]);
+    f->size = vtx_size(f);
 }
 
 static int attr_size(int mode, int direct_size) { return mode == 0 ? 0 : mode == 1 ? direct_size : mode == 2 ? 1 : 2; }
@@ -412,55 +430,61 @@ static int vtx_size(const VtxFormat *f) {
     return n;
 }
 
-/* Address of an attribute: either inline in the stream (*p advances) or indexed into an array. */
-static uint32_t attr_addr(int mode, int array, uint32_t *p, int direct_size) {
-    if (mode == 1) { uint32_t a = *p; *p += (uint32_t)direct_size; return a; }
-    uint32_t idx = mode == 2 ? rd8(*p) : rd16(*p);
-    *p += mode == 2 ? 1 : 2;
-    return 0x80000000u | ((cp[0xA0 + array] & 0x03FFFFFF) + idx * (cp[0xB0 + array] & 0xFF));
+/* An attribute's data: inline in the stream at s + *off (which advances), or indexed into an array. */
+static const uint8_t *attr_ptr(int mode, int array, const uint8_t *s, int *off, int direct_size, uint8_t *tmp) {
+    if (mode == 1) { const uint8_t *q = s + *off; *off += direct_size; return q; }
+    uint32_t idx = mode == 2 ? s[*off] : be16p(s + *off);
+    *off += mode == 2 ? 1 : 2;
+    uint32_t a = 0x80000000u | ((cp[0xA0 + array] & 0x03FFFFFF) + idx * (cp[0xB0 + array] & 0xFF));
+    return vspan(a, (uint32_t)(direct_size > 0 ? direct_size : 1), tmp);
 }
 
+/* Reads one vertex. Fields for attributes the format lacks are left as they are, except the
+ * flags and texcoords transform() looks at. */
 static void read_vertex(const VtxFormat *f, uint32_t *p, RawVertex *v) {
+    uint8_t sbuf[256], abuf[64];
+    const uint8_t *s = vspan(*p, (uint32_t)f->size, sbuf);
+    int off = 0;
     uint32_t mi_a = xf[0x1018], mi_b = xf[0x1019];
-    v->pnmtx = f->pnmtx ? rd8((*p)++) : (int)(mi_a & 63);
+    v->pnmtx = f->pnmtx ? s[off++] : (int)(mi_a & 63);
     for (int i = 0; i < 8; i++) {
         int def = i < 4 ? (int)((mi_a >> (6 + 6 * i)) & 63) : (int)((mi_b >> (6 * (i - 4))) & 63);
-        v->texmtx[i] = f->texmtx[i] ? rd8((*p)++) : def;
+        v->texmtx[i] = f->texmtx[i] ? s[off++] : def;
     }
+    v->pos[0] = v->pos[1] = v->pos[2] = 0;
     if (f->pos) {
         int comps = f->pos_cnt ? 3 : 2;
-        uint32_t a = attr_addr(f->pos, 0, p, comps * k_comp_size[f->pos_fmt]);
-        for (int i = 0; i < comps; i++) v->pos[i] = read_comp(&a, f->pos_fmt, f->pos_shift);
-        if (comps == 2) v->pos[2] = 0;
+        const uint8_t *q = attr_ptr(f->pos, 0, s, &off, comps * k_comp_size[f->pos_fmt], abuf);
+        read_comps(q, f->pos_fmt, f->pos_scale, comps, v->pos);
     }
+    v->has_nrm = 0;
     if (f->nrm) { /* the normal (binormal/tangent of NBT are skipped: no bump mapping yet) */
         int comps = f->nrm_cnt ? 9 : 3;
-        /* s8 normals have 6 fractional bits, s16 have 14 */
-        int shift = f->nrm_fmt == 1 || f->nrm_fmt == 0 ? 6 : f->nrm_fmt == 3 || f->nrm_fmt == 2 ? 14 : 0;
-        uint32_t a;
+        const uint8_t *q;
         if (f->nrm >= 2 && f->nrm_cnt && f->nrm_idx3) { /* three separate indices; the first is the normal */
-            a = attr_addr(f->nrm, 1, p, 0);
-            *p += 2 * (f->nrm == 2 ? 1 : 2);
+            q = attr_ptr(f->nrm, 1, s, &off, 3 * k_comp_size[f->nrm_fmt], abuf);
+            off += 2 * (f->nrm == 2 ? 1 : 2);
         } else {
-            a = attr_addr(f->nrm, 1, p, comps * k_comp_size[f->nrm_fmt]);
+            q = attr_ptr(f->nrm, 1, s, &off, comps * k_comp_size[f->nrm_fmt], abuf);
         }
-        for (int i = 0; i < 3; i++) v->nrm[i] = read_comp(&a, f->nrm_fmt, shift);
+        read_comps(q, f->nrm_fmt, f->nrm_scale, 3, v->nrm);
         v->has_nrm = 1;
     }
     for (int i = 0; i < 2; i++) {
         v->has_col[i] = 0;
         if (!f->col[i]) continue;
-        uint32_t a = attr_addr(f->col[i], 2 + i, p, k_color_size[f->col_fmt[i]]);
-        read_color(&a, f->col_fmt[i], v->col[i]);
+        const uint8_t *q = attr_ptr(f->col[i], 2 + i, s, &off, k_color_size[f->col_fmt[i]], abuf);
+        read_color(q, f->col_fmt[i], v->col[i]);
         v->has_col[i] = 1;
     }
     for (int i = 0; i < 8; i++) {
+        v->tex[i][0] = v->tex[i][1] = 0;
         if (!f->tex[i]) continue;
         int comps = f->tex_cnt[i] ? 2 : 1;
-        uint32_t a = attr_addr(f->tex[i], 4 + i, p, comps * k_comp_size[f->tex_fmt[i]]);
-        v->tex[i][0] = read_comp(&a, f->tex_fmt[i], f->tex_shift[i]);
-        v->tex[i][1] = comps == 2 ? read_comp(&a, f->tex_fmt[i], f->tex_shift[i]) : 0;
+        const uint8_t *q = attr_ptr(f->tex[i], 4 + i, s, &off, comps * k_comp_size[f->tex_fmt[i]], abuf);
+        read_comps(q, f->tex_fmt[i], f->tex_scale[i], comps, v->tex[i]);
     }
+    *p += (uint32_t)off;
 }
 
 static void unpack_color(uint32_t rgba, float *c) {
@@ -537,18 +561,8 @@ static void xf_setup(XfSetup *s, const RawVertex *first) {
 
 /* One color channel part (rgb or alpha) for one vertex, with the GX lighting model:
  * out = material * clamp(ambient + sum over enabled lights of color * diffuse * attenuation). */
-static void light_channel(const XfSetup *s, const RawVertex *v, int ch, int part, const float *vpos, const float *n,
-                          float *out) {
-    const XfChannel *c = &s->ch[ch][part];
-    int src = v->has_col[ch] ? ch : (v->has_col[0] ? 0 : -1);
-    const float *mat = c->vtx_mat && src >= 0 ? v->col[src] : c->mat;
-    int k0 = part ? 3 : 0, k1 = part ? 4 : 3;
-    if (!c->light) {
-        for (int k = k0; k < k1; k++) out[k] = mat[k];
-        return;
-    }
-    const float *amb = c->vtx_amb && src >= 0 ? v->col[src] : c->amb;
-    float acc[4] = {amb[0], amb[1], amb[2], amb[3]};
+/* Per-light factor (attenuation * diffuse) for one channel part's light setup. */
+static void light_factors(const XfSetup *s, const XfChannel *c, const float *vpos, const float *n, float *fac) {
     for (int l = 0; l < 8; l++) {
         if (!(c->mask & (1 << l))) continue;
         const XfLight *L = &s->light[l];
@@ -584,8 +598,30 @@ static void light_channel(const XfSetup *s, const RawVertex *v, int ch, int part
             diff = n[0] * ld[0] + n[1] * ld[1] + n[2] * ld[2];
             if (c->diffuse == 2 && diff < 0) diff = 0; /* clamp */
         }
-        float f = attn * diff;
-        for (int k = k0; k < k1; k++) acc[k] += L->color[k] * f;
+        fac[l] = attn * diff;
+    }
+}
+
+static int same_light_setup(const XfChannel *a, const XfChannel *b) {
+    return a->mask == b->mask && a->diffuse == b->diffuse && a->atten == b->atten && a->spot == b->spot;
+}
+
+/* One color channel part (rgb or alpha); fac holds this part's light factors when lit. */
+static void light_channel(const XfSetup *s, const RawVertex *v, int ch, int part, const float *fac, float *out) {
+    const XfChannel *c = &s->ch[ch][part];
+    int src = v->has_col[ch] ? ch : (v->has_col[0] ? 0 : -1);
+    const float *mat = c->vtx_mat && src >= 0 ? v->col[src] : c->mat;
+    int k0 = part ? 3 : 0, k1 = part ? 4 : 3;
+    if (!c->light) {
+        for (int k = k0; k < k1; k++) out[k] = mat[k];
+        return;
+    }
+    const float *amb = c->vtx_amb && src >= 0 ? v->col[src] : c->amb;
+    float acc[4] = {amb[0], amb[1], amb[2], amb[3]};
+    for (int l = 0; l < 8; l++) {
+        if (!(c->mask & (1 << l))) continue;
+        const XfLight *L = &s->light[l];
+        for (int k = k0; k < k1; k++) acc[k] += L->color[k] * fac[l];
     }
     for (int k = k0; k < k1; k++) {
         float a = acc[k] < 0 ? 0 : acc[k] > 1 ? 1 : acc[k];
@@ -621,10 +657,19 @@ static void transform(const XfSetup *s, const RawVertex *v, GxVertex *o) {
         float len = sqrtf(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
         if (len > 0) { n[0] /= len; n[1] /= len; n[2] /= len; }
     }
-    light_channel(s, v, 0, 0, vpos, n, o->c0);
-    light_channel(s, v, 0, 1, vpos, n, o->c0);
-    light_channel(s, v, 1, 0, vpos, n, o->c1);
-    light_channel(s, v, 1, 1, vpos, n, o->c1);
+    for (int ch = 0; ch < 2; ch++) {
+        const XfChannel *cc = &s->ch[ch][0], *ca = &s->ch[ch][1];
+        float fc[8], fa[8];
+        const float *pa = fa;
+        if (cc->light) light_factors(s, cc, vpos, n, fc);
+        if (ca->light) {
+            if (cc->light && same_light_setup(cc, ca)) pa = fc;
+            else light_factors(s, ca, vpos, n, fa);
+        }
+        float *out = ch ? o->c1 : o->c0;
+        light_channel(s, v, ch, 0, fc, out);
+        light_channel(s, v, ch, 1, pa, out);
+    }
 
     /* texture coordinates: each texgen's source row, then its texture matrix */
     for (uint32_t tc = 0; tc < 8; tc++) {
@@ -649,6 +694,7 @@ static void transform(const XfSetup *s, const RawVertex *v, GxVertex *o) {
 /* Render state is rebuilt only when a BP register changes (or a new frame starts); each rebuild
  * gets a new serial, so batching compares serials instead of whole states. */
 static GxState g_state;
+static uint32_t g_xf_serial = 1; /* bumped by writes to XF lights and registers (0x600 and up) */
 static uint32_t g_state_serial;
 static int g_state_valid;
 
@@ -786,12 +832,12 @@ static void draw(uint8_t opcode, uint32_t p, uint32_t count) {
         vs = realloc(vs, sizeof *vs * cap);
         idx = realloc(idx, sizeof *idx * cap);
     }
-    XfSetup xs;
+    static XfSetup xs;
+    static uint32_t xs_serial;
     for (uint32_t i = 0; i < count; i++) {
         RawVertex rv;
-        memset(&rv, 0, sizeof rv);
         read_vertex(&fmt, &p, &rv);
-        if (i == 0) xf_setup(&xs, &rv);
+        if (i == 0 && xs_serial != g_xf_serial) { xf_setup(&xs, &rv); xs_serial = g_xf_serial; }
         transform(&xs, &rv, &vs[i]);
     }
     apply_texcoord_scale(vs, count);
@@ -1043,12 +1089,14 @@ static size_t run_commands(const uint8_t *b, size_t n, uint32_t guest_addr, int 
             uint32_t hdr = be32(c + 1), addr = hdr & 0xFFFF, cnt = ((hdr >> 16) & 15) + 1;
             for (uint32_t k = 0; k < cnt; k++)
                 if (addr + k < 0x1100) xf[addr + k] = be32(c + 5 + 4 * k);
+            if (addr + cnt > 0x600) g_xf_serial++; /* lights or registers: per-draw setup changes */
             break;
         }
         case 0x20: case 0x28: case 0x30: case 0x38: {
             uint32_t v = be32(c + 1), arr = 12 + ((op - 0x20) >> 3), index = v >> 16, len = ((v >> 12) & 15) + 1, addr = v & 0xFFF;
             uint32_t src = 0x80000000u | ((cp[0xA0 + arr] & 0x03FFFFFF) + index * (cp[0xB0 + arr] & 0xFF));
             for (uint32_t k = 0; k < len; k++) xf[(addr + k) & 0xFFF] = rd32(src + 4 * k);
+            if (addr + len > 0x600) g_xf_serial++;
             break;
         }
         case 0x40: call_display_list(be32(c + 1), be32(c + 5), depth); break;
