@@ -26,7 +26,7 @@ host runtime into a native executable. This is the route toward a PC / Linux / S
 - **System font:** the SDK reads the console's boot-ROM font (`OSInitFont`/`OSLoadFont`). `__OSReadROM` is HLE and
   serves it from `user/GF7E01/ipl.bin` (your own IPL dump) or from free replacement fonts in `user/fonts/`
   (`font_western.bin`, `font_japanese.bin`, Apache 2.0, from Dolphin's `Sys/GC`). The comm subtitles are drawn with it.
-- **Known rendering gap:** some file-select panels and pop-up message boxes still show no text.
+- All text renders: menus, file and level select, pop-up messages, the mission briefing and the comm subtitles.
 
 ### Memory card
 
@@ -113,7 +113,7 @@ untranslated instructions.
 | **Lighting** | GX per-vertex lighting for both color channels (color and alpha separately). Normals are decoded (s8/s16/float, including the NBT index form) and transformed by the normal matrix (XF `0x400`). Ambient plus up to 8 lights from XF `0x600`: color, position, direction, spot (angle/distance) or specular attenuation, and the none/sign/clamp diffuse functions, multiplied by the material color from a register or the vertex. | `gx.c` |
 | **Frames** | Each frame's batches are built on the guest threads and handed to a **render thread** that owns the SDL window and an OpenGL 3.3 core context. It draws into a 640×528 EFB framebuffer and scales the XFB-copy rectangle into the window. EFB clears requested by copies are applied in order. | `video.c` |
 | **Input** | Port 1 merges the keyboard and the first SDL game controller (Steam Deck included) into `PADRead`. `--auto-press` taps START and A every 4 seconds for unattended testing. | `video.c`, `hle.c` |
-| **Diagnostics** | `--dump-frames` saves every 15th presented frame to `build/GF7E01/frames/*.bmp`. `--no-video` runs headless. With `SFA_GX_DEBUG=1`, each new draw configuration, texture upload (with how many source bytes are non-zero), EFB-to-texture copy and ARAM DMA is logged, and decoded textures are saved to `build/GF7E01/textures/`. | `video.c`, `gx.c` |
+| **Diagnostics** | `--dump-frames` saves every 15th presented frame to `build/GF7E01/frames/*.bmp`. Files are named by frame number and older runs' files aren't removed, so empty the folder before a run you want to compare. `--no-video` runs headless. With `SFA_GX_DEBUG=1`, each new draw configuration, texture upload (with how many source bytes are non-zero), EFB-to-texture copy and ARAM DMA is logged, and decoded textures are saved to `build/GF7E01/textures/`. | `video.c`, `gx.c` |
 
 Keyboard: arrows/WASD = control stick, Enter = START, Space/J = A, K/Backspace = B, L = X, I = Y,
 Q/E = L/R, Z = Z, numpad 8/4/6/2 = C-stick.
@@ -137,13 +137,12 @@ The generator also emits **extra entry points** for calls into the middle of a f
 
 ## Next
 
-1. **The remaining blank text:** some file-select panels and pop-up message boxes.
-2. **Indirect textures** (the TEV indirect stages, BP `0x10`–`0x27`). Unused through the front end and Mission 1
-   (0 of 27 million draws), so this waits until a later stage needs it.
-3. **Performance:** render-to-texture read-backs are synchronous (about 25 fps instead of 28–30); use PBOs
+1. **Performance:** render-to-texture read-backs are synchronous (about 25 fps instead of 28–30); use PBOs
    to read back asynchronously.
-4. **Performance:** GPU-side vertex transform, toward a steady 30 (or unlocked 60) fps.
-5. **Packaging:** a release build layout, and a Linux/Steam Deck build and test.
+2. **Performance:** GPU-side vertex transform, toward a steady 30 (or unlocked 60) fps.
+3. **Indirect textures** (the TEV indirect stages, BP `0x10`–`0x27`). Unused through the front end and Mission 1
+   (0 of 27 million draws), so this waits until a later stage needs it.
+4. **Packaging:** a release build layout, and a Linux/Steam Deck build and test.
 
 ### Debugging aids
 
