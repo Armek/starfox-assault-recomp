@@ -25,8 +25,8 @@ host runtime into a native executable. This is the route toward a PC / Linux / S
   - The 3D comm portraits (Falco, Slippy, …) and the Arwing's shadow render through EFB-to-texture copies.
 - **System font:** the SDK reads the console's boot-ROM font (`OSInitFont`/`OSLoadFont`). `__OSReadROM` is HLE and
   serves it from `user/GF7E01/ipl.bin` (your own IPL dump) or from free replacement fonts in `user/fonts/`
-  (`font_western.bin`, `font_japanese.bin`, Apache 2.0, from Dolphin's `Sys/GC`). The mission briefing text uses it.
-- **Known rendering gap:** the comm subtitles and some file-select panels still show no text.
+  (`font_western.bin`, `font_japanese.bin`, Apache 2.0, from Dolphin's `Sys/GC`). The comm subtitles are drawn with it.
+- **Known rendering gap:** some file-select panels and pop-up message boxes still show no text.
 
 ### Memory card
 
@@ -106,6 +106,7 @@ untranslated instructions.
 | **Command processor** | Bytes written to the write-gather pipe (`0xCC008000`) are parsed as soon as a command is complete. It handles CP/XF/BP register loads (with the BP mask register), indexed XF loads, `CALL_DL` display lists from guest memory, and all 8 primitive types. | `gx.c` |
 | **Vertices** | Every attribute (matrix indices, position, normal/NBT, two colors, eight texcoords) in direct, 8-bit and 16-bit indexed modes, all component formats and color formats. They're transformed on the CPU: position matrix, perspective/orthographic projection and viewport, written as clip-space vertices so GL still clips and interpolates with perspective correction. Texcoords go through the texgen source row and texture matrix (ST/STQ). | `gx.c` |
 | **Textures** | I4, I8, IA4, IA8, RGB565, RGB5A3, RGBA8, CI4, CI8, CI14X2 (TLUT loads into a TMEM model) and CMPR. Decoded to RGBA8 and cached by address/format/size/palette, then re-decoded when the source bytes' hash changes (checked once per frame). | `gx.c` |
+| **Texcoord scale** | The setup unit's per-texcoord sizes (SU_SSIZE/SU_TSIZE, BP `0x30`–`0x3F`) are applied: a texcoord is rescaled by its SU size over the bound texture's size. This matters for `GXSetTexCoordScaleManually`, which the system-font text uses to send texel coordinates (the font sheet is drawn as CI4 with an RGB5A3 alpha-ramp palette). | `gx.c` |
 | **TEV** | Full: up to 16 stages with every color/alpha combiner input, bias/scale/clamp/subtract and compare modes, the TEV color registers and konst colors (BP `0xE0`–`0xE7`, split by bit 23), konst selectors, swap tables, both raster color channels and 8 texture maps. The alpha compare uses both references and its logic op. Each distinct configuration becomes a generated GLSL fragment shader, compiled once and cached. | `gx.c`, `video.c` |
 | **Render state** | Blend factors/subtract, color/alpha write masks, depth test/function/write, scissor. | `gx.c`, `video.c` |
 | **Render-to-texture** | An EFB copy to texture ends the current *segment*. The render thread draws it (never dropped), reads the rectangle back and signals the guest. The guest box-filters it if half-scale is set, encodes it into the requested copy format (R4/I4, R8/I8, RA4/IA4, RA8/IA8, RGB565, RGB5A3, RGBA8, A8, R8, G8, B8, RG8, GB8; YUV intensity when set), tiled like textures, and writes it to the destination in RAM. Mission 1 uses this for the 3D comm portraits (69×65 RGBA8) and the Arwing shadow silhouette (160×160 RG8). | `gx.c`, `video.c` |
@@ -136,7 +137,7 @@ The generator also emits **extra entry points** for calls into the middle of a f
 
 ## Next
 
-1. **The remaining blank text:** the comm subtitles and some file-select panels (not the system font).
+1. **The remaining blank text:** some file-select panels and pop-up message boxes.
 2. **Indirect textures** (the TEV indirect stages, BP `0x10`–`0x27`). Unused through the front end and Mission 1
    (0 of 27 million draws), so this waits until a later stage needs it.
 3. **Performance:** render-to-texture read-backs are synchronous (about 25 fps instead of 28–30); use PBOs

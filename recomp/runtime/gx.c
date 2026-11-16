@@ -712,6 +712,34 @@ void gx_profile_report(void) {
     g_t_state = g_t_vtx = g_t_emit = g_t_calls = g_t_verts = 0;
 }
 
+/* The setup unit turns texcoords into texel units with SU_SSIZE/SU_TSIZE (BP 0x30 + 2n / 0x31 + 2n, size - 1
+ * for texcoord n). GX normally loads the size of the texture the coordinate is used with, so normalized
+ * coordinates work; with GXSetTexCoordScaleManually a game can set any scale and send other units (the
+ * system-font text uses texel coordinates with a scale of 1). The renderer samples normalized coordinates,
+ * so rescale each texcoord by its SU size over the size of the texture it's sampled from. */
+static void apply_texcoord_scale(GxVertex *vs, uint32_t count) {
+    float ks[8], kt[8];
+    uint32_t need = 0, nstages = ((bp[0x00] >> 10) & 15) + 1;
+    for (uint32_t k = 0; k < nstages; k++) {
+        uint32_t tref = bp[0x28 + k / 2] >> ((k & 1) ? 12 : 0);
+        if (!((tref >> 6) & 1)) continue;
+        uint32_t map = tref & 7, coord = (tref >> 3) & 7;
+        if (need & (1u << coord)) continue;
+        uint32_t img0 = bp[map < 4 ? 0x88 + map : 0xA8 + (map - 4)];
+        uint32_t w = (img0 & 0x3FF) + 1, h = ((img0 >> 10) & 0x3FF) + 1;
+        uint32_t ss = (bp[0x30 + 2 * coord] & 0xFFFF) + 1, ts = (bp[0x31 + 2 * coord] & 0xFFFF) + 1;
+        if (ss == w && ts == h) continue;
+        ks[coord] = (float)ss / (float)w;
+        kt[coord] = (float)ts / (float)h;
+        need |= 1u << coord;
+    }
+    if (!need) return;
+    for (uint32_t c = 0; c < 8; c++) {
+        if (!(need & (1u << c))) continue;
+        for (uint32_t i = 0; i < count; i++) { vs[i].uv[c][0] *= ks[c]; vs[i].uv[c][1] *= kt[c]; }
+    }
+}
+
 static void draw(uint8_t opcode, uint32_t p, uint32_t count) {
     debug_draw_config();
     if (g_dbg) { /* indirect texturing usage: GEN_MODE bits 16-18 = indirect stages; BP 0x10+ per TEV stage */
@@ -762,6 +790,7 @@ static void draw(uint8_t opcode, uint32_t p, uint32_t count) {
         if (i == 0) xf_setup(&xs, &rv);
         transform(&xs, &rv, &vs[i]);
     }
+    apply_texcoord_scale(vs, count);
     uint64_t t2 = ticks();
     g_t_state += t1 - t0;
     g_t_vtx += t2 - t1;
