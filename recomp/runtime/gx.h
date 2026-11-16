@@ -75,7 +75,17 @@ typedef struct GxFrame {
     uint32_t nclears, cap_clears;
     uint16_t copy_rect[4];   /* EFB source rectangle of the XFB copy: x, y, w, h */
     uint32_t number;
+    struct GxCopyRequest *copy; /* non-NULL: a mid-frame segment ending in an EFB-to-texture copy */
 } GxFrame;
+
+/* An EFB copy to texture: the renderer draws the segment, reads back the rectangle (RGBA8, top
+ * row first) into rgba and sets done; the guest thread then encodes it into guest memory. */
+typedef struct GxCopyRequest {
+    uint32_t x, y, w, h;
+    uint8_t *rgba;
+    volatile int done;
+} GxCopyRequest;
+void video_copy_segment(GxFrame *frame); /* takes ownership of frame; returns when copy->done */
 
 /* video.c */
 /* Controller state in PADStatus layout (button bits as in the SDK: A 0x100, B 0x200, X 0x400,

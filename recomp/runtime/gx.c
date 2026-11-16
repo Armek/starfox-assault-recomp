@@ -714,6 +714,30 @@ void gx_profile_report(void) {
 
 static void draw(uint8_t opcode, uint32_t p, uint32_t count) {
     debug_draw_config();
+    if (g_dbg) { /* indirect texturing usage: GEN_MODE bits 16-18 = indirect stages; BP 0x10+ per TEV stage */
+        uint32_t nind = (bp[0x00] >> 16) & 7, nst = ((bp[0x00] >> 10) & 15) + 1, cmd_stages = 0;
+        for (uint32_t i = 0; i < nst; i++) if (bp[0x10 + i] & 0x1FFFFF) cmd_stages++;
+        static unsigned long draws, ind_draws, last_frame = ~0ul;
+        static uint32_t seen[64];
+        static unsigned nseen;
+        draws++;
+        if (nind || cmd_stages) {
+            ind_draws++;
+            uint32_t key = nind << 28 ^ bp[0x10] ^ bp[0x27] << 4 ^ bp[0x0E] * 31;
+            int known = 0;
+            for (unsigned k = 0; k < nseen; k++) known |= seen[k] == key;
+            if (!known && nseen < 64) {
+                seen[nseen++] = key;
+                printf("[gx-ind] frame %u: %u indirect stages, %u TEV stages use them; IND_CMD0 %06X IREF %06X "
+                       "IMTX0 %06X/%06X/%06X SS0 %06X\n", g_frame_number, nind, cmd_stages, bp[0x10], bp[0x27],
+                       bp[0x06], bp[0x07], bp[0x08], bp[0x25]);
+            }
+        }
+        if (g_frame_number != last_frame && g_frame_number % 300 == 0) {
+            last_frame = g_frame_number;
+            printf("[gx-ind] by frame %u: %lu of %lu draws use indirect texturing\n", g_frame_number, ind_draws, draws);
+        }
+    }
     uint64_t t0 = ticks();
     VtxFormat fmt;
     vtx_format(opcode & 7, &fmt);
@@ -771,13 +795,99 @@ static void draw(uint8_t opcode, uint32_t p, uint32_t count) {
 }
 
 /* ---- BP side effects ----------------------------------------------------------------------- */
+/* Encode read-back EFB pixels (RGBA8, top row first) into a GX texture in guest memory, tiled the
+ * way the texture decoder expects. fmt is the copy format: 0 R4/I4, 1 R8/I8, 2 RA4/IA4, 3 RA8/IA8,
+ * 4 RGB565, 5 RGB5A3, 6 RGBA8, 7 A8, 8 R8, 9 G8, 10 B8, 11 RG8, 12 GB8. */
+static void encode_copy(const uint8_t *px, uint32_t w, uint32_t h, uint32_t fmt, int intensity, uint32_t dst) {
+    uint32_t tw, th, tb, tf;
+    static const uint32_t as_tex[13] = {0, 1, 2, 3, 4, 5, 6, 1, 1, 1, 1, 3, 3}; /* texture layout per copy format */
+    tf = fmt < 13 ? as_tex[fmt] : 6;
+    tex_tile(tf, &tw, &th, &tb);
+    for (uint32_t ty = 0; ty < h; ty += th)
+        for (uint32_t tx = 0; tx < w; tx += tw, dst += tb) {
+            uint8_t blk[64] = {0};
+            for (uint32_t yy = 0; yy < th; yy++)
+                for (uint32_t xx = 0; xx < tw; xx++) {
+                    uint32_t sx = tx + xx < w ? tx + xx : w - 1, sy = ty + yy < h ? ty + yy : h - 1;
+                    const uint8_t *c = px + ((size_t)sy * w + sx) * 4;
+                    uint8_t r = c[0], g = c[1], b = c[2], a = c[3];
+                    uint8_t I = intensity ? (uint8_t)((66 * r + 129 * g + 25 * b + 128) / 256 + 16) : r;
+                    uint32_t i = yy * tw + xx;
+                    switch (fmt) {
+                    case 0: blk[i / 2] |= (uint8_t)((I >> 4) << ((i & 1) ? 0 : 4)); break;
+                    case 1: case 8: blk[i] = I; break;
+                    case 7: blk[i] = a; break;
+                    case 9: blk[i] = g; break;
+                    case 10: blk[i] = b; break;
+                    case 2: blk[i] = (uint8_t)((a & 0xF0) | (I >> 4)); break;
+                    case 3: blk[i * 2] = a; blk[i * 2 + 1] = I; break;
+                    case 11: blk[i * 2] = g; blk[i * 2 + 1] = r; break;
+                    case 12: blk[i * 2] = b; blk[i * 2 + 1] = g; break;
+                    case 4: { uint16_t v16 = (uint16_t)((r >> 3) << 11 | (g >> 2) << 5 | b >> 3);
+                              blk[i * 2] = (uint8_t)(v16 >> 8); blk[i * 2 + 1] = (uint8_t)v16; break; }
+                    case 5: { uint16_t v16 = a >= 0xE0 ? (uint16_t)(0x8000 | (r >> 3) << 10 | (g >> 3) << 5 | b >> 3)
+                                                       : (uint16_t)((a >> 5) << 12 | (r >> 4) << 8 | (g >> 4) << 4 | b >> 4);
+                              blk[i * 2] = (uint8_t)(v16 >> 8); blk[i * 2 + 1] = (uint8_t)v16; break; }
+                    default: blk[i * 2] = a; blk[i * 2 + 1] = r; blk[32 + i * 2] = g; blk[32 + i * 2 + 1] = b; break;
+                    }
+                }
+            for (uint32_t k = 0; k < tb; k++) wr8(dst + k, blk[k]);
+        }
+}
+
+/* EFB copy to texture: render everything drawn so far (a frame segment), read the rectangle back
+ * and write it to guest memory in the requested format. */
+static void efb_copy_to_texture(uint32_t v, int x, int y, int w, int h) {
+    GxFrame *f = frame();
+    GxCopyRequest req = {(uint32_t)x, (uint32_t)y, (uint32_t)w, (uint32_t)h, malloc((size_t)w * h * 4), 0};
+    f->copy = &req;
+    g_frame = NULL;
+    g_state_valid = 0;
+    video_copy_segment(f);
+    uint32_t fmt = ((v >> 4) & 7) + ((v >> 3) & 1) * 8, half = (v >> 9) & 1, intensity = (v >> 15) & 1;
+    uint32_t dst = 0x80000000u | ((bp[0x4B] & 0xFFFFFF) << 5);
+    uint32_t ow = (uint32_t)w, oh = (uint32_t)h;
+    uint8_t *px = req.rgba;
+    if (half) { /* 2x2 box filter */
+        ow = (uint32_t)w / 2; oh = (uint32_t)h / 2;
+        for (uint32_t yy = 0; yy < oh; yy++)
+            for (uint32_t xx = 0; xx < ow; xx++)
+                for (int k = 0; k < 4; k++) {
+                    const uint8_t *s0 = req.rgba + ((size_t)(yy * 2) * (uint32_t)w + xx * 2) * 4;
+                    const uint8_t *s1 = s0 + (size_t)w * 4;
+                    px[((size_t)yy * ow + xx) * 4 + k] = (uint8_t)((s0[k] + s0[4 + k] + s1[k] + s1[4 + k] + 2) / 4);
+                }
+    }
+    if (ppc_is_ram(dst) && ow && oh) encode_copy(px, ow, oh, fmt, (int)intensity, dst);
+    if (g_dbg && g_frame_number % 120 == 0) { /* save what was copied, for inspection */
+        char path[256];
+        snprintf(path, sizeof path, "build/GF7E01/textures/copy_%05u_%08X_f%u_%ux%u.bmp", g_frame_number, dst, fmt, ow, oh);
+        FILE *fp = fopen(path, "wb");
+        if (fp) {
+            uint32_t sz = ow * oh * 4, t;
+            uint8_t hdr[54] = {'B', 'M'};
+            t = 54 + sz; memcpy(hdr + 2, &t, 4);
+            t = 54; memcpy(hdr + 10, &t, 4);
+            t = 40; memcpy(hdr + 14, &t, 4);
+            memcpy(hdr + 18, &ow, 4);
+            int32_t nh = -(int32_t)oh; memcpy(hdr + 22, &nh, 4);
+            hdr[26] = 1; hdr[28] = 32;
+            fwrite(hdr, 1, 54, fp);
+            for (uint32_t i = 0; i < ow * oh; i++) { uint8_t b4[4] = {px[i*4+2], px[i*4+1], px[i*4], 255}; fwrite(b4, 1, 4, fp); }
+            fclose(fp);
+        }
+    }
+    free(req.rgba);
+}
+
 static void efb_copy(uint32_t v) {
     uint32_t tl = bp[0x49], wh = bp[0x4A];
     int x = (int)(tl & 0x3FF), y = (int)((tl >> 10) & 0x3FF), w = (int)(wh & 0x3FF) + 1, h = (int)((wh >> 10) & 0x3FF) + 1;
     int to_xfb = (v >> 14) & 1, clear = (v >> 11) & 1;
     if (!to_xfb && g_dbg)
         printf("[gx-copy] frame %u EFB (%d,%d %dx%d) -> texture %08X fmt %u half %u\n", g_frame_number, x, y, w, h,
-               0x80000000u | ((bp[0x4B] & 0xFFFFFF) << 5), (v >> 4) & 15 | ((v >> 3) & 1) << 4, (v >> 9) & 1);
+               0x80000000u | ((bp[0x4B] & 0xFFFFFF) << 5), ((v >> 4) & 7) + ((v >> 3) & 1) * 8, (v >> 9) & 1);
+    if (!to_xfb) efb_copy_to_texture(v, x, y, w, h);
     if (to_xfb) {
         GxFrame *f = frame();
         f->copy_rect[0] = (uint16_t)x; f->copy_rect[1] = (uint16_t)y; f->copy_rect[2] = (uint16_t)w; f->copy_rect[3] = (uint16_t)h;

@@ -22,6 +22,7 @@ host runtime into a native executable. This is the route toward a PC / Linux / S
   - The frame rate is 28–30 fps in the mission, which looks like a 30 fps cap: the game still idles
     20–28% of the time waiting for the retrace.
   - Models are lit with the real GX lighting model (per-vertex lights, attenuation and diffuse functions).
+  - The 3D comm portraits (Falco, Slippy, …) and the Arwing's shadow render through EFB-to-texture copies.
 - **Known rendering gap:** some generated dialog boxes still show no text.
 
 ### Memory card
@@ -104,6 +105,7 @@ untranslated instructions.
 | **Textures** | I4, I8, IA4, IA8, RGB565, RGB5A3, RGBA8, CI4, CI8, CI14X2 (TLUT loads into a TMEM model) and CMPR. Decoded to RGBA8 and cached by address/format/size/palette, then re-decoded when the source bytes' hash changes (checked once per frame). | `gx.c` |
 | **TEV** | Full: up to 16 stages with every color/alpha combiner input, bias/scale/clamp/subtract and compare modes, the TEV color registers and konst colors (BP `0xE0`–`0xE7`, split by bit 23), konst selectors, swap tables, both raster color channels and 8 texture maps. The alpha compare uses both references and its logic op. Each distinct configuration becomes a generated GLSL fragment shader, compiled once and cached. | `gx.c`, `video.c` |
 | **Render state** | Blend factors/subtract, color/alpha write masks, depth test/function/write, scissor. | `gx.c`, `video.c` |
+| **Render-to-texture** | An EFB copy to texture ends the current *segment*. The render thread draws it (never dropped), reads the rectangle back and signals the guest. The guest box-filters it if half-scale is set, encodes it into the requested copy format (R4/I4, R8/I8, RA4/IA4, RA8/IA8, RGB565, RGB5A3, RGBA8, A8, R8, G8, B8, RG8, GB8; YUV intensity when set), tiled like textures, and writes it to the destination in RAM. Mission 1 uses this for the 3D comm portraits (69×65 RGBA8) and the Arwing shadow silhouette (160×160 RG8). | `gx.c`, `video.c` |
 | **Lighting** | GX per-vertex lighting for both color channels (color and alpha separately). Normals are decoded (s8/s16/float, including the NBT index form) and transformed by the normal matrix (XF `0x400`). Ambient plus up to 8 lights from XF `0x600`: color, position, direction, spot (angle/distance) or specular attenuation, and the none/sign/clamp diffuse functions, multiplied by the material color from a register or the vertex. | `gx.c` |
 | **Frames** | Each frame's batches are built on the guest threads and handed to a **render thread** that owns the SDL window and an OpenGL 3.3 core context. It draws into a 640×528 EFB framebuffer and scales the XFB-copy rectangle into the window. EFB clears requested by copies are applied in order. | `video.c` |
 | **Input** | Port 1 merges the keyboard and the first SDL game controller (Steam Deck included) into `PADRead`. `--auto-press` taps START and A every 4 seconds for unattended testing. | `video.c`, `hle.c` |
@@ -131,9 +133,11 @@ The generator also emits **extra entry points** for calls into the middle of a f
 
 ## Next
 
-1. **Indirect textures** (the TEV indirect stages, BP `0x10`–`0x27`), for warps and effects.
-2. **EFB copies to textures:** render-to-texture, used for effects and the pause screen.
-3. **The remaining blank dialog text.**
+1. **The remaining blank text:** some dialog boxes and the comm subtitles.
+2. **Indirect textures** (the TEV indirect stages, BP `0x10`–`0x27`). Unused through the front end and Mission 1
+   (0 of 27 million draws), so this waits until a later stage needs it.
+3. **Performance:** render-to-texture read-backs are synchronous (about 25 fps instead of 28–30); use PBOs
+   to read back asynchronously.
 4. **Performance:** GPU-side vertex transform, toward a steady 30 (or unlocked 60) fps.
 5. **Packaging:** a release build layout, and a Linux/Steam Deck build and test.
 

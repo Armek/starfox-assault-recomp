@@ -272,6 +272,26 @@ void video_submit(GxFrame *frame) {
     SDL_UnlockMutex(g_qlock);
 }
 
+/* A mid-frame segment ending in an EFB copy to texture. Unlike whole frames it is never dropped
+ * (later draws build on this EFB content), and the caller waits for the read-back pixels. */
+static SDL_cond *g_done_cond;
+
+void video_copy_segment(GxFrame *frame) {
+    GxCopyRequest *req = frame->copy;
+    if (!g_qlock) { /* --no-video: no EFB to read */
+        memset(req->rgba, 0, (size_t)req->w * req->h * 4);
+        req->done = 1;
+        free_frame(frame);
+        return;
+    }
+    SDL_LockMutex(g_qlock);
+    while (g_pending_frame) SDL_CondWait(g_done_cond, g_qlock); /* let the renderer take what is queued */
+    g_pending_frame = frame;
+    SDL_CondSignal(g_qcond);
+    while (!req->done && !g_quit) SDL_CondWaitTimeout(g_done_cond, g_qlock, 100);
+    SDL_UnlockMutex(g_qlock);
+}
+
 /* ---- renderer --------------------------------------------------------------------------------- */
 static SDL_Window *g_window;
 static GLuint g_vao, g_vbo, g_efb_fbo, g_efb_color, g_efb_depth, g_white;
@@ -626,6 +646,25 @@ static void render(GxFrame *f) {
     }
     glDisable(GL_SCISSOR_TEST);
 
+    if (f->copy) { /* EFB copy to texture: read the rectangle back for the guest, don't present */
+        GxCopyRequest *r = f->copy;
+        static uint8_t *tmp;
+        static size_t tmp_size;
+        size_t bytes = (size_t)r->w * r->h * 4;
+        if (bytes > tmp_size) { tmp = realloc(tmp, bytes); tmp_size = bytes; }
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, g_efb_fbo);
+        glReadPixels((GLint)r->x, (GLint)(EFB_HEIGHT - (r->y + r->h)), (GLsizei)r->w, (GLsizei)r->h, GL_RGBA,
+                     GL_UNSIGNED_BYTE, tmp);
+        for (uint32_t y = 0; y < r->h; y++) /* GL rows are bottom-up */
+            memcpy(r->rgba + (size_t)y * r->w * 4, tmp + (size_t)(r->h - 1 - y) * r->w * 4, (size_t)r->w * 4);
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        SDL_LockMutex(g_qlock);
+        r->done = 1;
+        SDL_CondBroadcast(g_done_cond);
+        SDL_UnlockMutex(g_qlock);
+        return;
+    }
+
     /* present: the XFB copy rectangle, scaled to the window */
     int ww, wh;
     SDL_GL_GetDrawableSize(g_window, &ww, &wh);
@@ -700,6 +739,7 @@ static int render_thread(void *arg) {
         if (!g_pending_frame) SDL_CondWaitTimeout(g_qcond, g_qlock, 16);
         GxFrame *f = g_pending_frame;
         g_pending_frame = NULL;
+        SDL_CondBroadcast(g_done_cond); /* a waiting copy segment may queue now */
         SDL_UnlockMutex(g_qlock);
         if (f) {
             render(f);
@@ -730,5 +770,6 @@ void video_start(int dump_frames) {
     g_pad_lock = SDL_CreateMutex();
     g_qlock = SDL_CreateMutex();
     g_qcond = SDL_CreateCond();
+    g_done_cond = SDL_CreateCond();
     SDL_CreateThread(render_thread, "render", NULL);
 }
