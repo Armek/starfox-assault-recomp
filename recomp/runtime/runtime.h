@@ -39,4 +39,8 @@ void rt_dvd_init(const char *root);
 int rt_dvd_write(uint32_t off, uint32_t v, int size);
 void rt_dvd_stats(unsigned long *reads, unsigned long *bytes);
 
+/* hle.c: --stage=N starts stage N of the game's stage table in place of Mission 1's first stage */
+extern int g_start_stage;
+void rt_on_rel_linked(const char *name, uint32_t module); /* hle.c: called when a REL module links */
+
 #endif

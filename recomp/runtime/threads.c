@@ -77,6 +77,7 @@ typedef struct HThread {
 #define MAX_THREADS 64
 static HThread *g_threads[MAX_THREADS];
 static int g_thread_count;
+static int g_next_thread_id = 1; /* ids for log lines; 0 is the main thread */
 static HThread *g_running;
 static Mutex g_lock = MUTEX_INIT;
 static Cond g_cv = COND_INIT;
@@ -157,7 +158,7 @@ static HThread *new_thread(uint32_t ctx) {
     t->saved_ctx = ctx;
     t->start_pc = rd32(ctx + 0x198); /* srr0 */
     t->exit_pc = t->c->lr;
-    t->id = g_thread_count;
+    t->id = g_next_thread_id++;
     g_threads[g_thread_count++] = t;
 #ifdef _WIN32
     HANDLE h = CreateThread(NULL, 8 << 20, thread_main, t, 0, NULL);
@@ -282,6 +283,25 @@ HLE(OSLoadContext) {
         if (g_threads[i] != self && owns(g_threads[i], ctx)) { target = g_threads[i]; break; }
     if (!target) target = new_thread(ctx);
     target->resume_ctx = ctx;
+    if (self->exiting && self->id != 0 && self->irq_depth == 0) {
+        /* OSExitThread switching away: this thread's context is never resumed, so release its slot
+         * and end its host thread instead of parking it forever (the game starts threads, such as
+         * its streaming workers, over and over). */
+        lock(&g_lock);
+        for (int i = 0; i < g_thread_count; i++)
+            if (g_threads[i] == self) { g_threads[i] = g_threads[--g_thread_count]; break; }
+        g_running = target;
+        broadcast(&g_cv);
+        unlock(&g_lock);
+        t_self = NULL;
+        free(self->c);
+        free(self);
+#ifdef _WIN32
+        ExitThread(0);
+#else
+        pthread_exit(NULL);
+#endif
+    }
     hand_off(self, target);
     /* Someone loaded one of our contexts. If it was an interrupted one, resume there. */
     return_from_exception_if_irq(self, self->resume_ctx);
@@ -398,4 +418,10 @@ void rt_safepoint(Ctx *c) {
         if (wait_s > 0.0005) rt_sleep_us((unsigned)(wait_s * 1e6));
         g_safepoint_budget = 0;
     }
+}
+
+/* Entry hook on OSExitThread: the current guest thread is ending (OSLoadContext then releases it). */
+void rt_hook_801365AC(Ctx *c) {
+    (void)c;
+    if (t_self) t_self->exiting = 1;
 }

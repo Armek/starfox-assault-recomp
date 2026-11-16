@@ -51,3 +51,9 @@ CARDSetStatusAsync
 
 # Boot ROM reads: the SDK loads the system font from the IPL ROM (OSInitFont/OSLoadFont).
 __OSReadROM
+
+# Entry hooks: the recompiled function runs, but calls rt_hook_XXXXXXXX(c) first.
+# fn_8005F470(state, stage, ...) starts a stage (an index into the stage table at 0x80223560).
+entry fn_8005F470
+# OSExitThread marks the current thread as exiting, so its host thread ends once it switches away.
+entry OSExitThread

@@ -126,6 +126,7 @@ static void rel_notify(Ctx *c, int linked) {
             for (uint32_t k = 0; k < nsec && k < 32; k++) g_rel[i].sec[k] = rd32(si + k * 8) & ~3u;
             g_rel[i].loaded = 1;
             printf("[rel] linked %s: text 0x%08X, %u sections\n", ri->name, g_rel[i].sec[ri->text_sec], nsec);
+            rt_on_rel_linked(ri->name, m);
         } else {
             g_rel[i].loaded = 0;
             printf("[rel] unlinked %s\n", ri->name);
@@ -620,6 +621,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--dump-frames")) dump_frames = 1;
         else if (!strcmp(argv[i], "--no-video")) no_video = 1;
         else if (!strcmp(argv[i], "--auto-press")) video_set_auto_press(1);
+        else if (!strncmp(argv[i], "--stage=", 8)) g_start_stage = atoi(argv[i] + 8);
         else root = argv[i];
     }
     g_mem = calloc(1, PPC_MEM_SIZE);
