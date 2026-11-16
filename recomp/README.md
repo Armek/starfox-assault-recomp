@@ -19,8 +19,8 @@ host runtime into a native executable. This is the route toward a PC / Linux / S
 - **Milestone 4:** audio, and the game reaches **Mission 1 gameplay** ("01 — A New Enemy — Fortuna").
   - It shows the Arwing in combat with the fleet, the full HUD, wingman tags and the pause menu.
   - Music and sound effects play through SDL.
-  - The frame rate is 28–30 fps in the mission, which looks like a 30 fps cap: the game still idles
-    20–28% of the time waiting for the retrace.
+  - The mission runs at its 30 fps cap (`SFA_FPS=1` shows 28–38 presented frames/s); the guest CPU is
+    idle about 32% of the time waiting for the retrace.
   - Models are lit with the real GX lighting model (per-vertex lights, attenuation and diffuse functions).
   - The 3D comm portraits (Falco, Slippy, …) and the Arwing's shadow render through EFB-to-texture copies.
 - **System font:** the SDK reads the console's boot-ROM font (`OSInitFont`/`OSLoadFont`). `__OSReadROM` is HLE and
@@ -72,21 +72,22 @@ frame has about 20,000 small draws (fleet, lasers, particles, HUD).
   - batch by render-state serial number instead of comparing whole states.
 - **Frame buffer pool:** frames go back to a small pool with their vertex and batch arrays, so a new frame
   reuses memory that is already allocated and paged in instead of growing ~17 MB of vertices from zero.
-  Batching fell from about 2.6 s to 0.45 s per 10 s, and the game builds about 50% more frames in the same
-  time (82 vs 53 GX frames per 10 s in Mission 1, as counted by the profiler).
+  Batching fell to about a sixth of its cost.
 - **Vertex fast paths:** attributes are read through host pointers resolved once per span (not byte by
   byte through guest-memory checks), fixed-point scales are precomputed multipliers, the per-draw XF setup
   is reused until an XF light or register write bumps a serial, and a channel's color and alpha halves share
-  their per-light terms when their light setup matches. Vertex cost fell from about 120 to 72 ns per vertex,
-  and the game builds about 90–99 frames per 10 s (from 82–89).
+  their per-light terms when their light setup matches. Vertex cost fell from about 120 to 72 ns per vertex.
 - **Render state:** a BP write invalidates the render state only when the value changes (or the register
   acts as a command: TLUT loads, the EFB copy, TEV color writes), and decoded vertex formats are cached per
   VAT until a CP register changes. Only about 2% of draws rebuild the state.
-- **Where the time goes now** (Mission 1, per 10 s, as profiled): vertices about 3.5 s, waiting on
-  EFB-to-texture copies about 1.7 s (3–4 copies a frame), batching about 0.5 s. The "state" figure (about
-  1.2 s) is mostly the profiler's own two clock reads per draw, not work that unprofiled runs do.
-- **Further headroom:** move vertex transform to a GPU vertex shader, and cut per-draw state rebuilds
-  (the game rewrites BP registers between almost every draw).
+- **Where the time goes now** (Mission 1, per 10 s of wall time): about 3.5 million draws; vertices
+  2.1–2.3 s, waiting on EFB-to-texture copies about 0.8 s, batching about 0.3 s, and the guest idles about
+  32%. The "state" figure (about 0.6 s) is mostly the profiler's own clock reads. (Earlier figures in this
+  history were per 10,000 profiler samples, about 19 s of wall time, not per 10 s.)
+- **Further headroom:** a GPU vertex shader would take most of the vertex time off the guest thread. The
+  game matches its 30 fps cap on this PC, so this matters for slower CPUs (the Steam Deck) rather than here.
+  Matrices change about every 18 draws (about 6,000 matrix loads a second), so it needs per-draw matrix
+  snapshots in a buffer the shader indexes, not one uniform set per batch.
 
 ### Display lists built at run time
 
@@ -152,12 +153,14 @@ The generator also emits **extra entry points** for calls into the middle of a f
 
 ## Next
 
-1. **Performance:** GPU-side vertex transform (still the largest cost after the CPU fast paths).
+1. **Performance:** GPU-side vertex transform, for headroom on slower CPUs (the game already holds its
+   30 fps cap here; measure on the Steam Deck first).
 2. **Performance:** keep EFB-to-texture copies on the GPU instead of reading them back synchronously
    (about 15% of the guest's time).
 3. **Indirect textures** (the TEV indirect stages, BP `0x10`–`0x27`). Unused through the front end and Mission 1
    (0 of 27 million draws), so this waits until a later stage needs it.
-4. **Packaging:** a release build layout, and a Linux/Steam Deck build and test.
+4. **Packaging:** a release build layout. Linux builds and runs headless (see *Linux and Steam Deck*);
+   still to do: the windowed renderer on Linux and a test on the Steam Deck itself.
 
 ### Debugging aids
 
@@ -166,7 +169,8 @@ The generator also emits **extra entry points** for calls into the middle of a f
   TMEM preloads, EFB-to-texture copies and ARAM DMA, and saves decoded textures as images.
 - **`SFA_GX_FRAMEDUMP=<n>`** lists every batch of frame *n*.
 - **`SFA_PROFILE=1`** prints the hottest guest functions, the GX stage times, GX frames built and the
-  time spent waiting on EFB-to-texture copies, every 10 s.
+  time spent waiting on EFB-to-texture copies, every 10 s of wall time.
+- **`SFA_FPS=1`** prints the presented frame rate every 5 s.
 - **`SFA_AX_DEBUG=1`** logs AX frame and AI buffer counts. **`SFA_DUMP_AUDIO=1`** writes everything
   played to `build/GF7E01/audio.wav`.
 - **`SFA_GX_TEXADDR=<hex>`** shows which code binds that texture address and which display list sets it.
@@ -185,7 +189,27 @@ build/GF7E01/cmake/sfa --selftest        # run from the project root
 
 On Windows with Visual Studio's bundled clang, also pass
 `-DCMAKE_C_COMPILER=".../VC/Tools/Llvm/x64/bin/clang.exe" -DCMAKE_RC_COMPILER=".../llvm-rc.exe"`.
-On Linux and Steam Deck, any gcc or clang works.
+
+### Linux and Steam Deck
+
+Any gcc or clang works, with CMake, Ninja and the SDL2 development package. On Debian or Ubuntu:
+
+```sh
+sudo apt-get install build-essential cmake ninja-build pkg-config libsdl2-dev
+cmake -S recomp -B build/linux -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo
+cmake --build build/linux
+build/linux/sfa --selftest               # run from the project root
+```
+
+The generated sources from `ppcrecomp.py` are the same on every platform, so a Windows checkout can be
+built from WSL without regenerating. Tested in WSL Debian 13 (gcc 14, SDL2 2.32.4): the build has no
+warnings, the self-test passes 5/5, and a 90 s headless run (`--no-video --auto-press`) boots into
+Mission 1 with streamed music. The windowed renderer hasn't been tried on Linux yet.
+
+For the Steam Deck, the binary needs glibc 2.34 or newer (its newest symbol is `GLIBC_2.34`) and
+`libSDL2-2.0.so.0`, which SteamOS has. Copy `build/linux/sfa` to the Deck and run it from a folder that
+holds `orig/GF7E01/` (your extracted disc) and `user/` (saves, fonts). If it won't start there, build
+inside Valve's Steam Runtime SDK or on the Deck itself.
 
 The generated code is derived from the game's code, so it stays under `build/` and is never committed.
 Regenerate it from your own dump.

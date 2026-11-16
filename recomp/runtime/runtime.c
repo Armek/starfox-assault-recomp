@@ -195,9 +195,12 @@ uint64_t rt_timebase(void) {
     uint64_t ticks = (uint64_t)(t.QuadPart - start.QuadPart);
     return ticks / (uint64_t)freq.QuadPart * 40500000u + ticks % (uint64_t)freq.QuadPart * 40500000u / (uint64_t)freq.QuadPart;
 #else
+    static struct timespec start;
     struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint64_t)ts.tv_sec * 40500000u + (uint64_t)ts.tv_nsec * 405u / 10000u;
+    if (!start.tv_sec && !start.tv_nsec) clock_gettime(CLOCK_MONOTONIC, &start);
+    clock_gettime(CLOCK_MONOTONIC, &ts); /* counted from the first call, like the Windows branch */
+    int64_t ns = (int64_t)(ts.tv_sec - start.tv_sec) * 1000000000 + (ts.tv_nsec - start.tv_nsec);
+    return (uint64_t)(ns / 1000000000) * 40500000u + (uint64_t)(ns % 1000000000) * 405u / 10000u;
 #endif
 }
 

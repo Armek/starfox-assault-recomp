@@ -721,6 +721,22 @@ static void render(GxFrame *f) {
     }
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
     SDL_GL_SwapWindow(g_window);
+
+    /* SFA_FPS=1: presented frames per second, every 5 s of wall time */
+    static int show_fps = -1;
+    static uint32_t fps_start, fps_frames;
+    if (show_fps < 0) show_fps = getenv("SFA_FPS") != NULL;
+    if (show_fps) {
+        uint32_t now = SDL_GetTicks();
+        if (!fps_start) fps_start = now;
+        fps_frames++;
+        if (now - fps_start >= 5000) {
+            printf("[fps] %.1f presented frames/s (frame %u)\n", fps_frames * 1000.0 / (now - fps_start), f->number);
+            fflush(stdout);
+            fps_start = now;
+            fps_frames = 0;
+        }
+    }
 }
 
 static int render_thread(void *arg) {

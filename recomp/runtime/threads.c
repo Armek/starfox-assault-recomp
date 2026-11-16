@@ -217,10 +217,17 @@ static void *prof_thread(void *arg)
 #endif
 {
     (void)arg;
-    for (unsigned long tick = 1;; tick++) {
+    /* sample about every millisecond, report every 10 s of wall time (sleeps overshoot, so a fixed
+     * number of samples would stretch the interval) */
+    uint64_t next = rt_timebase() + 10ull * 40500000ull;
+    for (;;) {
         rt_sleep_us(1000);
         prof_sample();
-        if (tick % 10000 == 0) { prof_report(); gx_profile_report(); }
+        if (rt_timebase() >= next) {
+            next += 10ull * 40500000ull;
+            prof_report();
+            gx_profile_report();
+        }
     }
     return 0;
 }
