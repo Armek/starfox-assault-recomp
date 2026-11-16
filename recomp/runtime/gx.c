@@ -42,8 +42,7 @@ static float xff(uint32_t addr) { float f; memcpy(&f, &xf[addr], 4); return f; }
 /* ---- frame building ------------------------------------------------------------------------ */
 static GxFrame *frame(void) {
     if (!g_frame) {
-        g_frame = calloc(1, sizeof *g_frame);
-        g_frame->number = g_frame_number;
+        g_frame = video_new_frame(g_frame_number);
     }
     return g_frame;
 }
@@ -698,7 +697,7 @@ static void debug_draw_config(void) {
 }
 
 /* SFA_PROFILE: time spent in each stage of draw(), reported with the guest profile. */
-static uint64_t g_t_state, g_t_vtx, g_t_emit, g_t_calls, g_t_verts;
+static uint64_t g_t_state, g_t_vtx, g_t_emit, g_t_calls, g_t_verts, g_t_copy, g_t_ncopy;
 static int g_prof_on = -1;
 static uint64_t ticks(void) { /* stage timing only when profiling: the clock call is not free */
     if (g_prof_on < 0) g_prof_on = getenv("SFA_PROFILE") != NULL;
@@ -709,7 +708,12 @@ void gx_profile_report(void) {
     printf("[prof] gx: %llu draws, %llu vertices; state %.0f ms, vertices %.0f ms, batching %.0f ms (per 10 s)\n",
            (unsigned long long)g_t_calls, (unsigned long long)g_t_verts, g_t_state / 40500.0, g_t_vtx / 40500.0,
            g_t_emit / 40500.0);
-    g_t_state = g_t_vtx = g_t_emit = g_t_calls = g_t_verts = 0;
+    static uint32_t last_frames;
+    printf("[prof] gx: %u frames (%.1f fps); %llu EFB-to-texture copies, guest waited %.0f ms (per 10 s)\n",
+           g_frame_number - last_frames, (g_frame_number - last_frames) / 10.0, (unsigned long long)g_t_ncopy,
+           g_t_copy / 40500.0);
+    last_frames = g_frame_number;
+    g_t_state = g_t_vtx = g_t_emit = g_t_calls = g_t_verts = g_t_copy = g_t_ncopy = 0;
 }
 
 /* The setup unit turns texcoords into texel units with SU_SSIZE/SU_TSIZE (BP 0x30 + 2n / 0x31 + 2n, size - 1
@@ -872,7 +876,10 @@ static void efb_copy_to_texture(uint32_t v, int x, int y, int w, int h) {
     f->copy = &req;
     g_frame = NULL;
     g_state_valid = 0;
+    uint64_t tc0 = ticks();
     video_copy_segment(f);
+    g_t_copy += ticks() - tc0;
+    g_t_ncopy++;
     uint32_t fmt = ((v >> 4) & 7) + ((v >> 3) & 1) * 8, half = (v >> 9) & 1, intensity = (v >> 15) & 1;
     uint32_t dst = 0x80000000u | ((bp[0x4B] & 0xFFFFFF) << 5);
     uint32_t ow = (uint32_t)w, oh = (uint32_t)h;

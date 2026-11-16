@@ -70,6 +70,12 @@ frame has about 20,000 small draws (fleet, lasers, particles, HUD).
   - hash texture contents at most once per frame
   - decode XF transform/channel/texgen setup once per draw
   - batch by render-state serial number instead of comparing whole states.
+- **Frame buffer pool:** frames go back to a small pool with their vertex and batch arrays, so a new frame
+  reuses memory that is already allocated and paged in instead of growing ~17 MB of vertices from zero.
+  Batching fell from about 2.6 s to 0.45 s per 10 s, and the game builds about 50% more frames in the same
+  time (82 vs 53 GX frames per 10 s in Mission 1, as counted by the profiler).
+- **Where the time goes now** (Mission 1, per 10 s): vertex transform about 5 s, state rebuilds about 1 s,
+  waiting on EFB-to-texture copies about 1.5 s (3–4 copies a frame), batching about 0.45 s.
 - **Further headroom:** move vertex transform to a GPU vertex shader, and cut per-draw state rebuilds
   (the game rewrites BP registers between almost every draw).
 
@@ -137,9 +143,9 @@ The generator also emits **extra entry points** for calls into the middle of a f
 
 ## Next
 
-1. **Performance:** render-to-texture read-backs are synchronous (about 25 fps instead of 28–30); use PBOs
-   to read back asynchronously.
-2. **Performance:** GPU-side vertex transform, toward a steady 30 (or unlocked 60) fps.
+1. **Performance:** GPU-side vertex transform (now the largest cost, about half of the guest's time).
+2. **Performance:** keep EFB-to-texture copies on the GPU instead of reading them back synchronously
+   (about 15% of the guest's time).
 3. **Indirect textures** (the TEV indirect stages, BP `0x10`–`0x27`). Unused through the front end and Mission 1
    (0 of 27 million draws), so this waits until a later stage needs it.
 4. **Packaging:** a release build layout, and a Linux/Steam Deck build and test.
@@ -150,7 +156,8 @@ The generator also emits **extra entry points** for calls into the middle of a f
 - **`SFA_GX_DEBUG=1`** logs draw configurations, textures (with how many source bytes are non-zero),
   TMEM preloads, EFB-to-texture copies and ARAM DMA, and saves decoded textures as images.
 - **`SFA_GX_FRAMEDUMP=<n>`** lists every batch of frame *n*.
-- **`SFA_PROFILE=1`** prints the hottest guest functions and the GX stage times every 10 s.
+- **`SFA_PROFILE=1`** prints the hottest guest functions, the GX stage times, GX frames built and the
+  time spent waiting on EFB-to-texture copies, every 10 s.
 - **`SFA_AX_DEBUG=1`** logs AX frame and AI buffer counts. **`SFA_DUMP_AUDIO=1`** writes everything
   played to `build/GF7E01/audio.wav`.
 - **`SFA_GX_TEXADDR=<hex>`** shows which code binds that texture address and which display list sets it.

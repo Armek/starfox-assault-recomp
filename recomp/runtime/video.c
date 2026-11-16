@@ -240,13 +240,41 @@ static int g_dump;
 
 int video_quit_requested(void) { return g_quit; }
 
+/* Finished frames go back to a small pool with their arrays, so building the next frame reuses
+ * memory that is already allocated and paged in (a Mission 1 frame holds ~150k vertices, ~17 MB). */
+#define FRAME_POOL 4
+static GxFrame *g_frame_pool[FRAME_POOL];
+static int g_frame_pool_n;
+static SDL_SpinLock g_frame_pool_lock;
+
 static void free_frame(GxFrame *f) {
     for (uint32_t i = 0; i < f->nuploads; i++) free(f->uploads[i].rgba);
+    f->nuploads = 0;
+    SDL_AtomicLock(&g_frame_pool_lock);
+    if (g_frame_pool_n < FRAME_POOL) {
+        g_frame_pool[g_frame_pool_n++] = f;
+        f = NULL;
+    }
+    SDL_AtomicUnlock(&g_frame_pool_lock);
+    if (!f) return;
     free(f->uploads);
     free(f->verts);
     free(f->batches);
     free(f->clears);
     free(f);
+}
+
+GxFrame *video_new_frame(uint32_t number) {
+    GxFrame *f = NULL;
+    SDL_AtomicLock(&g_frame_pool_lock);
+    if (g_frame_pool_n) f = g_frame_pool[--g_frame_pool_n];
+    SDL_AtomicUnlock(&g_frame_pool_lock);
+    if (!f) f = calloc(1, sizeof *f);
+    f->nverts = f->nbatches = f->nuploads = f->nclears = 0;
+    memset(f->copy_rect, 0, sizeof f->copy_rect);
+    f->copy = NULL;
+    f->number = number;
+    return f;
 }
 
 void video_submit(GxFrame *frame) {

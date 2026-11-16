@@ -100,6 +100,7 @@ void video_get_pad(int port, PadState *out);
 void video_set_auto_press(int on);
 void video_start(int dump_frames);
 void video_submit(GxFrame *frame);  /* takes ownership */
+GxFrame *video_new_frame(uint32_t number); /* empty frame, reusing a finished one's arrays */
 int video_quit_requested(void);
 
 /* gx.c */
