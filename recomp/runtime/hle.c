@@ -90,48 +90,31 @@ HLE(__OSReadROM) {
     c->r[3] = 1; /* TRUE */
 }
 
-/* Stage start, fn_8005F470(state, stage, a, b): log every stage, and with --stage=N replace the
- * first start of stage 0 (Mission 1, part 1) with stage N. The stage table at 0x80223560 has 20-byte
- * records whose first byte is the mission number - 1; first stages of missions 1-10 are
- * 0, 5, 9, 11, 15, 19, 20, 24, 27 and 29. The callers keep the stage in state+0x5A too. */
+/* --stage=N starts stage N of the stage table instead of Mission 1. The table at 0x80223560 has 20-byte
+ * records (byte 0 = mission - 1, byte 5 = play type: 0 ground, 1 flight); the first stages of missions
+ * 1-10 are 0, 5, 9, 11, 15, 19, 20, 24, 27 and 29.
+ *
+ * fn_8001D5B4(stage) sets the current stage: it copies the record into the game info at 0x802A2B60
+ * (+0x13C stage, +0x140 mission, +0x13F play type, which picks the gameplay module m8 or m9). Replacing
+ * the first request for stage 0 there makes the game set up stage N the way its own menus would: the
+ * briefing, the gameplay module and the stage start all follow from it. */
 int g_start_stage = -1;
 
-void rt_hook_8005F470(Ctx *c) {
+void rt_hook_8001D5B4(Ctx *c) {
     static int replaced;
-    if (g_start_stage >= 0 && !replaced && c->r[4] == 0 && g_start_stage < 0x3B) {
+    if (g_start_stage >= 0 && !replaced && (c->r[3] & 0xFF) == 0 && g_start_stage < 0x3B) {
         replaced = 1;
-        printf("[stage] --stage=%d: the game still asked for stage 0; starting stage %d instead\n", g_start_stage,
-               g_start_stage);
-        c->r[4] = (uint32_t)g_start_stage;
-        if (ppc_is_ram(c->r[3] + 0x5A) && rd8(c->r[3] + 0x5A) == 0) wr8(c->r[3] + 0x5A, (uint8_t)g_start_stage);
+        c->r[3] = (uint32_t)g_start_stage;
+        printf("[stage] --stage=%d: current stage set to %d (play type %u)\n", g_start_stage, g_start_stage,
+               rd8(0x80223565u + (uint32_t)g_start_stage * 0x14));
+        fflush(stdout);
     }
+}
+
+/* Stage start, fn_8005F470(state, stage, a, b): log each stage the game starts. */
+void rt_hook_8005F470(Ctx *c) {
     uint32_t stage = c->r[4];
     printf("[stage] start stage %d (mission %d, part %02X)\n", (int)stage,
            stage < 0x3B ? rd8(0x80223560u + stage * 0x14) + 1 : -1, stage < 0x3B ? rd8(0x80223561u + stage * 0x14) : 0);
     fflush(stdout);
-}
-
-/* The briefing module m5 reads its mission from its REL argument block (0x8029E440 + 0xC) as
- * (mission - 1) * 2 and loads that mission's packs. The loader fn_8001AB7C fills that block right
- * after OSLink from the module's pending-load record (a table of pointers at 0x8029E2C0; the record
- * holds the module at +0x38 and the first argument at +0x84). With --stage=N, when m5 links, find its
- * record and set the argument to stage N's mission, so the mission is set up the way the menus would. */
-void rt_on_rel_linked(const char *name, uint32_t module) {
-    static int done;
-    if (g_start_stage < 0 || done || strcmp(name, "m5") != 0) return;
-    done = 1;
-    uint32_t mission0 = rd8(0x80223560u + (uint32_t)g_start_stage * 0x14);
-    if (mission0 >= 9) { /* the disc has briefings b0101-b0901 only */
-        printf("[stage] --stage=%d: mission %u has no briefing; keeping Mission 1's\n", g_start_stage, mission0 + 1);
-        return;
-    }
-    for (uint32_t k = 0; k < 96; k++) {
-        uint32_t rec = rd32(0x8029E2C0u + 4 * k);
-        if (!ppc_is_ram(rec) || rd32(rec + 0x38) != module) continue;
-        uint32_t old = rd32(rec + 0x84), v = mission0 * 2 + (old & 1);
-        wr32(rec + 0x84, v);
-        printf("[stage] --stage=%d: briefing argument %u -> %u (mission %u)\n", g_start_stage, old, v, mission0 + 1);
-        return;
-    }
-    printf("[stage] --stage=%d: m5's load record not found; the briefing stays on Mission 1\n", g_start_stage);
 }

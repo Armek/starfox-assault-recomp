@@ -53,7 +53,10 @@ CARDSetStatusAsync
 __OSReadROM
 
 # Entry hooks: the recompiled function runs, but calls rt_hook_XXXXXXXX(c) first.
-# fn_8005F470(state, stage, ...) starts a stage (an index into the stage table at 0x80223560).
+# fn_8005F470(state, stage, ...) starts a stage (an index into the stage table at 0x80223560): logged.
 entry fn_8005F470
 # OSExitThread marks the current thread as exiting, so its host thread ends once it switches away.
 entry OSExitThread
+# fn_8001D5B4(stage) sets the current stage: copies its stage-table record into the game info at
+# 0x802A2B60 (+0x13C stage, +0x13F play type, which picks the gameplay module). --stage swaps it here.
+entry fn_8001D5B4

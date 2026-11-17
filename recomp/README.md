@@ -33,18 +33,17 @@ host runtime into a native executable. This is the route toward a PC / Linux / S
 `--stage=N` starts stage N of the game's stage table instead of Mission 1, and
 `python recomp/tools/mission_test.py` runs each mission that way with `--auto-press` and frame dumps,
 then writes a log and a contact sheet per mission to `build/GF7E01/missions/`.
-- **How it works:** the stage table at `0x80223560` has 20-byte records (byte 0 = mission − 1); the first
-  stages of missions 1–10 are 0, 5, 9, 11, 15, 19, 20, 24, 27 and 29. When the briefing module `m5` links,
-  the runtime sets its mission argument (the module's load record at `+0x84`, copied into the REL
-  argument block at `0x8029E440 + 0xC` as `(mission − 1) × 2`), so the briefing loads that mission's
-  packs. When the game then starts stage 0 (`fn_8005F470`), it gets stage N instead. Mission 10 has no
-  briefing pack on the disc, so it keeps Mission 1's.
-- **Flight missions work:** Missions 1, 5 (asteroid field) and 10 (Aparoid tunnel) each ran 4 minutes
-  without a crash, with correct rendering, HUD and wingman comms. (Stage byte 5 is 1 only for these.)
-- **Ground missions don't start this way yet:** Missions 2, 3, 4, 6, 7, 8 and 9 crash right after their
-  stage starts (a null `sh_bpdata` pointer). The game picks the gameplay module before the stage starts,
-  so it still links Mission 1's flight module `m9`, which expects data only a flight stage loads.
-  Starting them needs the menu's mission choice set earlier, or a save with those missions unlocked.
+- **How it works:** the stage table at `0x80223560` has 20-byte records (byte 0 = mission − 1, byte 5 =
+  play type); the first stages of missions 1–10 are 0, 5, 9, 11, 15, 19, 20, 24, 27 and 29. The game's
+  set-current-stage function `fn_8001D5B4` copies a record into the game info at `0x802A2B60` (`+0x13C`
+  stage, `+0x140` mission, `+0x13F` play type, which picks the gameplay module: `m8` or `m9`). An entry
+  hook there turns the first request for stage 0 into stage N, and the game does the rest itself: the
+  mission's own briefing, its gameplay module and the stage start.
+- **All ten missions run:** each ran 3 minutes from the first stage without a crash, with correct
+  rendering, HUD, radar, pause map, briefings and wingman comms: the flight missions (1 Fortuna, 5, 8
+  Orbital Gate, 10 Aparoid tunnel) and the on-foot/ground ones (2 Katina, 3, 4, 6, 7 Corneria, 9).
+  (Swapping the stage later, when the stage starts, isn't enough: the gameplay module is already chosen,
+  so ground missions ran Mission 1's flight module and crashed.)
 - **Threads:** the game starts a streaming worker thread over and over (more than 120 in 4 minutes).
   Exited threads used to keep their host thread and table slot until the 64-slot table ran out ("too
   many guest threads"); now `OSExitThread` marks the thread and it ends once it switches away.
@@ -168,7 +167,7 @@ Q/E = L/R, Z = Z, numpad 8/4/6/2 = C-stick.
 | **DSP** | A fake mailbox completes the SDK task loader's handshake (`0x8071FEED`, then "task init" `0xDCD10000` via the DSP interrupt). No microcode runs, so there's no audio yet. | `runtime.c` |
 | **Disc drive (DI)** | The disc is rebuilt virtually from `orig/GF7E01` (`boot.bin`, `bi2.bin`, apploader, DOL, FST and all 960+ files at their FST offsets). Read, disc-ID read, inquiry and status commands complete immediately with the DI interrupt, and the SDK's DVD driver runs unchanged. | `dvd.c` |
 | **HLE overrides** | Console output, DSP boot, MMU setup, context switching, `GXDrawDone` (no GPU), `PADRead` (host input), `__OSReadROM` (system font), `OSNotifyLink`/`OSNotifyUnlink` and the `CARD` API. | `hle.c` |
-| **Entry hooks** | An `entry NAME` line in `hle_overrides.txt` keeps the recompiled function but makes it call `rt_hook_XXXXXXXX(c)` first, so the runtime can watch or adjust its arguments. Used for `OSExitThread` (ending host threads) and the stage start (`--stage`). | `hle.c`, `threads.c` |
+| **Entry hooks** | An `entry NAME` line in `hle_overrides.txt` keeps the recompiled function but makes it call `rt_hook_XXXXXXXX(c)` first, so the runtime can watch or adjust its arguments. Used for `OSExitThread` (ending host threads), set-current-stage (`--stage`) and logging stage starts. | `hle.c`, `threads.c` |
 
 The generator also emits **extra entry points** for calls into the middle of a function (8, all in
 `__save_fpr`/`__restore_fpr`), and the timebase uses a high-resolution clock (`__AI_SRC_INIT` measures 1/48000 s).
@@ -183,13 +182,13 @@ The generator also emits **extra entry points** for calls into the middle of a f
    (0 of 27 million draws), so this waits until a later stage needs it.
 4. **Packaging:** a release build layout. Linux builds and runs headless (see *Linux and Steam Deck*);
    still to do: the windowed renderer on Linux and a test on the Steam Deck itself.
-5. **Ground missions:** reach Missions 2–4 and 6–9 (see *Other missions*): set the mission where the
-   menu chooses it, or load a save with them unlocked, then test them like the flight missions.
+5. **Longer play:** the missions have only been run for 3 minutes from their first stage with
+   `--auto-press` (it mostly pauses); later parts, bosses, VS mode and the bonus games are untested.
 
 ### Debugging aids
 
 - **`--dump-frames`, `--no-video`, `--auto-press`.**
-- **`--stage=N`** starts stage N instead of Mission 1 (flight missions only, for now), and
+- **`--stage=N`** starts stage N instead of Mission 1 (any of the ten missions), and
   **`recomp/tools/mission_test.py`** runs a list of missions and saves logs and contact sheets.
 - **`SFA_GX_DEBUG=1`** logs draw configurations, textures (with how many source bytes are non-zero),
   TMEM preloads, EFB-to-texture copies and ARAM DMA, and saves decoded textures as images.

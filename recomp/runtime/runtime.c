@@ -126,7 +126,6 @@ static void rel_notify(Ctx *c, int linked) {
             for (uint32_t k = 0; k < nsec && k < 32; k++) g_rel[i].sec[k] = rd32(si + k * 8) & ~3u;
             g_rel[i].loaded = 1;
             printf("[rel] linked %s: text 0x%08X, %u sections\n", ri->name, g_rel[i].sec[ri->text_sec], nsec);
-            rt_on_rel_linked(ri->name, m);
         } else {
             g_rel[i].loaded = 0;
             printf("[rel] unlinked %s\n", ri->name);
