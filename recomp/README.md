@@ -238,6 +238,11 @@ The generator also emits **extra entry points** for calls into the middle of a f
   EFB-to-texture copies (with the time spent waiting on them under `SFA_EFB_READBACK`), every 10 s of wall
   time.
 - **`SFA_EFB_READBACK=1`** reads EFB-to-texture copies back into guest RAM (slow; the old path).
+- **Crash reports:** a fatal error (`rt_fatal`) or a host crash (a signal on Linux, an unhandled
+  exception on Windows) appends a report to `user/crash.log`: the message, build date, guest registers,
+  current stage and the last 64 guest functions entered. Outside test runs it also shows an error box.
+  When stdout isn't a terminal and it isn't a test run, all output goes to `user/sfa.log` (the last
+  run), so runs started from Steam or a file manager leave a log too.
 - **`SFA_FPS=1`** prints, every 5 s, the presented frame rate, the longest gap between frames and how
   many exceeded 50 ms, shader compiles, texture uploads, and audio underruns and dropped samples.
 - **`SFA_AX_DEBUG=1`** logs AX frame and AI buffer counts. **`SFA_DUMP_AUDIO=1`** writes everything

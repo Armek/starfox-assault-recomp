@@ -53,6 +53,10 @@ Options
 -------
 {help}
 Saves (memory card files) are kept in user/GF7E01/card_a/.
+
+If the game stops with an error or crashes, a report is added to user/crash.log. When it isn't
+started from a terminal (from Steam, a file manager, or the Deck's game mode), everything it prints
+also goes to user/sfa.log for the last run. Send both files with a bug report.
 """
 
 LAUNCHER = """#!/bin/sh

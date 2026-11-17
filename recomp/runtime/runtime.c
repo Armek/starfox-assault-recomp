@@ -7,12 +7,19 @@
 #include <stdlib.h>
 #include <stdarg.h>
 #include <time.h>
+#include <string.h>
 #ifdef _WIN32
 #include <windows.h>
+#include <io.h>
+#include <direct.h>
 #else
 #include <unistd.h>
 #include <dirent.h>
+#include <signal.h>
+#include <sys/stat.h>
 #endif
+#define SDL_MAIN_HANDLED /* keep our own main() */
+#include <SDL.h>
 #include "funcs.h"
 #include "runtime.h"
 #include "gx.h"
@@ -33,30 +40,116 @@ int g_trace_sdk;
 static FILE *g_sdk_log;
 static unsigned long g_sdk_calls, g_sdk_log_limit = 5000;
 
-void rt_dump_trace(void) {
-    fprintf(stderr, "[recomp] last functions entered (oldest first):\n");
-    uint32_t n = g_trace_pos < RT_TRACE_RING ? g_trace_pos : RT_TRACE_RING;
-    for (uint32_t i = g_trace_pos - n; i != g_trace_pos; i++) {
+static void dump_trace_to(FILE *f, unsigned count) {
+    fprintf(f, "[recomp] last functions entered (oldest first):\n");
+    uint32_t pos = g_trace_pos, n = pos < RT_TRACE_RING ? pos : RT_TRACE_RING;
+    for (uint32_t i = pos - n; i != pos; i++) {
         uint32_t a = g_trace_ring[i & (RT_TRACE_RING - 1)];
-        if (i + 24 >= g_trace_pos) fprintf(stderr, "    %08X %s\n", a, rt_func_name(a));
+        if (i + count >= pos) fprintf(f, "    %08X %s\n", a, rt_func_name(a));
     }
 }
 
-void rt_fatal(const char *fmt, ...) {
-    va_list ap;
-    fflush(stdout);
-    va_start(ap, fmt);
-    fprintf(stderr, "[recomp] fatal: ");
-    vfprintf(stderr, fmt, ap);
-    fputc('\n', stderr);
-    va_end(ap);
+void rt_dump_trace(void) { dump_trace_to(stderr, 24); }
+
+/* ---- crash reports -------------------------------------------------------------------------------
+ * A fatal error or a host crash (segfault and the like) appends a report to user/crash.log: what
+ * happened, the guest registers and the last guest functions entered. Players can send that file.
+ * When the program wasn't started from a terminal (Steam, a file manager, the Deck's game mode),
+ * everything it prints goes to user/sfa.log too, for the last run. */
+static void write_report(FILE *f, const char *what) {
+    time_t now = time(NULL);
+    char when[64];
+    strftime(when, sizeof when, "%Y-%m-%d %H:%M:%S", localtime(&now));
+    fprintf(f, "==== %s, build %s %s ====\n", when, __DATE__, __TIME__);
+    fprintf(f, "[recomp] fatal: %s\n", what);
     Ctx *c = rt_current_ctx();
     if (!c) c = &g_ctx;
-    fprintf(stderr, "[recomp] registers: r1=%08X lr=%08X ctr=%08X r3=%08X r4=%08X r5=%08X msr=%08X\n",
+    fprintf(f, "[recomp] guest registers: r1=%08X lr=%08X ctr=%08X r3=%08X r4=%08X r5=%08X msr=%08X\n",
             c->r[1], c->lr, c->ctr, c->r[3], c->r[4], c->r[5], c->msr);
-    rt_dump_trace();
+    if (g_mem) {
+        uint32_t stage = rd8(0x802A2B60u + 0x13C);
+        fprintf(f, "[recomp] current stage %u (mission %d)\n", stage, stage < 0x3B ? rd8(0x80223560u + stage * 0x14) + 1 : -1);
+    }
+    dump_trace_to(f, 64);
+    fflush(f);
+}
+
+static int g_no_dialogs; /* testing: never stop on an error box */
+
+static void crash_report(const char *what) {
+    static int reporting;
+    if (reporting++) return; /* a crash while reporting */
+    fflush(stdout);
+    write_report(stderr, what);
+    FILE *f = fopen("user/crash.log", "a");
+    if (f) {
+        write_report(f, what);
+        fclose(f);
+    }
     if (g_sdk_log) fflush(g_sdk_log);
+    char box[1200];
+    snprintf(box, sizeof box, "%s\n\nDetails were saved to user/crash.log next to the program.", what);
+    if (!g_no_dialogs) SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "Star Fox: Assault (recompiled) stopped", box, NULL);
+}
+
+void rt_fatal(const char *fmt, ...) {
+    char msg[1024];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(msg, sizeof msg, fmt, ap);
+    va_end(ap);
+    crash_report(msg);
     exit(1);
+}
+
+#ifdef _WIN32
+static LONG WINAPI on_crash(EXCEPTION_POINTERS *ep) {
+    char msg[256];
+    snprintf(msg, sizeof msg, "the program crashed (exception 0x%08lX at %p, address %p)",
+             (unsigned long)ep->ExceptionRecord->ExceptionCode, ep->ExceptionRecord->ExceptionAddress,
+             ep->ExceptionRecord->NumberParameters >= 2 ? (void *)ep->ExceptionRecord->ExceptionInformation[1] : NULL);
+    crash_report(msg);
+    return EXCEPTION_EXECUTE_HANDLER;
+}
+#else
+static void on_crash(int sig, siginfo_t *si, void *uc) {
+    (void)uc;
+    char msg[256];
+    snprintf(msg, sizeof msg, "the program crashed (%s at address %p)", strsignal(sig), si ? si->si_addr : NULL);
+    crash_report(msg);
+    signal(sig, SIG_DFL);
+    raise(sig);
+}
+#endif
+
+/* After the working folder is settled (next to the program or the game). Test runs (g_no_dialogs)
+ * keep their output where the caller sends it. */
+static void crash_handling_init(void) {
+#ifdef _WIN32
+    _mkdir("user");
+    int tty = _isatty(_fileno(stdout));
+    SetUnhandledExceptionFilter(on_crash);
+#else
+    mkdir("user", 0755);
+    int tty = isatty(fileno(stdout));
+    static uint8_t alt[64 * 1024];
+    stack_t ss = {.ss_sp = alt, .ss_size = sizeof alt};
+    sigaltstack(&ss, NULL);
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_sigaction = on_crash;
+    sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
+    const int sigs[] = {SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGABRT};
+    for (size_t i = 0; i < sizeof sigs / sizeof sigs[0]; i++) sigaction(sigs[i], &sa, NULL);
+#endif
+    if (!tty && !g_no_dialogs && freopen("user/sfa.log", "w", stdout)) {
+        setvbuf(stdout, NULL, _IOLBF, 4096);
+#ifdef _WIN32
+        _dup2(_fileno(stdout), _fileno(stderr));
+#else
+        dup2(fileno(stdout), fileno(stderr));
+#endif
+    }
 }
 
 void rt_console_putc(char ch) { fputc(ch, stdout); if (ch == '\n') fflush(stdout); }
@@ -768,6 +861,7 @@ int main(int argc, char **argv) {
         else if (argv[i][0] == '-') { fprintf(stderr, "unknown option %s\n", argv[i]); usage(); return 2; }
         else { root = argv[i]; root_given = 1; }
     }
+    g_no_dialogs = testing || no_video || run_selftest;
     if (!root_given) {
         /* the start screen, unless testing or told to skip it */
         int launcher = !skip_launcher && !testing && !no_video && !run_selftest && !getenv("SFA_NO_LAUNCHER");
@@ -784,6 +878,7 @@ int main(int argc, char **argv) {
             }
         }
     }
+    if (!run_selftest) crash_handling_init();
     g_mem = calloc(1, PPC_MEM_SIZE);
     g_lc = calloc(1, PPC_LC_SIZE);
     if (!g_mem || !g_lc) rt_fatal("out of memory");
