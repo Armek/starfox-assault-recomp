@@ -5,8 +5,8 @@
  * Coverage so far: all register loads, indexed XF loads, display lists, every primitive type,
  * every vertex attribute format, position/texture matrices, perspective/orthographic projection,
  * the viewport, all texture formats (I4, I8, IA4, IA8, RGB565, RGB5A3, RGBA8, CI4, CI8, CI14X2,
- * CMPR), TLUT loads, blending, depth, scissor, alpha test and EFB copies to the XFB.
- * Not yet: lighting, multi-stage TEV (stage 0 is approximated), EFB copies to textures.
+ * CMPR), TLUT loads, blending, depth, scissor, alpha test, lighting, multi-stage TEV, and EFB copies
+ * to the XFB and to textures (on the GPU). Not yet: indirect texturing.
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -173,6 +173,34 @@ static uint8_t *decode_texture(uint32_t addr, uint32_t fmt, uint32_t w, uint32_t
 static uint64_t ticks(void);
 static uint64_t g_t_decode, g_t_ndecode, g_t_decode_px; /* texture decode time (profiling) */
 
+/* EFB copies to texture kept on the GPU (see efb_copy_to_texture): the texture at `addr` is the
+ * renderer's texture `id`. Guest memory there is not written, so it keeps its old bytes: their hash
+ * at copy time tells whether the CPU has since put something else there (then memory wins). */
+typedef struct {
+    uint32_t addr, id, size, ram_hash, checked_frame;
+} GpuCopy;
+#define GPU_COPIES 32
+static GpuCopy g_gpu_copies[GPU_COPIES];
+static int g_ngpu_copies; /* live entries */
+
+static uint32_t gpu_copy_for(uint32_t addr) {
+    for (int i = 0; i < GPU_COPIES; i++) {
+        GpuCopy *c = &g_gpu_copies[i];
+        if (!c->id || c->addr != addr) continue;
+        if (c->checked_frame != g_frame_number) {
+            uint32_t hash = fnv(ppc_ram(addr), c->size, 2166136261u);
+            if (hash != c->ram_hash) { /* the CPU wrote new data there */
+                c->id = 0;
+                g_ngpu_copies--;
+                return 0;
+            }
+            c->checked_frame = g_frame_number;
+        }
+        return c->id;
+    }
+    return 0;
+}
+
 /* Texture map n -> GxTexture id (decoding and queueing an upload if new or changed). */
 static uint32_t texture_for_map(int n) {
     uint32_t base_image0 = n < 4 ? 0x88 + n : 0xA8 + (n - 4);
@@ -197,6 +225,10 @@ static uint32_t texture_for_map(int n) {
                    (img1 & 0x7FFF) << 5, fmt, w, h, addr);
     }
     if (!ppc_is_ram(addr)) return 0;
+    if (g_ngpu_copies) {
+        uint32_t id = gpu_copy_for(addr);
+        if (id) return id;
+    }
     uint32_t tlut = bp[base_tlut], tlut_fmt = (tlut >> 10) & 3;
     const uint8_t *pal = tmem_tlut + (((tlut & 0x3FF) << 9) & (sizeof tmem_tlut - 1));
     uint32_t tlut_hash = 0;
@@ -929,9 +961,52 @@ static void encode_copy(const uint8_t *px, uint32_t w, uint32_t h, uint32_t fmt,
         }
 }
 
-/* EFB copy to texture: render everything drawn so far (a frame segment), read the rectangle back
- * and write it to guest memory in the requested format. */
+/* EFB copy to texture, on the GPU: a marker in the frame where the renderer converts the rectangle
+ * into a texture of its own, and an entry that makes texture lookups at the destination use it. No
+ * waiting: reading the pixels back stalled the CPU and GPU once or twice a frame (Mission 1's comm
+ * portrait and an effect are copies, made every frame). */
+static void efb_copy_gpu(uint32_t v, int x, int y, int w, int h) {
+    static const uint32_t as_tex[13] = {0, 1, 2, 3, 4, 5, 6, 1, 1, 1, 1, 3, 3}; /* texture layout per copy format */
+    uint32_t fmt = ((v >> 4) & 7) + ((v >> 3) & 1) * 8, half = (v >> 9) & 1, intensity = (v >> 15) & 1;
+    uint32_t dst = 0x80000000u | ((bp[0x4B] & 0xFFFFFF) << 5);
+    uint32_t ow = half ? (uint32_t)w / 2 : (uint32_t)w, oh = half ? (uint32_t)h / 2 : (uint32_t)h;
+    uint32_t size = tex_size(fmt < 13 ? as_tex[fmt] : 6, ow, oh);
+    if (!ppc_is_ram(dst) || !ow || !oh || (dst & 0x01FFFFFF) + size > PPC_MEM_SIZE) return;
+    GpuCopy *c = NULL;
+    for (int i = 0; i < GPU_COPIES && !c; i++)
+        if (g_gpu_copies[i].id && g_gpu_copies[i].addr == dst) c = &g_gpu_copies[i];
+    if (!c) {
+        static int next_evict;
+        for (int i = 0; i < GPU_COPIES && !c; i++)
+            if (!g_gpu_copies[i].id) c = &g_gpu_copies[i];
+        if (!c) { c = &g_gpu_copies[next_evict]; next_evict = (next_evict + 1) % GPU_COPIES; g_ngpu_copies--; }
+        c->addr = dst;
+        c->id = g_next_tex_id++;
+        g_ngpu_copies++;
+    }
+    c->size = size;
+    c->ram_hash = fnv(ppc_ram(dst), size, 2166136261u);
+    c->checked_frame = g_frame_number;
+    GxFrame *f = frame();
+    GROW(f->efb_copies, f->nefb_copies, f->cap_efb_copies, 8);
+    GxEfbCopy *e = &f->efb_copies[f->nefb_copies++];
+    e->at_batch = f->nbatches;
+    e->seq = f->nevents++;
+    e->id = c->id;
+    e->x = (uint16_t)x; e->y = (uint16_t)y; e->w = (uint16_t)w; e->h = (uint16_t)h;
+    e->out_w = (uint16_t)ow; e->out_h = (uint16_t)oh;
+    e->fmt = (uint8_t)fmt; e->half = (uint8_t)half; e->intensity = (uint8_t)intensity;
+    g_t_ncopy++;
+    g_state_valid = 0; /* texture lookups at dst now give the copy */
+}
+
+/* EFB copy to texture with SFA_EFB_READBACK: render everything drawn so far (a frame segment), read
+ * the rectangle back and write it to guest memory in the requested format. Slow (the CPU waits for the
+ * GPU), but the guest can read the result. */
 static void efb_copy_to_texture(uint32_t v, int x, int y, int w, int h) {
+    static int readback = -1;
+    if (readback < 0) readback = getenv("SFA_EFB_READBACK") != NULL;
+    if (!readback) { efb_copy_gpu(v, x, y, w, h); return; }
     GxFrame *f = frame();
     GxCopyRequest req = {(uint32_t)x, (uint32_t)y, (uint32_t)w, (uint32_t)h, malloc((size_t)w * h * 4), 0};
     f->copy = &req;
@@ -1017,6 +1092,7 @@ static void efb_copy(uint32_t v) {
         GxClear *cl = &f->clears[f->nclears++];
         uint32_t ar = bp[0x4F], gb = bp[0x50];
         cl->at_batch = f->nbatches;
+        cl->seq = f->nevents++;
         cl->color[0] = (ar & 255) / 255.f; cl->color[1] = ((gb >> 8) & 255) / 255.f;
         cl->color[2] = (gb & 255) / 255.f; cl->color[3] = ((ar >> 8) & 255) / 255.f;
         cl->depth = (bp[0x51] & 0xFFFFFF) / 16777215.f;

@@ -124,10 +124,18 @@ frame has about 20,000 small draws (fleet, lasers, particles, HUD).
   history were per 10,000 profiler samples, about 19 s of wall time, not per 10 s.)
 - **GX thread:** like the real GPU, GX commands run on their own thread. The game's thread only appends
   pipe bytes to an 8 MB ring (and records display lists itself, which must happen in program order); the
-  GX thread parses and executes them: vertex transform, batching, EFB copies (it waits for the renderer,
-  not the game) and frame submission. The game sees GX progress only through the PE token register,
+  GX thread parses and executes them: vertex transform, batching, EFB copies and frame submission. The game sees GX progress only through the PE token register,
   which it polls, and `GXDrawDone`, which now waits until everything queued has run. `SFA_GX_SYNC=1`
   runs the commands on the game's thread as before.
+- **EFB copies on the GPU:** an EFB-to-texture copy used to stop the pipeline: the GX thread waited while
+  the renderer drew everything so far and read the rectangle back, then encoded it into RAM, where it was
+  decoded and uploaded again. Mission 1 makes two every frame (the comm portrait and the Arwing's shadow),
+  so in busy scenes the game spent up to 43% of its time waiting and dropped to 45-52 fps on an i5-1135G7
+  laptop (Iris Xe). Now a copy is a marker in the frame: the renderer converts the rectangle into a texture
+  of its own with a small shader (same format conversion and rounding as before), and texture lookups at
+  the destination use it. Guest RAM there isn't written; if the CPU later stores something else at that
+  address (its hash changes), memory wins again. The same stretch now holds 58-60 fps. `SFA_EFB_READBACK=1`
+  brings back the read-back path, for a game that reads copies with the CPU.
 - **Remaining hitches:** shader compiles, the first time a new TEV setup appears (28 at once when Mission
   1's effects first show cause a ~70 ms frame), and loading screens. Texture decoding is minor (about
   2 ms a second).
@@ -170,7 +178,7 @@ untranslated instructions.
 | **Texcoord scale** | The setup unit's per-texcoord sizes (SU_SSIZE/SU_TSIZE, BP `0x30`–`0x3F`) are applied: a texcoord is rescaled by its SU size over the bound texture's size. This matters for `GXSetTexCoordScaleManually`, which the system-font text uses to send texel coordinates (the font sheet is drawn as CI4 with an RGB5A3 alpha-ramp palette). | `gx.c` |
 | **TEV** | Full: up to 16 stages with every color/alpha combiner input, bias/scale/clamp/subtract and compare modes, the TEV color registers and konst colors (BP `0xE0`–`0xE7`, split by bit 23), konst selectors, swap tables, both raster color channels and 8 texture maps. The alpha compare uses both references and its logic op. Each distinct configuration becomes a generated GLSL fragment shader, compiled once and cached. | `gx.c`, `video.c` |
 | **Render state** | Blend factors/subtract, color/alpha write masks, depth test/function/write, scissor. | `gx.c`, `video.c` |
-| **Render-to-texture** | An EFB copy to texture ends the current *segment*. The render thread draws it (never dropped), reads the rectangle back and signals the guest. The guest box-filters it if half-scale is set, encodes it into the requested copy format (R4/I4, R8/I8, RA4/IA4, RA8/IA8, RGB565, RGB5A3, RGBA8, A8, R8, G8, B8, RG8, GB8; YUV intensity when set), tiled like textures, and writes it to the destination in RAM. Mission 1 uses this for the 3D comm portraits (69×65 RGBA8) and the Arwing shadow silhouette (160×160 RG8). | `gx.c`, `video.c` |
+| **Render-to-texture** | An EFB copy to texture is recorded as a marker in the frame (ordered with the clears) and an entry mapping the destination address to a renderer texture. At the marker, the render thread runs a small shader pass that box-filters the rectangle if half-scale is set and converts it into what the requested copy format (R4/I4, R8/I8, RA4/IA4, RA8/IA8, RGB565, RGB5A3, RGBA8, A8, R8, G8, B8, RG8, GB8; YUV intensity when set) decodes to, so nothing waits. Texture lookups at the destination use that texture while guest RAM there is unchanged. With `SFA_EFB_READBACK=1` the copy instead ends a frame *segment* that the renderer draws and reads back, and the guest encodes it into RAM, tiled like textures. Mission 1 uses copies for the 3D comm portraits (69×65 RGBA8) and the Arwing shadow silhouette (160×160 RG8). | `gx.c`, `video.c` |
 | **Lighting** | GX per-vertex lighting for both color channels (color and alpha separately). Normals are decoded (s8/s16/float, including the NBT index form) and transformed by the normal matrix (XF `0x400`). Ambient plus up to 8 lights from XF `0x600`: color, position, direction, spot (angle/distance) or specular attenuation, and the none/sign/clamp diffuse functions, multiplied by the material color from a register or the vertex. | `gx.c` |
 | **Frames** | Each frame's batches are built on the guest threads and handed to a **render thread** that owns the SDL window and an OpenGL 3.3 core context. It draws into a 640×528 EFB framebuffer and scales the XFB-copy rectangle into the window. EFB clears requested by copies are applied in order. | `video.c` |
 | **Input** | Port 1 merges the keyboard and the first SDL game controller (Steam Deck included) into `PADRead`. `--auto-press` taps START and A every 4 seconds for unattended testing. | `video.c`, `hle.c` |
@@ -201,8 +209,8 @@ The generator also emits **extra entry points** for calls into the middle of a f
 
 1. **Performance:** a disk cache for compiled shaders (removes the first-time hitches), and GPU-side
    vertex transform if the Steam Deck needs more headroom.
-2. **Performance:** keep EFB-to-texture copies on the GPU instead of reading them back synchronously
-   (about 15% of the guest's time).
+2. **Performance:** the GX thread is now the limit in Mission 1's busiest scenes (about 11,800 small draws
+   and 50,000 vertices a frame); a smaller vertex layout or GPU-side transform would lower it.
 3. **Indirect textures** (the TEV indirect stages, BP `0x10`–`0x27`). Unused through the front end and Mission 1
    (0 of 27 million draws), so this waits until a later stage needs it.
 4. **Steam Deck:** release packages exist (see *Release packages*); still to do: the windowed renderer
@@ -227,7 +235,9 @@ The generator also emits **extra entry points** for calls into the middle of a f
   TMEM preloads, EFB-to-texture copies and ARAM DMA, and saves decoded textures as images.
 - **`SFA_GX_FRAMEDUMP=<n>`** lists every batch of frame *n*.
 - **`SFA_PROFILE=1`** prints the hottest guest functions, the GX stage times, GX frames built and the
-  time spent waiting on EFB-to-texture copies, every 10 s of wall time.
+  EFB-to-texture copies (with the time spent waiting on them under `SFA_EFB_READBACK`), every 10 s of wall
+  time.
+- **`SFA_EFB_READBACK=1`** reads EFB-to-texture copies back into guest RAM (slow; the old path).
 - **`SFA_FPS=1`** prints, every 5 s, the presented frame rate, the longest gap between frames and how
   many exceeded 50 ms, shader compiles, texture uploads, and audio underruns and dropped samples.
 - **`SFA_AX_DEBUG=1`** logs AX frame and AI buffer counts. **`SFA_DUMP_AUDIO=1`** writes everything

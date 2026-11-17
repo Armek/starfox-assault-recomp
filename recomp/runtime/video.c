@@ -374,6 +374,7 @@ static void free_frame(GxFrame *f) {
     free(f->verts);
     free(f->batches);
     free(f->clears);
+    free(f->efb_copies);
     free(f);
 }
 
@@ -383,7 +384,7 @@ GxFrame *video_new_frame(uint32_t number) {
     if (g_frame_pool_n) f = g_frame_pool[--g_frame_pool_n];
     SDL_AtomicUnlock(&g_frame_pool_lock);
     if (!f) f = calloc(1, sizeof *f);
-    f->nverts = f->nbatches = f->nuploads = f->nclears = 0;
+    f->nverts = f->nbatches = f->nuploads = f->nclears = f->nefb_copies = f->nevents = 0;
     memset(f->copy_rect, 0, sizeof f->copy_rect);
     f->copy = NULL;
     f->number = number;
@@ -443,6 +444,52 @@ void video_set_window(int fullscreen, int w, int h) {
 }
 static GLuint g_vao, g_vbo, g_efb_fbo, g_efb_color, g_efb_depth, g_white;
 static GLuint *g_textures; /* GxTexture id -> GL name */
+static uint32_t *g_texture_dims; /* GxTexture id -> width << 16 | height */
+static GLuint g_copy_prog, g_copy_fbo;
+static GLint g_copy_u_src, g_copy_u_mode, g_copy_u_half, g_copy_u_intensity;
+
+/* EFB copy to texture: one fullscreen triangle over the destination texture. Each output texel is
+ * what the GX texture the copy format stores would decode to (see encode_copy/decode_texture in
+ * gx.c): intensity formats replicate I into RGBA, IA formats give (I, I, I, A), and so on, with the
+ * same 4/5/6-bit rounding. Texture row 0 is the top of the copied rectangle; EFB row 0 (GL) is the
+ * bottom. */
+static const char *k_copy_vs =
+    "#version 330 core\n"
+    "void main() {\n"
+    "    vec2 p = vec2((gl_VertexID & 1) * 4.0 - 1.0, (gl_VertexID & 2) * 2.0 - 1.0);\n"
+    "    gl_Position = vec4(p, 0.0, 1.0);\n"
+    "}\n";
+static const char *k_copy_fs =
+    "#version 330 core\n"
+    "uniform sampler2D u_efb;\n"
+    "uniform vec2 u_src;\n"
+    "uniform int u_mode, u_half, u_intensity;\n"
+    "out vec4 o;\n"
+    "vec4 px(int x, int y) { return texelFetch(u_efb, ivec2(x, 527 - y), 0); }\n"
+    "float q(float v, float bits) { float n = exp2(bits) - 1.0; return floor(floor(v * 255.0 + 0.5) / exp2(8.0 - bits)) / n; }\n"
+    "void main() {\n"
+    "    ivec2 p = ivec2(gl_FragCoord.xy);\n"
+    "    int sx = int(u_src.x), sy = int(u_src.y);\n"
+    "    vec4 c;\n"
+    "    if (u_half != 0) {\n"
+    "        int x = sx + p.x * 2, y = sy + p.y * 2;\n"
+    "        c = (px(x, y) + px(x + 1, y) + px(x, y + 1) + px(x + 1, y + 1)) * 0.25;\n"
+    "    } else c = px(sx + p.x, sy + p.y);\n"
+    "    float I = u_intensity != 0 ? clamp(dot(c.rgb, vec3(66.0, 129.0, 25.0) / 256.0) + 16.0 / 255.0, 0.0, 1.0) : c.r;\n"
+    "    if (u_mode == 0) o = vec4(q(I, 4.0));\n"
+    "    else if (u_mode == 1 || u_mode == 8) o = vec4(I);\n"
+    "    else if (u_mode == 2) o = vec4(vec3(q(I, 4.0)), q(c.a, 4.0));\n"
+    "    else if (u_mode == 3) o = vec4(vec3(I), c.a);\n"
+    "    else if (u_mode == 4) o = vec4(q(c.r, 5.0), q(c.g, 6.0), q(c.b, 5.0), 1.0);\n"
+    "    else if (u_mode == 5) o = c.a >= 224.0 / 255.0 ? vec4(q(c.r, 5.0), q(c.g, 5.0), q(c.b, 5.0), 1.0)\n"
+    "                                                   : vec4(q(c.r, 4.0), q(c.g, 4.0), q(c.b, 4.0), q(c.a, 3.0));\n"
+    "    else if (u_mode == 7) o = vec4(c.a);\n"
+    "    else if (u_mode == 9) o = vec4(c.g);\n"
+    "    else if (u_mode == 10) o = vec4(c.b);\n"
+    "    else if (u_mode == 11) o = vec4(vec3(c.r), c.g);\n"
+    "    else if (u_mode == 12) o = vec4(vec3(c.g), c.b);\n"
+    "    else o = c;\n"
+    "}\n";
 static uint32_t g_ntextures;
 
 /* ---- TEV: one generated fragment shader per distinct GxTevConfig ------------------------------- */
@@ -670,19 +717,67 @@ static void gl_setup(void) {
     glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, g_efb_depth);
     glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
     glPixelStorei(GL_PACK_ALIGNMENT, 1);
+
+    /* EFB copies to texture: a pass that converts an EFB rectangle into the copy's texture */
+    g_copy_prog = glCreateProgram();
+    glAttachShader(g_copy_prog, compile(GL_VERTEX_SHADER, k_copy_vs));
+    glAttachShader(g_copy_prog, compile(GL_FRAGMENT_SHADER, k_copy_fs));
+    glLinkProgram(g_copy_prog);
+    glUseProgram(g_copy_prog);
+    glUniform1i(glGetUniformLocation(g_copy_prog, "u_efb"), 0);
+    g_copy_u_src = glGetUniformLocation(g_copy_prog, "u_src");
+    g_copy_u_mode = glGetUniformLocation(g_copy_prog, "u_mode");
+    g_copy_u_half = glGetUniformLocation(g_copy_prog, "u_half");
+    g_copy_u_intensity = glGetUniformLocation(g_copy_prog, "u_intensity");
+    glGenFramebuffers(1, &g_copy_fbo);
+    glBindFramebuffer(GL_FRAMEBUFFER, g_efb_fbo);
 }
 
-static void upload(GxTextureUpload *u) {
-    if (u->id >= g_ntextures) {
+/* GL texture for GxTexture id, (re)allocated at w x h; returns its name. */
+static GLuint texture_slot(uint32_t id, uint32_t w, uint32_t h, const void *rgba) {
+    if (id >= g_ntextures) {
         uint32_t n = g_ntextures ? g_ntextures : 256;
-        while (n <= u->id) n *= 2;
+        while (n <= id) n *= 2;
         g_textures = realloc(g_textures, sizeof *g_textures * n);
+        g_texture_dims = realloc(g_texture_dims, sizeof *g_texture_dims * n);
         memset(g_textures + g_ntextures, 0, sizeof *g_textures * (n - g_ntextures));
+        memset(g_texture_dims + g_ntextures, 0, sizeof *g_texture_dims * (n - g_ntextures));
         g_ntextures = n;
     }
-    if (!g_textures[u->id]) glGenTextures(1, &g_textures[u->id]);
-    glBindTexture(GL_TEXTURE_2D, g_textures[u->id]);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, (GLsizei)u->width, (GLsizei)u->height, 0, GL_RGBA, GL_UNSIGNED_BYTE, u->rgba);
+    if (!g_textures[id]) glGenTextures(1, &g_textures[id]);
+    glBindTexture(GL_TEXTURE_2D, g_textures[id]);
+    uint32_t dims = w << 16 | h;
+    if (rgba || g_texture_dims[id] != dims) {
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, (GLsizei)w, (GLsizei)h, 0, GL_RGBA, GL_UNSIGNED_BYTE, rgba);
+        g_texture_dims[id] = dims;
+    }
+    return g_textures[id];
+}
+
+static void upload(GxTextureUpload *u) { texture_slot(u->id, u->width, u->height, u->rgba); }
+
+/* Run an EFB copy to texture on the GPU. The caller restores the EFB framebuffer and state. */
+static void efb_copy_pass(const GxEfbCopy *c) {
+    GLuint tex = texture_slot(c->id, c->out_w, c->out_h, NULL);
+    glBindFramebuffer(GL_FRAMEBUFFER, g_copy_fbo);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tex, 0);
+    glViewport(0, 0, c->out_w, c->out_h);
+    glDisable(GL_SCISSOR_TEST);
+    glDisable(GL_DEPTH_TEST);
+    glDisable(GL_BLEND);
+    glDisable(GL_CULL_FACE);
+    glColorMask(1, 1, 1, 1);
+    glUseProgram(g_copy_prog);
+    glUniform2f(g_copy_u_src, c->x, c->y);
+    glUniform1i(g_copy_u_mode, c->fmt);
+    glUniform1i(g_copy_u_half, c->half);
+    glUniform1i(g_copy_u_intensity, c->intensity);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, g_efb_color);
+    glDrawArrays(GL_TRIANGLES, 0, 3);
+    glBindFramebuffer(GL_FRAMEBUFFER, g_efb_fbo);
+    glViewport(0, 0, EFB_WIDTH, EFB_HEIGHT);
+    glEnable(GL_SCISSOR_TEST);
 }
 
 static void apply_state(const GxState *s) {
@@ -774,9 +869,16 @@ static void render(GxFrame *f) {
     glActiveTexture(GL_TEXTURE0);
     glEnable(GL_SCISSOR_TEST);
 
-    uint32_t next_clear = 0;
+    uint32_t next_clear = 0, next_copy = 0;
     for (uint32_t b = 0; b <= f->nbatches; b++) {
-        while (next_clear < f->nclears && f->clears[next_clear].at_batch == b) {
+        for (;;) { /* clears and EFB copies before batch b, in the order they were made */
+            int has_clear = next_clear < f->nclears && f->clears[next_clear].at_batch == b;
+            int has_copy = next_copy < f->nefb_copies && f->efb_copies[next_copy].at_batch == b;
+            if (!has_clear && !has_copy) break;
+            if (has_copy && (!has_clear || f->efb_copies[next_copy].seq < f->clears[next_clear].seq)) {
+                efb_copy_pass(&f->efb_copies[next_copy++]);
+                continue;
+            }
             GxClear *cl = &f->clears[next_clear++];
             glDisable(GL_SCISSOR_TEST);
             glColorMask(1, 1, 1, 1);

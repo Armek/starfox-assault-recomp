@@ -58,11 +58,21 @@ typedef struct {
 
 /* EFB clears requested by copies: applied before batches with index >= at_batch. */
 typedef struct {
-    uint32_t at_batch;
+    uint32_t at_batch, seq;  /* seq orders clears and copies at the same batch */
     float color[4];
     float depth;
     uint8_t clear_color, clear_depth;
 } GxClear;
+
+/* EFB copies to texture done on the GPU: before batch at_batch, the renderer converts the EFB
+ * rectangle into texture `id` (out_w x out_h), as the GX texture the copy format stores would
+ * decode. The pixels never go through guest memory. */
+typedef struct {
+    uint32_t at_batch, seq, id;
+    uint16_t x, y, w, h;     /* EFB source rectangle */
+    uint16_t out_w, out_h;
+    uint8_t fmt, half, intensity;
+} GxEfbCopy;
 
 typedef struct GxFrame {
     GxVertex *verts;
@@ -73,6 +83,9 @@ typedef struct GxFrame {
     uint32_t nuploads, cap_uploads;
     GxClear *clears;
     uint32_t nclears, cap_clears;
+    GxEfbCopy *efb_copies;
+    uint32_t nefb_copies, cap_efb_copies;
+    uint32_t nevents;        /* next clear/copy seq */
     uint16_t copy_rect[4];   /* EFB source rectangle of the XFB copy: x, y, w, h */
     uint32_t number;
     struct GxCopyRequest *copy; /* non-NULL: a mid-frame segment ending in an EFB-to-texture copy */
