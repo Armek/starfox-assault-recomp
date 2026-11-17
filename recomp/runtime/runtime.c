@@ -11,6 +11,7 @@
 #include <windows.h>
 #else
 #include <unistd.h>
+#include <dirent.h>
 #endif
 #include "funcs.h"
 #include "runtime.h"
@@ -475,24 +476,33 @@ void rt_vi_retrace(void) { mmio_set(VI_DI0, mmio_get(VI_DI0, 2) | 0x8000u, 2); }
 
 /* ---- loading ----------------------------------------------------------------------------------- */
 
-static uint8_t *read_file(const char *path, long *size_out) {
-    FILE *f = fopen(path, "rb");
-    if (!f) rt_fatal("cannot open %s", path);
-    fseek(f, 0, SEEK_END);
-    long size = ftell(f);
-    fseek(f, 0, SEEK_SET);
-    uint8_t *data = malloc((size_t)size + 1);
-    if (!data || fread(data, 1, (size_t)size, f) != (size_t)size) rt_fatal("cannot read %s", path);
-    fclose(f);
-    *size_out = size;
-    return data;
-}
-
 static uint32_t be32(const uint8_t *p) { return (uint32_t)p[0] << 24 | p[1] << 16 | p[2] << 8 | p[3]; }
 
-static void load_dol(const char *path) {
-    long size;
-    uint8_t *dol = read_file(path, &size);
+static uint32_t crc32_of(const uint8_t *p, size_t n) {
+    uint32_t c = 0xFFFFFFFFu;
+    for (size_t i = 0; i < n; i++) {
+        c ^= p[i];
+        for (int k = 0; k < 8; k++) c = (c >> 1) ^ (0xEDB88320u & (0u - (c & 1)));
+    }
+    return ~c;
+}
+
+/* Load the DOL from the disc (its offset is in boot.bin). It must be the one the code was translated
+ * from: a different region or revision would run mistranslated code. */
+static void load_dol(const uint8_t *boot) {
+    uint32_t dol_off = be32(boot + 0x420);
+    uint8_t *hdr = rt_disc_alloc(dol_off, 0x100);
+    long size = 0x100;
+    for (int i = 0; i < 18; i++) {
+        uint32_t end = be32(hdr + i * 4) + be32(hdr + 0x90 + i * 4);
+        if (be32(hdr + 0x90 + i * 4) && end > (uint32_t)size) size = end;
+    }
+    free(hdr);
+    uint8_t *dol = rt_disc_alloc(dol_off, (uint32_t)size);
+    if ((uint32_t)size != RT_DOL_SIZE || crc32_of(dol, (size_t)size) != RT_DOL_CRC32)
+        rt_fatal("this disc's main.dol (%ld bytes, CRC32 %08X) isn't the one this program was built from "
+                 "(%u bytes, CRC32 %08X): it needs the same Star Fox: Assault USA (GF7E01) disc",
+                 size, crc32_of(dol, (size_t)size), RT_DOL_SIZE, RT_DOL_CRC32);
     for (int i = 0; i < 18; i++) {
         uint32_t off = be32(dol + i * 4), addr = be32(dol + 0x48 + i * 4), len = be32(dol + 0x90 + i * 4);
         if (!len) continue;
@@ -505,19 +515,16 @@ static void load_dol(const char *path) {
 /* Recreate what the IPL and apploader leave in low memory before jumping to the DOL entry point.
  * Layout: OSBootInfo at 0x80000000 and the globals around 0x800000C0-0x800000FC / 0x800030xx. */
 void rt_boot_setup(const char *root) {
-    char path[1024];
-    long size;
-
-    snprintf(path, sizeof path, "%s/sys/main.dol", root);
-    load_dol(path);
-
-    snprintf(path, sizeof path, "%s/sys/boot.bin", root);
-    uint8_t *boot = read_file(path, &size);
+    rt_dvd_init(root);
+    uint8_t *boot = rt_disc_alloc(0, 0x440);
+    if (memcmp(boot, "GF7E01", 6) != 0)
+        rt_fatal("%s is not Star Fox: Assault USA (disc ID %.6s, need GF7E01)", root, (const char *)boot);
+    load_dol(boot);
     memcpy(ppc_ram(0x80000000u), boot, 0x20); /* disc ID: game code, maker, disc number, version */
-    free(boot);
 
-    snprintf(path, sizeof path, "%s/sys/fst.bin", root);
-    uint8_t *fst = read_file(path, &size);
+    long size = (long)be32(boot + 0x428);
+    uint8_t *fst = rt_disc_alloc(be32(boot + 0x424), (uint32_t)size);
+    free(boot);
     uint32_t fst_addr = (0x81800000u - (uint32_t)size) & ~31u;
     memcpy(ppc_ram(fst_addr), fst, (size_t)size);
     free(fst);
@@ -535,7 +542,6 @@ void rt_boot_setup(const char *root) {
     wr32(0x800000F8u, 162000000u);    /* bus clock */
     wr32(0x800000FCu, 486000000u);    /* CPU clock */
     dsp_send(0x8071FEEDu);            /* the DSP greets the task loader after reset */
-    rt_dvd_init(root);
     printf("[recomp] boot: FST at 0x%08X (%ld bytes), arena hi 0x%08X\n", fst_addr, size, fst_addr);
 }
 
@@ -616,33 +622,110 @@ static int file_exists(const char *path) {
     return f != NULL;
 }
 
-/* A release keeps orig/ and user/ next to the executable; when the game isn't found from the current
- * directory (a launcher, a desktop shortcut, Steam), switch to the executable's folder. */
-static void chdir_to_game(const char *root) {
-    char probe[1024], dir[1024] = "";
-    snprintf(probe, sizeof probe, "%s/sys/main.dol", root);
-    if (file_exists(probe)) return;
+static int has_suffix(const char *name, const char *ext) {
+    size_t n = strlen(name), e = strlen(ext);
+    if (n < e) return 0;
+    for (size_t k = 0; k < e; k++) {
+        char a = name[n - e + k], b = ext[k];
+        if (a >= 'A' && a <= 'Z') a = (char)(a - 'A' + 'a');
+        if (a != b) return 0;
+    }
+    return 1;
+}
+
+static int disc_image_id_ok(const char *path) {
+    char id[6] = {0};
+    FILE *f = fopen(path, "rb");
+    if (!f) return 0;
+    size_t got = fread(id, 1, 6, f);
+    fclose(f);
+    return got == 6 && memcmp(id, "GF7E01", 6) == 0;
+}
+
+/* Look for the game in `dir`: an extracted disc at orig/GF7E01, or a disc image (.iso/.gcm) of
+ * Star Fox: Assault USA. Compressed images Dolphin makes (.rvz, .wia, .gcz, .ciso, .wbfs, .nkit)
+ * can't be read directly; *other_format names one if seen. */
+static int find_game_in(const char *dir, char *out, size_t n, char *other_format, size_t on) {
+    char probe[1024];
+    snprintf(probe, sizeof probe, "%s/orig/GF7E01/sys/main.dol", dir);
+    if (file_exists(probe)) { snprintf(out, n, "orig/GF7E01"); return 1; }
+    static const char *const images[] = {".iso", ".gcm"};
+    static const char *const others[] = {".rvz", ".wia", ".gcz", ".ciso", ".wbfs", ".nkit.iso"};
+#ifdef _WIN32
+    char pattern[1024];
+    snprintf(pattern, sizeof pattern, "%s\\*", dir);
+    WIN32_FIND_DATAA fd;
+    HANDLE h = FindFirstFileA(pattern, &fd);
+    if (h == INVALID_HANDLE_VALUE) return 0;
+    int found = 0;
+    do {
+        const char *name = fd.cFileName;
+#else
+    DIR *d = opendir(dir);
+    if (!d) return 0;
+    int found = 0;
+    struct dirent *e;
+    while (!found && (e = readdir(d))) {
+        const char *name = e->d_name;
+#endif
+        int other = 0;
+        for (size_t k = 0; k < sizeof others / sizeof others[0]; k++) other |= has_suffix(name, others[k]);
+        if (other) { snprintf(other_format, on, "%s", name); continue; }
+        for (size_t k = 0; k < sizeof images / sizeof images[0] && !found; k++) {
+            if (!has_suffix(name, images[k])) continue;
+            snprintf(probe, sizeof probe, "%s/%s", dir, name);
+            if (disc_image_id_ok(probe)) { snprintf(out, n, "%s", name); found = 1; }
+        }
+#ifdef _WIN32
+    } while (!found && FindNextFileA(h, &fd));
+    FindClose(h);
+#else
+    }
+    closedir(d);
+#endif
+    return found;
+}
+
+/* Find the game: in the current folder, else next to the executable (then run from there, so saves
+ * go to its user/ folder too; this is how a release runs from a shortcut, a file manager or Steam). */
+static const char *find_game(void) {
+    static char found[1024];
+    char other[256] = "", dir[1024] = "";
+    if (find_game_in(".", found, sizeof found, other, sizeof other)) return found;
 #ifdef _WIN32
     DWORD n = GetModuleFileNameA(NULL, dir, sizeof dir);
-    if (n == 0 || n >= sizeof dir) return;
+    if (n == 0 || n >= sizeof dir) dir[0] = 0;
 #else
     ssize_t n = readlink("/proc/self/exe", dir, sizeof dir - 1);
-    if (n <= 0) return;
-    dir[n] = 0;
+    dir[n > 0 ? n : 0] = 0;
 #endif
     char *slash = strrchr(dir, '/'), *bslash = strrchr(dir, '\\');
     if (bslash > slash) slash = bslash;
-    if (!slash) return;
-    *slash = 0;
+    if (slash) {
+        *slash = 0;
+        if (find_game_in(dir, found, sizeof found, other, sizeof other)) {
 #ifdef _WIN32
-    if (SetCurrentDirectoryA(dir)) printf("[recomp] running from %s\n", dir);
+            SetCurrentDirectoryA(dir);
 #else
-    if (chdir(dir) == 0) printf("[recomp] running from %s\n", dir);
+            if (chdir(dir) != 0) return NULL;
 #endif
+            printf("[recomp] running from %s\n", dir);
+            return found;
+        }
+    }
+    if (other[0])
+        rt_fatal("%s is a compressed disc image, which can't be read directly. In Dolphin, right-click the "
+                 "game, choose Convert File..., pick the ISO format, and put the .iso next to this program.",
+                 other);
+    rt_fatal("Star Fox: Assault wasn't found. Put a disc image of it (.iso or .gcm, USA, GF7E01) next to this "
+             "program, or an extracted disc at orig/GF7E01/ (sys/ and files/), or name either on the "
+             "command line.");
+    return NULL;
 }
 
 static void usage(void) {
-    printf("usage: sfa [options] [game folder, default orig/GF7E01]\n"
+    printf("usage: sfa [options] [disc image (.iso/.gcm) or extracted disc folder]\n"
+           "  (without one: an .iso/.gcm or orig/GF7E01 in this folder or next to the program)\n"
            "  --fullscreen          start fullscreen (F11 or Alt+Enter toggles)\n"
            "  --window=WxH          window size (default 1280x960)\n"
            "  --no-video            run without a window (testing)\n"
@@ -654,7 +737,7 @@ static void usage(void) {
 }
 
 int main(int argc, char **argv) {
-    const char *root = "orig/GF7E01", *sdk_log = "build/GF7E01/sdk_trace.txt";
+    const char *root = NULL, *sdk_log = "build/GF7E01/sdk_trace.txt";
     int run_selftest = 0, dump_frames = 0, no_video = 0, root_given = 0;
     for (int i = 1; i < argc; i++) {
         int w, h;
@@ -672,7 +755,7 @@ int main(int argc, char **argv) {
         else if (argv[i][0] == '-') { fprintf(stderr, "unknown option %s\n", argv[i]); usage(); return 2; }
         else { root = argv[i]; root_given = 1; }
     }
-    if (!root_given) chdir_to_game(root);
+    if (!root_given) root = find_game();
     g_mem = calloc(1, PPC_MEM_SIZE);
     g_lc = calloc(1, PPC_LC_SIZE);
     if (!g_mem || !g_lc) rt_fatal("out of memory");

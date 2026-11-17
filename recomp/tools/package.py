@@ -1,7 +1,7 @@
 """Make a release folder (and archive) of the recompiled game, without any game data.
 
 The folder holds the executable (plus SDL2.dll on Windows), a launcher on Linux, and PLAY.txt with the
-setup steps. Players add their own extracted disc as orig/GF7E01/ next to the executable; saves go to
+setup steps. Players add their own disc image (.iso/.gcm) next to the executable; saves go to
 user/ there. With --with-fonts, the replacement system fonts from user/fonts/ (and their license) are
 included too.
 
@@ -26,11 +26,10 @@ This folder holds only the recompiled program. You need your own copy of the gam
 
 Setup
 -----
-1. Extract your Star Fox: Assault (USA, GF7E01) disc with Dolphin: right-click the game,
-   Properties > Filesystem > right-click the disc > Extract Entire Disc. Put the result here so that
-   these exist:
-       orig/GF7E01/sys/main.dol
-       orig/GF7E01/files/...
+1. Put a disc image of your Star Fox: Assault (USA, GF7E01) in this folder, as an .iso or .gcm file
+   (any file name). If Dolphin has it as .rvz or another compressed format, right-click the game in
+   Dolphin, choose Convert File..., and pick ISO. (An extracted disc also works: Dolphin's
+   Properties > Filesystem > Extract Entire Disc, placed here as orig/GF7E01/sys and orig/GF7E01/files.)
 2. System font (text in dialogs, comm subtitles): put font_western.bin and font_japanese.bin in
    user/fonts/ (Dolphin ships them in Sys/GC/), or a dump of your own console's boot ROM as
    user/GF7E01/ipl.bin.{fonts_note}
@@ -75,7 +74,6 @@ def main():
     dest = os.path.join(args.out, name)
     if os.path.exists(dest):
         shutil.rmtree(dest)
-    os.makedirs(os.path.join(dest, "orig", "GF7E01"))
     os.makedirs(os.path.join(dest, "user", "fonts"))
 
     shutil.copy2(exe, dest)
@@ -119,7 +117,7 @@ def main():
                 for f in files:
                     full = os.path.join(base, f)
                     z.write(full, os.path.relpath(full, args.out))
-                if not files and base != dest:  # keep the empty orig/ and user/ folders
+                if not files and base != dest:  # keep the empty user/fonts folder
                     z.write(base, os.path.relpath(base, args.out) + "/")
     else:
         archive = dest + ".tar.gz"

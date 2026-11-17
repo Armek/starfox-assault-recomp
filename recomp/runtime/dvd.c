@@ -1,12 +1,14 @@
-/* dvd.c - the disc drive (DI) for the recompiled game, served from the extracted disc.
+/* dvd.c - the disc drive (DI) for the recompiled game, served from a disc image or extracted disc.
  *
- * The disc is rebuilt virtually from orig/GF7E01: sys/boot.bin at offset 0, bi2.bin at 0x440,
- * apploader.img at 0x2440, main.dol and fst.bin at the offsets boot.bin records, and every file
- * at the offset its FST entry records. The SDK's DVD driver is recompiled unchanged and talks to
+ * The disc is a disc image (.iso/.gcm, read directly) or is rebuilt virtually from an extracted
+ * folder like orig/GF7E01: sys/boot.bin at offset 0, bi2.bin at 0x440, apploader.img at 0x2440,
+ * main.dol and fst.bin at the offsets boot.bin records, and every file at the offset its FST entry
+ * records. The SDK's DVD driver is recompiled unchanged and talks to
  * the DI registers below; commands complete immediately and raise the DI transfer interrupt.
  */
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include "funcs.h"
 #include "runtime.h"
 
@@ -82,7 +84,23 @@ static void add_fst(const char *root, const uint8_t *fst, uint32_t fst_size) {
     (void)dir_part;
 }
 
-void rt_dvd_init(const char *root) {
+static int is_directory(const char *path) {
+    char probe[1024];
+    snprintf(probe, sizeof probe, "%s/sys/boot.bin", path);
+    FILE *f = fopen(probe, "rb");
+    if (f) fclose(f);
+    return f != NULL;
+}
+
+/* A disc image (.iso/.gcm: the raw 1.4 GB disc) is one file at offset 0. */
+static void dvd_init_image(const char *image) {
+    long size = file_size(image);
+    if (size < 0x2440) rt_fatal("cannot read the disc image %s", image);
+    add_file(0, (uint32_t)size, image);
+    printf("[recomp] dvd: disc image %s (%ld MB)\n", image, size >> 20);
+}
+
+static void dvd_init_folder(const char *root) {
     char path[1024];
     snprintf(path, sizeof path, "%s/sys/boot.bin", root);
     FILE *f = fopen(path, "rb");
@@ -110,33 +128,65 @@ void rt_dvd_init(const char *root) {
     printf("[recomp] dvd: %d files mapped from %s\n", g_nfiles, root);
 }
 
-/* Copy disc bytes [offset, offset+len) to guest memory, zero-filling unmapped gaps. */
-static void disc_read(uint32_t offset, uint32_t dest, uint32_t len) {
-    uint8_t buf[0x8000];
-    g_reads++;
-    g_read_bytes += len;
-    for (uint32_t i = 0; i < len; i++) wr8(dest + i, 0);
+/* The disc comes from an extracted folder (sys/ and files/, as Dolphin's "Extract Entire Disc"
+ * writes them) or from a disc image file. */
+void rt_dvd_init(const char *root) {
+    if (is_directory(root)) dvd_init_folder(root);
+    else dvd_init_image(root);
+}
+
+/* The most recently used disc file stays open (a disc image is read many times). */
+static FILE *open_cached(const char *path) {
+    static FILE *f;
+    static const char *open_path;
+    if (f && open_path == path) return f;
+    if (f) fclose(f);
+    f = fopen(path, "rb");
+    open_path = f ? path : NULL;
+    return f;
+}
+
+/* Copy disc bytes [offset, offset+len) to host memory, zero-filling unmapped gaps. */
+static void disc_read_host(uint32_t offset, uint8_t *dst, uint32_t len, uint32_t guest_dest) {
+    memset(dst, 0, len);
     for (int k = 0; k < g_nfiles; k++) {
         DiscFile *df = &g_files[k];
         uint32_t lo = offset > df->offset ? offset : df->offset;
         uint64_t hi64 = (uint64_t)offset + len < (uint64_t)df->offset + df->size ? (uint64_t)offset + len
                                                                                    : (uint64_t)df->offset + df->size;
         if (lo >= hi64) continue;
-        if (g_reads <= 5000)
-            printf("[dvd] read %s +0x%X (%u bytes) -> %08X\n", df->path, lo - df->offset, (unsigned)(hi64 - lo), dest);
-        FILE *f = fopen(df->path, "rb");
+        if (guest_dest && g_reads <= 5000)
+            printf("[dvd] read %s +0x%X (%u bytes) -> %08X\n", df->path, lo - df->offset, (unsigned)(hi64 - lo),
+                   guest_dest);
+        FILE *f = open_cached(df->path);
         if (!f) rt_fatal("cannot open %s", df->path);
-        fseek(f, (long)(lo - df->offset), SEEK_SET);
-        uint32_t n = (uint32_t)(hi64 - lo), done = 0;
-        while (done < n) {
-            uint32_t chunk = n - done < sizeof buf ? n - done : (uint32_t)sizeof buf;
-            size_t got = fread(buf, 1, chunk, f);
-            for (size_t j = 0; j < got; j++) wr8(dest + (lo - offset) + done + (uint32_t)j, buf[j]);
-            if (got < chunk) break;
-            done += chunk;
-        }
-        fclose(f);
+#ifdef _WIN32
+        _fseeki64(f, (int64_t)(lo - df->offset), SEEK_SET);
+#else
+        fseeko(f, (off_t)(lo - df->offset), SEEK_SET);
+#endif
+        size_t got = fread(dst + (lo - offset), 1, (size_t)(hi64 - lo), f);
+        (void)got;
     }
+}
+
+/* Disc bytes into a new host buffer (for the boot loader: boot.bin, the DOL, the FST). */
+uint8_t *rt_disc_alloc(uint32_t offset, uint32_t len) {
+    uint8_t *p = malloc(len ? len : 1);
+    if (!p) rt_fatal("out of memory reading the disc");
+    disc_read_host(offset, p, len, 0);
+    return p;
+}
+
+/* Copy disc bytes [offset, offset+len) to guest memory. */
+static void disc_read(uint32_t offset, uint32_t dest, uint32_t len) {
+    g_reads++;
+    g_read_bytes += len;
+    uint8_t *buf = malloc(len ? len : 1);
+    if (!buf) rt_fatal("out of memory reading the disc");
+    disc_read_host(offset, buf, len, dest);
+    for (uint32_t i = 0; i < len; i++) wr8(dest + i, buf[i]);
+    free(buf);
 }
 
 static void execute(void) {

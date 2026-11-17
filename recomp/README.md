@@ -187,7 +187,7 @@ Q/E = L/R, Z = Z, numpad 8/4/6/2 = C-stick.
 | **Hardware registers** | `0xCC000000` is a register file, so reads return what was written. EXI/SI transfers complete instantly. The AI sample counter runs at 48 kHz. | `runtime.c` |
 | **ARAM** | 16 MB with instant DMA and the ARAM interrupt. | `runtime.c` |
 | **DSP** | A fake mailbox completes the SDK task loader's handshake (`0x8071FEED`, then "task init" `0xDCD10000` via the DSP interrupt). No microcode runs, so there's no audio yet. | `runtime.c` |
-| **Disc drive (DI)** | The disc is rebuilt virtually from `orig/GF7E01` (`boot.bin`, `bi2.bin`, apploader, DOL, FST and all 960+ files at their FST offsets). Read, disc-ID read, inquiry and status commands complete immediately with the DI interrupt, and the SDK's DVD driver runs unchanged. | `dvd.c` |
+| **Disc drive (DI)** | The disc is read straight from a disc image (`.iso`/`.gcm`), or rebuilt virtually from an extracted disc like `orig/GF7E01` (`boot.bin`, `bi2.bin`, apploader, DOL, FST and all 960+ files at their FST offsets). The boot loader reads `boot.bin`, the DOL and the FST through the same layer, checks the disc ID is GF7E01 and that the DOL's size and CRC32 match the `main.dol` the code was translated from (the generator records them in `funcs.h`), and refuses another disc with a clear message. Read, disc-ID read, inquiry and status commands complete immediately with the DI interrupt, and the SDK's DVD driver runs unchanged. | `dvd.c`, `runtime.c` |
 | **HLE overrides** | Console output, DSP boot, MMU setup, context switching, `GXDrawDone` (no GPU), `PADRead` (host input), `__OSReadROM` (system font), `OSNotifyLink`/`OSNotifyUnlink` and the `CARD` API. | `hle.c` |
 | **Entry hooks** | An `entry NAME` line in `hle_overrides.txt` keeps the recompiled function but makes it call `rt_hook_XXXXXXXX(c)` first, so the runtime can watch or adjust its arguments. Used for `OSExitThread` (ending host threads), set-current-stage (`--stage`) and logging stage starts. | `hle.c`, `threads.c` |
 
@@ -260,22 +260,28 @@ warnings, the self-test passes 5/5, and a 90 s headless run (`--no-video --auto-
 Mission 1 with streamed music. The windowed renderer hasn't been tried on Linux yet.
 
 For the Steam Deck, the binary needs glibc 2.34 or newer (its newest symbol is `GLIBC_2.34`) and
-`libSDL2-2.0.so.0`, which SteamOS has. Copy `build/linux/sfa` to the Deck and run it from a folder that
-holds `orig/GF7E01/` (your extracted disc) and `user/` (saves, fonts). If it won't start there, build
+`libSDL2-2.0.so.0`, which SteamOS has. Copy `build/linux/sfa` (or a release package) to the Deck with your disc
+image next to it, plus `user/fonts/`. If it won't start there, build
 inside Valve's Steam Runtime SDK or on the Deck itself.
 
 ### Release packages
 
 `python recomp/tools/package.py` (on Windows) or `python3 recomp/tools/package.py` (on Linux, after the
 Linux build) makes `dist/sfa-recomp-<platform>/` and a `.zip`/`.tar.gz` of it (about 11 MB). It holds the
-executable (stripped on Linux; `SDL2.dll` on Windows), `sfa.sh` on Linux (starts fullscreen), empty
-`orig/GF7E01/` and `user/fonts/` folders and `PLAY.txt` with the setup steps, controls and options. It
-never contains game data: players extract their own disc into `orig/GF7E01/`. `--with-fonts` also copies
-the replacement fonts from `user/fonts/` with their license.
+executable (stripped on Linux; `SDL2.dll` on Windows), `sfa.sh` on Linux (starts fullscreen), an empty
+`user/fonts/` folder and `PLAY.txt` with the setup steps, controls and options. It never contains game
+data: players put their own disc image next to the executable. `--with-fonts` also copies the
+replacement fonts from `user/fonts/` with their license.
 
-When `orig/GF7E01/sys/main.dol` isn't found from the current directory, the executable switches to its own
-folder, so a package runs from a shortcut, a file manager or Steam (tested on Windows and in WSL Debian:
-the packaged binary run from another directory boots and keeps its save in the package's `user/`).
+**Finding the game:** a disc image or extracted-disc folder named on the command line, or else, in the
+current folder and then next to the executable: `orig/GF7E01/`, or any `.iso`/`.gcm` file whose disc ID
+is GF7E01 (any file name). When it's found next to the executable, the program runs from there, so saves
+go to that folder's `user/` too; a package runs from a shortcut, a file manager or Steam. Compressed
+images (`.rvz`, `.wia`, `.gcz`, `.ciso`, `.wbfs`, NKit) can't be read; the program says to convert them
+to ISO with Dolphin's Convert File. Tested on Windows and in WSL Debian with an image rebuilt from the
+extracted disc: booted from the folder, from an image argument, from an image found in the current
+folder and next to the packaged executable (into Mission 2), and a disc with one changed DOL byte was
+refused.
 
 The generated code is derived from the game's code, so it stays under `build/` and is never committed.
 Regenerate it from your own dump.

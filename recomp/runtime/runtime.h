@@ -35,7 +35,8 @@ void rt_ax_command_list(uint32_t cl);
 void video_audio_push(const int16_t *interleaved_be_ok, int frames);
 
 /* Disc drive (dvd.c) */
-void rt_dvd_init(const char *root);
+void rt_dvd_init(const char *root);        /* root: an extracted disc folder or a disc image */
+uint8_t *rt_disc_alloc(uint32_t offset, uint32_t len); /* disc bytes into a new host buffer */
 int rt_dvd_write(uint32_t off, uint32_t v, int size);
 void rt_dvd_stats(unsigned long *reads, unsigned long *bytes);
 
