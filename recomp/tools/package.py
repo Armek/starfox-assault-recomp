@@ -1,11 +1,10 @@
 """Make a release folder (and archive) of the recompiled game, without any game data.
 
-The folder holds the executable (plus SDL2.dll on Windows), a launcher on Linux, and PLAY.txt with the
-setup steps. Players add their own disc image (.iso/.gcm) next to the executable; saves go to
-user/ there. With --with-fonts, the replacement system fonts from user/fonts/ (and their license) are
-included too.
+The folder holds the executable (plus SDL2.dll on Windows; the replacement system fonts are compiled
+in), a launcher on Linux, PLAY.txt with the setup steps and font-licenses.txt. Players add their own
+disc image (.iso/.gcm) next to the executable; saves go to user/ there.
 
-usage: python recomp/tools/package.py [--build-dir DIR] [--out dist] [--with-fonts] [--no-archive]
+usage: python recomp/tools/package.py [--build-dir DIR] [--out dist] [--no-archive]
 """
 import argparse
 import os
@@ -32,14 +31,15 @@ Setup
    Properties > Filesystem > Extract Entire Disc, placed here as orig/GF7E01/sys and orig/GF7E01/files.)
 2. Run {run}. A start screen comes up (mouse, keyboard or controller):
      GAME DISC    finds an .iso next to the program by itself, or browse to yours
-     SYSTEM FONT  text in dialogs and comm subtitles needs the GameCube system font: browse to
-                  Dolphin's Sys/GC folder and it copies font_western.bin and font_japanese.bin
-                  into user/fonts/ (or put them there yourself, or a dump of your own console's
-                  boot ROM as user/GF7E01/ipl.bin){fonts_note}
      DISPLAY      window or fullscreen
      PLAY         start the game (START on a controller)
    Your choices are remembered in user/launcher.cfg. To skip the start screen, run with --play
    or name the disc image on the command line.
+
+The GameCube's system font (dialog text, comm subtitles) is built in: replacement fonts made from
+Droid Sans by the Dolphin project, under the Apache License 2.0 (see font-licenses.txt). A dump of
+your own console's boot ROM at user/GF7E01/ipl.bin, or font files in user/fonts/, are used instead
+when present.
 
 Controls
 --------
@@ -67,7 +67,6 @@ def main():
     default_build = os.path.join(ROOT, "build", "GF7E01", "cmake" if is_win else "../linux")
     ap.add_argument("--build-dir", default=os.path.normpath(default_build))
     ap.add_argument("--out", default=os.path.join(ROOT, "dist"))
-    ap.add_argument("--with-fonts", action="store_true", help="include user/fonts (Apache 2.0) and the license")
     ap.add_argument("--no-archive", action="store_true")
     args = ap.parse_args()
 
@@ -80,7 +79,8 @@ def main():
     dest = os.path.join(args.out, name)
     if os.path.exists(dest):
         shutil.rmtree(dest)
-    os.makedirs(os.path.join(dest, "user", "fonts"))
+    os.makedirs(dest)
+    shutil.copy2(os.path.join(ROOT, "recomp", "fonts", "font-licenses.txt"), dest)  # the built-in fonts' license
 
     shutil.copy2(exe, dest)
     if is_win:
@@ -97,21 +97,11 @@ def main():
             f.write(LAUNCHER)
         os.chmod(launcher, os.stat(launcher).st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
 
-    fonts_note = ""
-    if args.with_fonts:
-        src = os.path.join(ROOT, "user", "fonts")
-        copied = [f for f in os.listdir(src) if f.endswith(".bin") or "license" in f.lower()] if os.path.isdir(src) else []
-        for f in copied:
-            shutil.copy2(os.path.join(src, f), os.path.join(dest, "user", "fonts"))
-        if copied:
-            fonts_note = (".\n                  This package already includes Dolphin's replacement fonts\n"
-                          "                  (Apache 2.0; see user/fonts/font-licenses.txt)")
-
     help_text = subprocess.run([os.path.join(dest, exe_name), "--help"], capture_output=True, text=True,
                                cwd=dest).stdout.strip()
     run = "sfa.exe" if is_win else "./sfa.sh (fullscreen; add it to Steam as a non-Steam game) or ./sfa"
     with open(os.path.join(dest, "PLAY.txt"), "w", newline="\n" if not is_win else "\r\n") as f:
-        f.write(PLAY_TXT.format(platform=plat, run=run, help=help_text, fonts_note=fonts_note))
+        f.write(PLAY_TXT.format(platform=plat, run=run, help=help_text))
 
     print(f"folder: {dest}")
     if args.no_archive:
@@ -123,8 +113,6 @@ def main():
                 for f in files:
                     full = os.path.join(base, f)
                     z.write(full, os.path.relpath(full, args.out))
-                if not files and base != dest:  # keep the empty user/fonts folder
-                    z.write(base, os.path.relpath(base, args.out) + "/")
     else:
         archive = dest + ".tar.gz"
         with tarfile.open(archive, "w:gz") as t:

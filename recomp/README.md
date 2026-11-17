@@ -29,8 +29,11 @@ host runtime into a native executable. This is the route toward a PC / Linux / S
   - Models are lit with the real GX lighting model (per-vertex lights, attenuation and diffuse functions).
   - The 3D comm portraits (Falco, Slippy, …) and the Arwing's shadow render through EFB-to-texture copies.
 - **System font:** the SDK reads the console's boot-ROM font (`OSInitFont`/`OSLoadFont`). `__OSReadROM` is HLE and
-  serves it from `user/GF7E01/ipl.bin` (your own IPL dump) or from free replacement fonts in `user/fonts/`
-  (`font_western.bin`, `font_japanese.bin`, Apache 2.0, from Dolphin's `Sys/GC`). The comm subtitles are drawn with it.
+  serves it from `user/GF7E01/ipl.bin` (your own IPL dump), else from font files in `user/fonts/`, else from the
+  replacement fonts compiled into the program: `recomp/fonts/font_western.bin` and `font_japanese.bin`, which the
+  Dolphin project generated from Droid Sans (Apache License 2.0, text in `recomp/fonts/font-licenses.txt`, shipped
+  with every release package). `tools/embed_fonts.cmake` turns them into C arrays at build time. So players need
+  only a disc image. The comm subtitles and menu text are drawn with it.
 - All text renders: menus, file and level select, pop-up messages, the mission briefing and the comm subtitles.
 
 ### Other missions
@@ -264,27 +267,25 @@ Mission 1 with streamed music. The windowed renderer hasn't been tried on Linux 
 
 For the Steam Deck, the binary needs glibc 2.34 or newer (its newest symbol is `GLIBC_2.34`) and
 `libSDL2-2.0.so.0`, which SteamOS has. Copy `build/linux/sfa` (or a release package) to the Deck with your disc
-image next to it, plus `user/fonts/`. If it won't start there, build
+image next to it. If it won't start there, build
 inside Valve's Steam Runtime SDK or on the Deck itself.
 
 ### Release packages
 
 `python recomp/tools/package.py` (on Windows) or `python3 recomp/tools/package.py` (on Linux, after the
 Linux build) makes `dist/sfa-recomp-<platform>/` and a `.zip`/`.tar.gz` of it (about 11 MB). It holds the
-executable (stripped on Linux; `SDL2.dll` on Windows), `sfa.sh` on Linux (starts fullscreen), an empty
-`user/fonts/` folder and `PLAY.txt` with the setup steps, controls and options. It never contains game
-data: players put their own disc image next to the executable. `--with-fonts` also copies the
-replacement fonts from `user/fonts/` with their license.
+executable (stripped on Linux; `SDL2.dll` on Windows), `sfa.sh` on Linux (starts fullscreen),
+`font-licenses.txt` (for the built-in fonts) and `PLAY.txt` with the setup steps, controls and options. It
+never contains game data: players put their own disc image next to the executable, and that's all.
 
 **Start screen** (`launcher.c`): started without a disc on the command line, the program first shows a
-launcher: a warp starfield, the title, and PLAY / GAME DISC / SYSTEM FONT / DISPLAY / QUIT. It uses SDL's 2D
+launcher: a warp starfield, the title, and PLAY / GAME DISC / DISPLAY / QUIT. It uses SDL's 2D
 renderer and a built-in 5x7 pixel font, so it needs no files, and works with the mouse, the keyboard or a
 controller (the Steam Deck in Gaming Mode). GAME DISC opens a file browser (places: program folder, home,
 Desktop, Downloads, drives on Windows, `/run/media/$USER` and `/media` on Linux) that shows folders and
 `.iso`/`.gcm` files, offers an extracted disc folder as one entry, and greys out compressed images with a
 note to convert them. A picked disc is checked at once (disc ID GF7E01, and the DOL's size and CRC32), so a
-wrong disc is refused there with the reason. SYSTEM FONT browses to Dolphin's `Sys/GC` folder and copies
-`font_western.bin`, `font_japanese.bin` and the license into `user/fonts/`. DISPLAY picks window or
+wrong disc is refused there with the reason. DISPLAY picks window or
 fullscreen. The choices are kept in `user/launcher.cfg`. `--play`, a disc on the command line, any testing
 option or `SFA_NO_LAUNCHER=1` skips it; if no window can be opened, the program looks for the game as below.
 Tested on Windows: picking the test ISO in the browser and pressing START boots from it, and a disc with one

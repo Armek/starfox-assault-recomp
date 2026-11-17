@@ -1,4 +1,4 @@
-/* launcher.c - the start screen: pick the game disc (and the system font), choose window or
+/* launcher.c - the start screen: pick the game disc, choose window or
  * fullscreen, and press PLAY. It uses SDL's 2D renderer and a built-in pixel font, so it needs no
  * files of its own, and it works with a mouse, the keyboard or a game controller (the Steam Deck).
  *
@@ -137,7 +137,7 @@ static void fit_left(char *out, size_t n, const char *s, int max) {
     else snprintf(out, n, "...%s", s + len - (max - 3));
 }
 
-/* ---- disc and font checks ---------------------------------------------------------------------- */
+/* ---- disc checks ---------------------------------------------------------------------------- */
 static uint32_t crc32_of(const uint8_t *p, size_t n) {
     uint32_t c = 0xFFFFFFFFu;
     for (size_t i = 0; i < n; i++) {
@@ -226,44 +226,6 @@ static int check_disc(const char *path, char *msg, size_t n) {
     return 1;
 }
 
-static int fonts_present(void) {
-    return file_exists("user/fonts/font_western.bin") || file_exists("user/GF7E01/ipl.bin");
-}
-
-static int copy_file(const char *from, const char *to) {
-    FILE *a = fopen(from, "rb");
-    if (!a) return 0;
-    FILE *b = fopen(to, "wb");
-    if (!b) { fclose(a); return 0; }
-    char buf[65536];
-    size_t k;
-    int ok = 1;
-    while ((k = fread(buf, 1, sizeof buf, a)) > 0) ok &= fwrite(buf, 1, k, b) == k;
-    fclose(a);
-    fclose(b);
-    return ok;
-}
-
-/* Copy Dolphin's replacement fonts (and their license) from `dir` into user/fonts/. */
-static int install_fonts(const char *dir, char *msg, size_t n) {
-    static const char *const names[] = {"font_western.bin", "font_japanese.bin", "font-licenses.txt"};
-    char from[1100], to[256];
-    MKDIR("user");
-    MKDIR("user/fonts");
-    int copied = 0;
-    for (int i = 0; i < 3; i++) {
-        snprintf(from, sizeof from, "%s/%s", dir, names[i]);
-        snprintf(to, sizeof to, "user/fonts/%s", names[i]);
-        if (file_exists(from) && copy_file(from, to)) copied++;
-    }
-    if (!file_exists("user/fonts/font_western.bin")) {
-        snprintf(msg, n, "NO FONT_WESTERN.BIN THERE (IT'S IN DOLPHIN'S SYS/GC FOLDER)");
-        return 0;
-    }
-    snprintf(msg, n, "FONTS INSTALLED (%d FILES)", copied);
-    return 1;
-}
-
 /* ---- settings ---------------------------------------------------------------------------------- */
 static char g_disc[1024];
 static int g_fullscreen;
@@ -289,7 +251,7 @@ static void save_settings(void) {
 }
 
 /* ---- file browser ------------------------------------------------------------------------------ */
-typedef struct { char name[260]; char path[1100]; int kind; } Entry; /* kind: 0 dir, 1 disc, 2 other image, 3 font, 4 place, 5 back */
+typedef struct { char name[260]; char path[1100]; int kind; } Entry; /* kind: 0 dir, 1 disc, 2 other image, 4 place, 5 back */
 #ifdef _WIN32
 #define SEP "\\"
 #else
@@ -377,8 +339,8 @@ static void list_places(void) {
 #endif
 }
 
-/* List `dir`; fonts mode shows Dolphin's font files instead of disc images. */
-static void list_dir(const char *dir_in, int fonts_mode) {
+/* List `dir`: folders, and disc images (compressed ones too, shown as unusable). */
+static void list_dir(const char *dir_in) {
     char dir[1100];
 #ifdef _WIN32
     if (!GetFullPathNameA(dir_in, sizeof dir, dir, NULL)) snprintf(dir, sizeof dir, "%s", dir_in);
@@ -411,9 +373,7 @@ static void list_dir(const char *dir_in, int fonts_mode) {
             if (name[0] == '.') continue;
             snprintf(full, sizeof full, "%s%s%s", dir, (dir[strlen(dir) - 1] == '/' || dir[strlen(dir) - 1] == '\\') ? "" : SEP, name);
             if (is_dir) add_entry(name, full, 0);
-            else if (fonts_mode) {
-                if (!strcmp(name, "font_western.bin")) add_entry(name, full, 3);
-            } else if (has_suffix(name, ".iso") || has_suffix(name, ".gcm")) {
+            else if (has_suffix(name, ".iso") || has_suffix(name, ".gcm")) {
                 add_entry(name, full, has_suffix(name, ".nkit.iso") ? 2 : 1);
             } else if (has_suffix(name, ".rvz") || has_suffix(name, ".wia") || has_suffix(name, ".gcz") ||
                        has_suffix(name, ".ciso") || has_suffix(name, ".wbfs")) {
@@ -431,11 +391,7 @@ static void list_dir(const char *dir_in, int fonts_mode) {
     if (g_nentries > 1) qsort(g_entries + 1, (size_t)(g_nentries - 1), sizeof *g_entries, entry_cmp);
     /* an extracted disc folder can be used as it is */
     snprintf(full, sizeof full, "%s/sys/boot.bin", dir);
-    if (!fonts_mode && file_exists(full)) add_entry("[ USE THIS EXTRACTED DISC FOLDER ]", dir, 1);
-    if (fonts_mode) {
-        snprintf(full, sizeof full, "%s/font_western.bin", dir);
-        if (file_exists(full)) add_entry("[ USE THE FONTS IN THIS FOLDER ]", dir, 3);
-    }
+    if (file_exists(full)) add_entry("[ USE THIS EXTRACTED DISC FOLDER ]", dir, 1);
 }
 
 static void parent_of(char *dir) {
@@ -454,8 +410,8 @@ static void parent_of(char *dir) {
 /* ---- the screen -------------------------------------------------------------------------------- */
 #define VW 960
 #define VH 600
-enum { SCREEN_MAIN, SCREEN_BROWSE_DISC, SCREEN_BROWSE_FONTS };
-enum { ITEM_PLAY, ITEM_DISC, ITEM_FONT, ITEM_DISPLAY, ITEM_QUIT, ITEM_COUNT };
+enum { SCREEN_MAIN, SCREEN_BROWSE_DISC };
+enum { ITEM_PLAY, ITEM_DISC, ITEM_DISPLAY, ITEM_QUIT, ITEM_COUNT };
 
 typedef struct { float x, y, z; } Star;
 static Star g_stars[220];
@@ -589,7 +545,7 @@ int launcher_run(const char *found_disc, int *fullscreen_io, char *disc_out, siz
                 int hit = -1;
                 if (screen == SCREEN_MAIN) {
                     for (int i = 0; i < ITEM_COUNT; i++)
-                        if (mx >= 180 && mx < VW - 180 && my >= 200 + i * 62 && my < 200 + i * 62 + 50) hit = i;
+                        if (mx >= 180 && mx < VW - 180 && my >= 210 + i * 70 && my < 210 + i * 70 + 54) hit = i;
                     if (hit >= 0) sel = hit;
                 } else if (mx >= 60 && mx < VW - 60 && my >= list_y && my < list_y + rows * row_h) {
                     hit = scroll + (my - list_y) / row_h;
@@ -633,18 +589,18 @@ int launcher_run(const char *found_disc, int *fullscreen_io, char *disc_out, siz
                     if (disc_ok) { result = 1; running = 0; }
                     else { snprintf(msg, sizeof msg, "CHOOSE A DISC IMAGE FIRST"); msg_ok = 0; }
                     break;
-                case ITEM_DISC: case ITEM_FONT: {
-                    screen = sel == ITEM_DISC ? SCREEN_BROWSE_DISC : SCREEN_BROWSE_FONTS;
+                case ITEM_DISC: {
+                    screen = SCREEN_BROWSE_DISC;
                     char start[1100] = "";
-                    if (sel == ITEM_DISC && g_disc[0]) {
+                    if (g_disc[0]) {
                         snprintf(start, sizeof start, "%s", g_disc);
                         if (!path_is_dir(start)) parent_of(start);
                     }
                     if (!start[0]) exe_dir(start, sizeof start);
-                    if (start[0] && path_is_dir(start)) list_dir(start, screen == SCREEN_BROWSE_FONTS);
+                    if (start[0] && path_is_dir(start)) list_dir(start);
                     else list_places();
                     bsel = scroll = 0;
-                    if (sel == ITEM_DISC && g_disc[0]) { /* start on the disc chosen now */
+                    if (g_disc[0]) { /* start on the disc chosen now */
                         const char *base = g_disc + strlen(g_disc);
                         while (base > g_disc && base[-1] != '/' && base[-1] != '\\') base--;
                         for (int i = 0; i < g_nentries; i++)
@@ -661,7 +617,6 @@ int launcher_run(const char *found_disc, int *fullscreen_io, char *disc_out, siz
                 }
             }
         } else {
-            int fonts_mode = screen == SCREEN_BROWSE_FONTS;
             if (move) {
                 bsel += move;
                 if (bsel < 0) bsel = 0;
@@ -686,12 +641,12 @@ int launcher_run(const char *found_disc, int *fullscreen_io, char *disc_out, siz
                     snprintf(before, sizeof before, "%s", up);
                     parent_of(up);
                     if (!up[0] || !strcmp(up, before)) list_places();
-                    else list_dir(up, fonts_mode);
+                    else list_dir(up);
                     bsel = scroll = 0;
                 } else if (en.kind == 5) {
                     screen = SCREEN_MAIN;
                 } else if (en.kind == 0 || en.kind == 4) {
-                    list_dir(en.path, fonts_mode);
+                    list_dir(en.path);
                     bsel = scroll = 0;
                 } else if (en.kind == 1) {
                     char m[256];
@@ -710,12 +665,6 @@ int launcher_run(const char *found_disc, int *fullscreen_io, char *disc_out, siz
                 } else if (en.kind == 2) {
                     snprintf(msg, sizeof msg, "COMPRESSED IMAGE: CONVERT IT TO ISO IN DOLPHIN (RIGHT-CLICK, CONVERT FILE)");
                     msg_ok = 0;
-                } else if (en.kind == 3) {
-                    char dir[1100];
-                    snprintf(dir, sizeof dir, "%s", en.path);
-                    if (!path_is_dir(dir)) parent_of(dir);
-                    msg_ok = install_fonts(dir, msg, sizeof msg);
-                    if (msg_ok) { screen = SCREEN_MAIN; sel = disc_ok ? ITEM_PLAY : ITEM_DISC; }
                 }
             }
             if (bsel < scroll) scroll = bsel;
@@ -735,18 +684,18 @@ int launcher_run(const char *found_disc, int *fullscreen_io, char *disc_out, siz
             text_center(r, "STAR FOX: ASSAULT", VW / 2 + 4, 54 + 4, 7, (SDL_Color){0, 60, 120, 200});
             text_center(r, "STAR FOX: ASSAULT", VW / 2, 54, 7, WHITE);
             text_center(r, "STATIC RECOMPILATION FOR PC", VW / 2, 124, 2, CYAN);
-            static const char *const labels[ITEM_COUNT] = {"PLAY", "GAME DISC", "SYSTEM FONT", "DISPLAY", "QUIT"};
+            static const char *const labels[ITEM_COUNT] = {"PLAY", "GAME DISC", "DISPLAY", "QUIT"};
             for (int i = 0; i < ITEM_COUNT; i++) {
-                SDL_Rect rc = {180, 200 + i * 62, VW - 360, 50};
+                SDL_Rect rc = {180, 210 + i * 70, VW - 360, 54};
                 int enabled = i != ITEM_PLAY || disc_ok;
                 panel(r, rc, sel == i, enabled);
                 SDL_Color c = enabled ? (sel == i ? CYAN : WHITE) : DIM;
                 if (i == ITEM_PLAY) {
                     if (sel == i && enabled) c = (SDL_Color){(Uint8)(90 + 165 * (1 - pulse)), 230, 255, 255};
-                    text_center(r, "PLAY", VW / 2, rc.y + 11, 4, c);
+                    text_center(r, "PLAY", VW / 2, rc.y + 13, 4, c);
                     continue;
                 }
-                text(r, labels[i], rc.x + 20, rc.y + 17, 2, c);
+                text(r, labels[i], rc.x + 20, rc.y + 19, 2, c);
                 const char *value = "";
                 SDL_Color vc = DIM;
                 if (i == ITEM_DISC) {
@@ -757,22 +706,16 @@ int launcher_run(const char *found_disc, int *fullscreen_io, char *disc_out, siz
                         value = tmp;
                         vc = disc_ok ? GREEN : RED;
                     } else { value = "NOT CHOSEN"; vc = RED; }
-                } else if (i == ITEM_FONT) {
-                    int ok = fonts_present();
-                    value = ok ? "FOUND" : "MISSING (TEXT WILL BE BLANK)";
-                    vc = ok ? GREEN : GOLD;
                 } else if (i == ITEM_DISPLAY) {
                     value = g_fullscreen ? "FULLSCREEN" : "WINDOW";
                     vc = WHITE;
                 }
-                text(r, value, rc.x + rc.w - 20 - text_w(value, 2), rc.y + 17, 2, vc);
+                text(r, value, rc.x + rc.w - 20 - text_w(value, 2), rc.y + 19, 2, vc);
             }
             if (msg[0]) text_center(r, msg, VW / 2, 520, 2, msg_ok ? GREEN : GOLD);
             text_center(r, "ENTER / A: SELECT    ESC / B: BACK    START: PLAY    F11: FULLSCREEN", VW / 2, 566, 1, DIM);
         } else {
-            int fonts_mode = screen == SCREEN_BROWSE_FONTS;
-            text_center(r, fonts_mode ? "FIND DOLPHIN'S SYS/GC FOLDER (FONT_WESTERN.BIN)" : "CHOOSE YOUR GAME DISC (.ISO / .GCM)",
-                        VW / 2, 30, 2, WHITE);
+            text_center(r, "CHOOSE YOUR GAME DISC (.ISO / .GCM)", VW / 2, 30, 2, WHITE);
             fit_left(tmp, sizeof tmp, g_cwd[0] ? g_cwd : "PLACES", 70);
             text_center(r, tmp, VW / 2, 70, 2, CYAN);
             SDL_Rect frame = {50, list_y - 8, VW - 100, rows * row_h + 16};
@@ -785,8 +728,8 @@ int launcher_run(const char *found_disc, int *fullscreen_io, char *disc_out, siz
                     SDL_SetRenderDrawColor(r, 30, 90, 120, 220);
                     SDL_RenderFillRect(r, &rc);
                 }
-                static const char *const tags[] = {"DIR ", "DISC", "    ", "FONT", "    ", "    "};
-                SDL_Color c = en->kind == 1 ? GREEN : en->kind == 3 ? GREEN : en->kind == 2 ? DIM : WHITE;
+                static const char *const tags[] = {"DIR ", "DISC", "    ", "    ", "    ", "    "};
+                SDL_Color c = en->kind == 1 ? GREEN : en->kind == 2 ? DIM : WHITE;
                 text(r, tags[en->kind], rc.x + 8, rc.y + 6, 2, en->kind == 0 ? CYAN : c);
                 fit_left(tmp, sizeof tmp, en->name, 58);
                 text(r, tmp, rc.x + 80, rc.y + 6, 2, c);

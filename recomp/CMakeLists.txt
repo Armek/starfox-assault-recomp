@@ -20,7 +20,15 @@ list(TRANSFORM GENERATED_SOURCES PREPEND "${GENERATED_DIR}/")
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 
-add_executable(sfa runtime/runtime.c runtime/hle.c runtime/threads.c runtime/dvd.c runtime/gx.c runtime/video.c runtime/card.c runtime/ax.c runtime/launcher.c ${GENERATED_SOURCES})
+# The replacement system fonts (recomp/fonts, Apache 2.0) are compiled in, so players need only a disc image.
+set(FONTS_C "${CMAKE_CURRENT_BINARY_DIR}/fonts_embedded.c")
+add_custom_command(OUTPUT "${FONTS_C}"
+  COMMAND ${CMAKE_COMMAND} -DIN_DIR=${CMAKE_CURRENT_SOURCE_DIR}/fonts -DOUT=${FONTS_C}
+          -P ${CMAKE_CURRENT_SOURCE_DIR}/tools/embed_fonts.cmake
+  DEPENDS fonts/font_western.bin fonts/font_japanese.bin tools/embed_fonts.cmake
+  COMMENT "Embedding the system fonts")
+
+add_executable(sfa "${FONTS_C}" runtime/runtime.c runtime/hle.c runtime/threads.c runtime/dvd.c runtime/gx.c runtime/video.c runtime/card.c runtime/ax.c runtime/launcher.c ${GENERATED_SOURCES})
 target_include_directories(sfa PRIVATE runtime "${GENERATED_DIR}")
 
 if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")

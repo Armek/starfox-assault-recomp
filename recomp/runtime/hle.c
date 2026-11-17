@@ -57,8 +57,9 @@ HLE(PADRead) {
 /* BOOL __OSReadROM(void *buffer, s32 length, s32 offset): read the boot ROM (IPL) over EXI.
  * Games only read the system fonts from it: the SJIS font at 0x1AFF00 and the ANSI font at
  * 0x1FCF00, Yay0-compressed. They come from user/GF7E01/ipl.bin (a dump of your own console's
- * boot ROM) or, failing that, from free replacement fonts in user/fonts/ (Dolphin ships
- * font_western.bin and font_japanese.bin, Apache 2.0, based on Droid Sans). */
+ * boot ROM), else from font files in user/fonts/, else from the replacement fonts compiled into
+ * the program (recomp/fonts: Dolphin's font_western.bin and font_japanese.bin, generated from
+ * Droid Sans, Apache 2.0). */
 #define IPL_SIZE 0x200000u
 static uint8_t *g_ipl;
 
@@ -79,11 +80,15 @@ static void ipl_init(void) {
     }
     long a = load_into("user/fonts/font_western.bin", g_ipl + 0x1FCF00, IPL_SIZE - 0x1FCF00);
     long s = load_into("user/fonts/font_japanese.bin", g_ipl + 0x1AFF00, 0x1FCF00 - 0x1AFF00);
-    if (a > 0 || s > 0)
+    if (a > 0 || s > 0) {
         printf("[rom] system fonts from user/fonts (western %ld bytes, japanese %ld bytes)\n", a, s);
-    else
-        printf("[rom] no system font found: text drawn with OSGetFontTexture will be blank "
-               "(put font_western.bin in user/fonts or an IPL dump at user/GF7E01/ipl.bin)\n");
+        return;
+    }
+    extern const unsigned char g_font_western[], g_font_japanese[];
+    extern const size_t g_font_western_size, g_font_japanese_size;
+    memcpy(g_ipl + 0x1FCF00, g_font_western, g_font_western_size);
+    memcpy(g_ipl + 0x1AFF00, g_font_japanese, g_font_japanese_size);
+    printf("[rom] built-in system fonts (Droid Sans, Apache 2.0)\n");
 }
 
 HLE(__OSReadROM) {
