@@ -30,10 +30,16 @@ Setup
    (any file name). If Dolphin has it as .rvz or another compressed format, right-click the game in
    Dolphin, choose Convert File..., and pick ISO. (An extracted disc also works: Dolphin's
    Properties > Filesystem > Extract Entire Disc, placed here as orig/GF7E01/sys and orig/GF7E01/files.)
-2. System font (text in dialogs, comm subtitles): put font_western.bin and font_japanese.bin in
-   user/fonts/ (Dolphin ships them in Sys/GC/), or a dump of your own console's boot ROM as
-   user/GF7E01/ipl.bin.{fonts_note}
-3. Run {run}.
+2. Run {run}. A start screen comes up (mouse, keyboard or controller):
+     GAME DISC    finds an .iso next to the program by itself, or browse to yours
+     SYSTEM FONT  text in dialogs and comm subtitles needs the GameCube system font: browse to
+                  Dolphin's Sys/GC folder and it copies font_western.bin and font_japanese.bin
+                  into user/fonts/ (or put them there yourself, or a dump of your own console's
+                  boot ROM as user/GF7E01/ipl.bin){fonts_note}
+     DISPLAY      window or fullscreen
+     PLAY         start the game (START on a controller)
+   Your choices are remembered in user/launcher.cfg. To skip the start screen, run with --play
+   or name the disc image on the command line.
 
 Controls
 --------
@@ -98,12 +104,12 @@ def main():
         for f in copied:
             shutil.copy2(os.path.join(src, f), os.path.join(dest, "user", "fonts"))
         if copied:
-            fonts_note = ("\n   This package already includes Dolphin's replacement fonts in user/fonts/\n"
-                          "   (Apache 2.0; see font-licenses.txt there).")
+            fonts_note = (".\n                  This package already includes Dolphin's replacement fonts\n"
+                          "                  (Apache 2.0; see user/fonts/font-licenses.txt)")
 
     help_text = subprocess.run([os.path.join(dest, exe_name), "--help"], capture_output=True, text=True,
                                cwd=dest).stdout.strip()
-    run = "sfa.exe (add --fullscreen for fullscreen)" if is_win else "./sfa.sh (fullscreen) or ./sfa"
+    run = "sfa.exe" if is_win else "./sfa.sh (fullscreen; add it to Steam as a non-Steam game) or ./sfa"
     with open(os.path.join(dest, "PLAY.txt"), "w", newline="\n" if not is_win else "\r\n") as f:
         f.write(PLAY_TXT.format(platform=plat, run=run, help=help_text, fonts_note=fonts_note))
 

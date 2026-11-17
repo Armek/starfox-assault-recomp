@@ -688,7 +688,7 @@ static int find_game_in(const char *dir, char *out, size_t n, char *other_format
 
 /* Find the game: in the current folder, else next to the executable (then run from there, so saves
  * go to its user/ folder too; this is how a release runs from a shortcut, a file manager or Steam). */
-static const char *find_game(void) {
+static const char *find_game(int required) {
     static char found[1024];
     char other[256] = "", dir[1024] = "";
     if (find_game_in(".", found, sizeof found, other, sizeof other)) return found;
@@ -713,6 +713,16 @@ static const char *find_game(void) {
             return found;
         }
     }
+    if (!required) { /* the launcher will ask: keep its settings and saves next to the program */
+        if (slash) {
+#ifdef _WIN32
+            SetCurrentDirectoryA(dir);
+#else
+            if (chdir(dir) != 0) return NULL;
+#endif
+        }
+        return NULL;
+    }
     if (other[0])
         rt_fatal("%s is a compressed disc image, which can't be read directly. In Dolphin, right-click the "
                  "game, choose Convert File..., pick the ISO format, and put the .iso next to this program.",
@@ -726,6 +736,8 @@ static const char *find_game(void) {
 static void usage(void) {
     printf("usage: sfa [options] [disc image (.iso/.gcm) or extracted disc folder]\n"
            "  (without one: an .iso/.gcm or orig/GF7E01 in this folder or next to the program)\n"
+           "  (with neither, a start screen lets you pick the disc and press PLAY)\n"
+           "  --play                skip the start screen\n"
            "  --fullscreen          start fullscreen (F11 or Alt+Enter toggles)\n"
            "  --window=WxH          window size (default 1280x960)\n"
            "  --no-video            run without a window (testing)\n"
@@ -738,24 +750,40 @@ static void usage(void) {
 
 int main(int argc, char **argv) {
     const char *root = NULL, *sdk_log = "build/GF7E01/sdk_trace.txt";
-    int run_selftest = 0, dump_frames = 0, no_video = 0, root_given = 0;
+    int run_selftest = 0, dump_frames = 0, no_video = 0, root_given = 0, testing = 0, skip_launcher = 0, fullscreen = 0;
     for (int i = 1; i < argc; i++) {
         int w, h;
         if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) { usage(); return 0; }
-        else if (!strcmp(argv[i], "--fullscreen")) video_set_window(1, 0, 0);
+        else if (!strcmp(argv[i], "--fullscreen")) { fullscreen = 1; video_set_window(1, 0, 0); }
+        else if (!strcmp(argv[i], "--play")) skip_launcher = 1;
         else if (!strncmp(argv[i], "--window=", 9) && sscanf(argv[i] + 9, "%dx%d", &w, &h) == 2) video_set_window(0, w, h);
         else if (!strcmp(argv[i], "--selftest")) run_selftest = 1;
         else if (!strncmp(argv[i], "--sdk-log=", 10)) sdk_log = argv[i] + 10;
         else if (!strncmp(argv[i], "--sdk-log-limit=", 16)) g_sdk_log_limit = strtoul(argv[i] + 16, NULL, 0);
-        else if (!strcmp(argv[i], "--dump-frames")) dump_frames = 1;
+        else if (!strcmp(argv[i], "--dump-frames")) dump_frames = testing = 1;
         else if (!strcmp(argv[i], "--no-video")) no_video = 1;
-        else if (!strcmp(argv[i], "--auto-press")) video_set_auto_press(1);
-        else if (!strncmp(argv[i], "--stage=", 8)) g_start_stage = atoi(argv[i] + 8);
-        else if (!strncmp(argv[i], "--auto-keys=", 12)) video_set_auto_keys(argv[i] + 12);
+        else if (!strcmp(argv[i], "--auto-press")) { video_set_auto_press(1); testing = 1; }
+        else if (!strncmp(argv[i], "--stage=", 8)) { g_start_stage = atoi(argv[i] + 8); testing = 1; }
+        else if (!strncmp(argv[i], "--auto-keys=", 12)) { video_set_auto_keys(argv[i] + 12); testing = 1; }
         else if (argv[i][0] == '-') { fprintf(stderr, "unknown option %s\n", argv[i]); usage(); return 2; }
         else { root = argv[i]; root_given = 1; }
     }
-    if (!root_given) root = find_game();
+    if (!root_given) {
+        /* the start screen, unless testing or told to skip it */
+        int launcher = !skip_launcher && !testing && !no_video && !run_selftest && !getenv("SFA_NO_LAUNCHER");
+        root = find_game(!launcher);
+        if (launcher) {
+            static char chosen[1024];
+            int r = launcher_run(root, &fullscreen, chosen, sizeof chosen);
+            if (r == 0) return 0; /* QUIT */
+            if (r == 1) {
+                root = chosen;
+                video_set_window(fullscreen, 0, 0);
+            } else if (!root) {
+                root = find_game(1); /* no start screen possible: look for the game as before */
+            }
+        }
+    }
     g_mem = calloc(1, PPC_MEM_SIZE);
     g_lc = calloc(1, PPC_LC_SIZE);
     if (!g_mem || !g_lc) rt_fatal("out of memory");

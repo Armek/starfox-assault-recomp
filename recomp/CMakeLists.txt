@@ -20,7 +20,7 @@ list(TRANSFORM GENERATED_SOURCES PREPEND "${GENERATED_DIR}/")
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 
-add_executable(sfa runtime/runtime.c runtime/hle.c runtime/threads.c runtime/dvd.c runtime/gx.c runtime/video.c runtime/card.c runtime/ax.c ${GENERATED_SOURCES})
+add_executable(sfa runtime/runtime.c runtime/hle.c runtime/threads.c runtime/dvd.c runtime/gx.c runtime/video.c runtime/card.c runtime/ax.c runtime/launcher.c ${GENERATED_SOURCES})
 target_include_directories(sfa PRIVATE runtime "${GENERATED_DIR}")
 
 if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")

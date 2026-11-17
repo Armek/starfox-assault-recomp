@@ -42,5 +42,8 @@ void rt_dvd_stats(unsigned long *reads, unsigned long *bytes);
 
 /* hle.c: --stage=N starts stage N of the game's stage table in place of Mission 1's first stage */
 extern int g_start_stage;
+/* launcher.c: the start screen. found: a disc already found, or NULL. Returns 1 to play (with
+ * disc_out and *fullscreen set), 0 to quit, -1 if it couldn't open a window. */
+int launcher_run(const char *found, int *fullscreen, char *disc_out, size_t disc_n);
 
 #endif

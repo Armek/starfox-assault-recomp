@@ -209,6 +209,9 @@ The generator also emits **extra entry points** for calls into the middle of a f
 
 ### Debugging aids
 
+- **`SFA_LAUNCHER_SCRIPT=down,enter,…`** drives the start screen for testing: every 0.6 s it saves
+  `build/GF7E01/launcher_NN.bmp` and presses the next key (`up down pgdn enter esc start`); it quits
+  after the last one.
 - **`--help`** lists the options. **`--fullscreen`** and **`--window=WxH`** set up the window; F11 or
   Alt+Enter toggles fullscreen.
 - **`--dump-frames`, `--no-video`, `--auto-press`.**
@@ -272,6 +275,20 @@ executable (stripped on Linux; `SDL2.dll` on Windows), `sfa.sh` on Linux (starts
 `user/fonts/` folder and `PLAY.txt` with the setup steps, controls and options. It never contains game
 data: players put their own disc image next to the executable. `--with-fonts` also copies the
 replacement fonts from `user/fonts/` with their license.
+
+**Start screen** (`launcher.c`): started without a disc on the command line, the program first shows a
+launcher: a warp starfield, the title, and PLAY / GAME DISC / SYSTEM FONT / DISPLAY / QUIT. It uses SDL's 2D
+renderer and a built-in 5x7 pixel font, so it needs no files, and works with the mouse, the keyboard or a
+controller (the Steam Deck in Gaming Mode). GAME DISC opens a file browser (places: program folder, home,
+Desktop, Downloads, drives on Windows, `/run/media/$USER` and `/media` on Linux) that shows folders and
+`.iso`/`.gcm` files, offers an extracted disc folder as one entry, and greys out compressed images with a
+note to convert them. A picked disc is checked at once (disc ID GF7E01, and the DOL's size and CRC32), so a
+wrong disc is refused there with the reason. SYSTEM FONT browses to Dolphin's `Sys/GC` folder and copies
+`font_western.bin`, `font_japanese.bin` and the license into `user/fonts/`. DISPLAY picks window or
+fullscreen. The choices are kept in `user/launcher.cfg`. `--play`, a disc on the command line, any testing
+option or `SFA_NO_LAUNCHER=1` skips it; if no window can be opened, the program looks for the game as below.
+Tested on Windows: picking the test ISO in the browser and pressing START boots from it, and a disc with one
+changed DOL byte shows "different version of the game".
 
 **Finding the game:** a disc image or extracted-disc folder named on the command line, or else, in the
 current folder and then next to the executable: `orig/GF7E01/`, or any `.iso`/`.gcm` file whose disc ID
