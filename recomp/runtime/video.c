@@ -121,6 +121,31 @@ static SDL_GameController *g_controller;
 static int g_auto_press;
 
 void video_set_auto_press(int on) { g_auto_press = on; }
+static volatile int g_auto_play; /* a stage is running: auto-press plays instead of tapping START */
+void video_set_auto_play(int on) { g_auto_play = on; }
+
+/* --auto-keys=TOKENS: comma-separated buttons pressed one per step (1.5 s) from launch, for reaching
+ * menus auto-press doesn't (VS mode, bonus games). Tokens: a b x y z l r start up down left right,
+ * and w (wait one step). After the last step, --auto-press behaviour (if on) takes over. */
+#define AUTO_KEY_STEP_MS 1500
+static uint16_t g_auto_keys[256];
+static int g_auto_nkeys;
+void video_set_auto_keys(const char *list) {
+    static const struct { const char *name; uint16_t bits; } k[] = {
+        {"a", 0x100}, {"b", 0x200}, {"x", 0x400}, {"y", 0x800}, {"start", 0x1000}, {"z", 0x10}, {"r", 0x20},
+        {"l", 0x40}, {"left", 0x1}, {"right", 0x2}, {"down", 0x4}, {"up", 0x8}, {"w", 0}};
+    g_auto_nkeys = 0;
+    while (*list && g_auto_nkeys < 256) {
+        size_t n = strcspn(list, ",");
+        uint16_t bits = 0xFFFF;
+        for (size_t i = 0; i < sizeof k / sizeof k[0]; i++)
+            if (strlen(k[i].name) == n && !strncmp(k[i].name, list, n)) bits = k[i].bits;
+        if (bits == 0xFFFF) fprintf(stderr, "[video] --auto-keys: unknown key '%.*s'\n", (int)n, list);
+        else g_auto_keys[g_auto_nkeys++] = bits;
+        list += n;
+        if (*list == ',') list++;
+    }
+}
 
 static int8_t axis8(Sint16 v) {
     int x = v / 256;
@@ -194,7 +219,29 @@ void video_get_pad(int port, PadState *out) {
         out->trigger_l = b.trigger_l > a.trigger_l ? b.trigger_l : a.trigger_l;
         out->trigger_r = b.trigger_r > a.trigger_r ? b.trigger_r : a.trigger_r;
     }
-    if (g_auto_press) { /* testing aid: tap START, then A, every 4 seconds */
+    if (g_auto_nkeys) { /* scripted keys first: press each for 150 ms at the start of its step */
+        Uint32 t = SDL_GetTicks();
+        int step = (int)(t / AUTO_KEY_STEP_MS);
+        if (step < g_auto_nkeys) {
+            if (t % AUTO_KEY_STEP_MS < 200) {
+                uint16_t k = g_auto_keys[step];
+                out->buttons |= k;
+                /* directions also move the main stick: menus read either */
+                if (k & 0x8) out->stick_y = 100;
+                if (k & 0x4) out->stick_y = -100;
+                if (k & 0x1) out->stick_x = -100;
+                if (k & 0x2) out->stick_x = 100;
+            }
+            return;
+        }
+    }
+    if (g_auto_press && g_auto_play) { /* in a stage: fire and move, never pause */
+        Uint32 t = SDL_GetTicks();
+        if (t % 500 < 120) out->buttons |= 0x100; /* A: fire, and advances dialogue */
+        out->stick_y = 60;                        /* forward */
+        int phase = (int)(t % 8000);              /* sweep left and right every 8 s */
+        out->stick_x = (int8_t)((phase < 4000 ? phase : 8000 - phase) * 100 / 4000 - 50);
+    } else if (g_auto_press) { /* menus: tap START, then A, every 4 seconds */
         Uint32 t = SDL_GetTicks() % 4000;
         if (t < 150) out->buttons |= 0x1000;
         else if (t >= 2000 && t < 2150) out->buttons |= 0x100;

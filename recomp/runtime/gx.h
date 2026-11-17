@@ -98,6 +98,8 @@ typedef struct {
 } PadState;
 void video_get_pad(int port, PadState *out);
 void video_set_auto_press(int on);
+void video_set_auto_keys(const char *list); /* --auto-keys=a,down,start,w,... */
+void video_set_auto_play(int on); /* with --auto-press: in a stage, fire and move instead of tapping START */
 void video_start(int dump_frames);
 void video_submit(GxFrame *frame);  /* takes ownership */
 GxFrame *video_new_frame(uint32_t number); /* empty frame, reusing a finished one's arrays */

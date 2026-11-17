@@ -621,6 +621,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--no-video")) no_video = 1;
         else if (!strcmp(argv[i], "--auto-press")) video_set_auto_press(1);
         else if (!strncmp(argv[i], "--stage=", 8)) g_start_stage = atoi(argv[i] + 8);
+        else if (!strncmp(argv[i], "--auto-keys=", 12)) video_set_auto_keys(argv[i] + 12);
         else root = argv[i];
     }
     g_mem = calloc(1, PPC_MEM_SIZE);

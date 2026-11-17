@@ -107,12 +107,19 @@ void rt_hook_8001D5B4(Ctx *c) {
         c->r[3] = (uint32_t)g_start_stage;
         printf("[stage] --stage=%d: current stage set to %d (play type %u)\n", g_start_stage, g_start_stage,
                rd8(0x80223565u + (uint32_t)g_start_stage * 0x14));
+        /* later parts of a mission take their resource list from RAM the earlier parts fill in
+         * (the table's pointer is outside the DOL's read-only data), so they can't start cold */
+        if (rd32(0x80229748u + (uint32_t)g_start_stage * 12) >= 0x80380000u)
+            printf("[stage] warning: stage %d is a later part of its mission and needs the earlier parts' state; "
+                   "start from a mission's first stage (0, 5, 9, 11, 15, 19, 20, 24, 27, 29)\n", g_start_stage);
         fflush(stdout);
     }
 }
 
-/* Stage start, fn_8005F470(state, stage, a, b): log each stage the game starts. */
+/* Stage start, fn_8005F470(state, stage, a, b): log each stage the game starts; from here on
+ * --auto-press plays (fires and moves) instead of tapping START. */
 void rt_hook_8005F470(Ctx *c) {
+    video_set_auto_play(1);
     uint32_t stage = c->r[4];
     printf("[stage] start stage %d (mission %d, part %02X)\n", (int)stage,
            stage < 0x3B ? rd8(0x80223560u + stage * 0x14) + 1 : -1, stage < 0x3B ? rd8(0x80223561u + stage * 0x14) : 0);

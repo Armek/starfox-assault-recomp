@@ -44,6 +44,16 @@ then writes a log and a contact sheet per mission to `build/GF7E01/missions/`.
   Orbital Gate, 10 Aparoid tunnel) and the on-foot/ground ones (2 Katina, 3, 4, 6, 7 Corneria, 9).
   (Swapping the stage later, when the stage starts, isn't enough: the gameplay module is already chosen,
   so ground missions ran Mission 1's flight module and crashed.)
+- **Only first stages start cold:** a mission's later parts and boss stages take their resource list
+  from RAM that the earlier parts fill in (the stage table points outside the DOL's read-only data), so
+  `--stage` on them crashes at once and the runtime warns. Reaching them needs real progress through the
+  mission.
+- **Auto-play:** once the game starts a stage, `--auto-press` stops tapping START (which paused the game
+  half the time) and plays instead: A every half second, stick forward with a slow left-right sweep.
+  Mission 1 then flies on to Oikonny's flagship.
+- **Also seen working:** the full opening cinematic (fleet battle, subtitles), Mission 1's story intro
+  (General Pepper's briefing and the in-engine cutscene), and the attract demo's 4-player split-screen
+  VS matches.
 - **Threads:** the game starts a streaming worker thread over and over (more than 120 in 4 minutes).
   Exited threads used to keep their host thread and table slot until the 64-slot table ran out ("too
   many guest threads"); now `OSExitThread` marks the thread and it ends once it switches away.
@@ -182,13 +192,16 @@ The generator also emits **extra entry points** for calls into the middle of a f
    (0 of 27 million draws), so this waits until a later stage needs it.
 4. **Packaging:** a release build layout. Linux builds and runs headless (see *Linux and Steam Deck*);
    still to do: the windowed renderer on Linux and a test on the Steam Deck itself.
-5. **Longer play:** the missions have only been run for 3 minutes from their first stage with
-   `--auto-press` (it mostly pauses); later parts, bosses, VS mode and the bonus games are untested.
+5. **Longer play:** later parts and bosses of each mission, VS mode menus and the bonus games are
+   untested (they need real play, or menu scripts that wait for each menu to accept input).
 
 ### Debugging aids
 
 - **`--dump-frames`, `--no-video`, `--auto-press`.**
-- **`--stage=N`** starts stage N instead of Mission 1 (any of the ten missions), and
+- **`--auto-keys=start,w,down,a,…`** presses one button per 1.5 s step from launch (`w` waits), then
+  hands over to `--auto-press`. Directions also move the stick. Menus ignore input for a moment after
+  they appear, so fixed timing is fragile.
+- **`--stage=N`** starts stage N instead of Mission 1 (the first stage of any of the ten missions), and
   **`recomp/tools/mission_test.py`** runs a list of missions and saves logs and contact sheets.
 - **`SFA_GX_DEBUG=1`** logs draw configurations, textures (with how many source bytes are non-zero),
   TMEM preloads, EFB-to-texture copies and ARAM DMA, and saves decoded textures as images.
