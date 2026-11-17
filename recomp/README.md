@@ -167,6 +167,12 @@ untranslated instructions.
   HLE hooks that recognise the module (by ID and section sizes) and record its real section addresses. After
   that, `rt_call`/`rt_jump` map pointers into the module (vtables, `_prolog`, callbacks) to its generated
   functions.
+- **Calls into unlinked modules:** leaving a stage, `fn_8001B098` unlinks the gameplay module (`m9` in
+  Mission 1) and frees it, and its caller `fn_8003CE84` then calls a function pointer into it anyway. The
+  console runs the old code from the freed memory. So an unlinked module keeps its section addresses, and
+  an address no linked module covers maps to the module linked there most recently (unlinked ranges
+  overlap, since modules share the heap). Before this, finishing Mission 1 or a game over stopped with
+  "indirect call to unknown address".
 
 ### Graphics and input (milestone 3)
 

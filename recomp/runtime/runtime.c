@@ -184,13 +184,26 @@ static void watch_init(void) {
 static void watch_init(void) {}
 #endif
 
-/* A runtime address inside a linked REL module's code -> the address its code was generated at. */
+/* g_rel[i].loaded: 0 never linked, REL_LINKED, or REL_UNLINKED (unlinked, but its code is still where it
+ * was: the game calls into a module it has just unlinked, see rel_notify). */
+#define REL_LINKED 1
+#define REL_UNLINKED 2
+
+static uint32_t g_rel_link_seq[RT_NUM_RELS], g_rel_links; /* when each module was last linked */
+
+/* A runtime address inside a REL module's code -> the address its code was generated at. Linked
+ * modules come first. Otherwise the address is in freed memory, which holds the code of the module
+ * linked there most recently (unlinked ranges overlap: modules load into the same heap). */
 static uint32_t rel_to_generated(uint32_t addr) {
+    int best = -1;
     for (unsigned i = 0; i < RT_NUM_RELS; i++) {
         const RelInfo *ri = &g_rel_info[i];
         uint32_t base = g_rel[i].sec[ri->text_sec];
-        if (g_rel[i].loaded && addr >= base && addr < base + ri->text_size) return addr - base + ri->vbase;
+        if (!g_rel[i].loaded || addr < base || addr >= base + ri->text_size) continue;
+        if (g_rel[i].loaded == REL_LINKED) return addr - base + ri->vbase;
+        if (best < 0 || g_rel_link_seq[i] > g_rel_link_seq[best]) best = (int)i;
     }
+    if (best >= 0) return addr - g_rel[best].sec[g_rel_info[best].text_sec] + g_rel_info[best].vbase;
     return addr;
 }
 
@@ -218,10 +231,16 @@ static void rel_notify(Ctx *c, int linked) {
         if (!match) continue;
         if (linked) {
             for (uint32_t k = 0; k < nsec && k < 32; k++) g_rel[i].sec[k] = rd32(si + k * 8) & ~3u;
-            g_rel[i].loaded = 1;
+            g_rel[i].loaded = REL_LINKED;
+            g_rel_link_seq[i] = ++g_rel_links;
             printf("[rel] linked %s: text 0x%08X, %u sections\n", ri->name, g_rel[i].sec[ri->text_sec], nsec);
         } else {
-            g_rel[i].loaded = 0;
+            /* Keep the section addresses: freeing a module doesn't erase it, and the game relies on
+             * that. Leaving a stage, fn_8001B098 unlinks the gameplay module (m9 in Mission 1) and its
+             * caller fn_8003CE84 then still calls a function pointer into it. On the console that runs
+             * the old code from freed memory; here it used to stop with "indirect call to unknown
+             * address" (after a game over, or finishing Mission 1). */
+            g_rel[i].loaded = REL_UNLINKED;
             printf("[rel] unlinked %s\n", ri->name);
         }
         return;
