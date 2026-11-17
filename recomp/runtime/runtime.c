@@ -610,11 +610,58 @@ static int selftest(void) {
 
 /* ---- entry point ------------------------------------------------------------------------------- */
 
+static int file_exists(const char *path) {
+    FILE *f = fopen(path, "rb");
+    if (f) fclose(f);
+    return f != NULL;
+}
+
+/* A release keeps orig/ and user/ next to the executable; when the game isn't found from the current
+ * directory (a launcher, a desktop shortcut, Steam), switch to the executable's folder. */
+static void chdir_to_game(const char *root) {
+    char probe[1024], dir[1024] = "";
+    snprintf(probe, sizeof probe, "%s/sys/main.dol", root);
+    if (file_exists(probe)) return;
+#ifdef _WIN32
+    DWORD n = GetModuleFileNameA(NULL, dir, sizeof dir);
+    if (n == 0 || n >= sizeof dir) return;
+#else
+    ssize_t n = readlink("/proc/self/exe", dir, sizeof dir - 1);
+    if (n <= 0) return;
+    dir[n] = 0;
+#endif
+    char *slash = strrchr(dir, '/'), *bslash = strrchr(dir, '\\');
+    if (bslash > slash) slash = bslash;
+    if (!slash) return;
+    *slash = 0;
+#ifdef _WIN32
+    if (SetCurrentDirectoryA(dir)) printf("[recomp] running from %s\n", dir);
+#else
+    if (chdir(dir) == 0) printf("[recomp] running from %s\n", dir);
+#endif
+}
+
+static void usage(void) {
+    printf("usage: sfa [options] [game folder, default orig/GF7E01]\n"
+           "  --fullscreen          start fullscreen (F11 or Alt+Enter toggles)\n"
+           "  --window=WxH          window size (default 1280x960)\n"
+           "  --no-video            run without a window (testing)\n"
+           "  --stage=N             start stage N of the stage table instead of Mission 1\n"
+           "  --auto-press          press buttons automatically (testing)\n"
+           "  --auto-keys=a,w,...   scripted button presses, one per 1.5 s (testing)\n"
+           "  --dump-frames         save every 15th frame to build/GF7E01/frames\n"
+           "  --selftest            check the recompiled code and exit\n");
+}
+
 int main(int argc, char **argv) {
     const char *root = "orig/GF7E01", *sdk_log = "build/GF7E01/sdk_trace.txt";
-    int run_selftest = 0, dump_frames = 0, no_video = 0;
+    int run_selftest = 0, dump_frames = 0, no_video = 0, root_given = 0;
     for (int i = 1; i < argc; i++) {
-        if (!strcmp(argv[i], "--selftest")) run_selftest = 1;
+        int w, h;
+        if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) { usage(); return 0; }
+        else if (!strcmp(argv[i], "--fullscreen")) video_set_window(1, 0, 0);
+        else if (!strncmp(argv[i], "--window=", 9) && sscanf(argv[i] + 9, "%dx%d", &w, &h) == 2) video_set_window(0, w, h);
+        else if (!strcmp(argv[i], "--selftest")) run_selftest = 1;
         else if (!strncmp(argv[i], "--sdk-log=", 10)) sdk_log = argv[i] + 10;
         else if (!strncmp(argv[i], "--sdk-log-limit=", 16)) g_sdk_log_limit = strtoul(argv[i] + 16, NULL, 0);
         else if (!strcmp(argv[i], "--dump-frames")) dump_frames = 1;
@@ -622,8 +669,10 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--auto-press")) video_set_auto_press(1);
         else if (!strncmp(argv[i], "--stage=", 8)) g_start_stage = atoi(argv[i] + 8);
         else if (!strncmp(argv[i], "--auto-keys=", 12)) video_set_auto_keys(argv[i] + 12);
-        else root = argv[i];
+        else if (argv[i][0] == '-') { fprintf(stderr, "unknown option %s\n", argv[i]); usage(); return 2; }
+        else { root = argv[i]; root_given = 1; }
     }
+    if (!root_given) chdir_to_game(root);
     g_mem = calloc(1, PPC_MEM_SIZE);
     g_lc = calloc(1, PPC_LC_SIZE);
     if (!g_mem || !g_lc) rt_fatal("out of memory");

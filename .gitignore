@@ -39,3 +39,4 @@ recomp-probe/sample_generated.rs
 
 # Saves and other per-user data written by the recompiled game
 user/
+dist/

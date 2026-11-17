@@ -369,6 +369,11 @@ void video_copy_segment(GxFrame *frame) {
 
 /* ---- renderer --------------------------------------------------------------------------------- */
 static SDL_Window *g_window;
+static int g_fullscreen, g_window_w = 1280, g_window_h = 960;
+void video_set_window(int fullscreen, int w, int h) {
+    g_fullscreen = fullscreen;
+    if (w > 0 && h > 0) { g_window_w = w; g_window_h = h; }
+}
 static GLuint g_vao, g_vbo, g_efb_fbo, g_efb_color, g_efb_depth, g_white;
 static GLuint *g_textures; /* GxTexture id -> GL name */
 static uint32_t g_ntextures;
@@ -793,7 +798,9 @@ static int render_thread(void *arg) {
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
     SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
     g_window = SDL_CreateWindow("Star Fox: Assault (recompiled)", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
-                                1280, 960, SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE);
+                                g_window_w, g_window_h,
+                                SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE |
+                                    (g_fullscreen ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0));
     if (!g_window) rt_fatal("SDL_CreateWindow: %s", SDL_GetError());
     SDL_GLContext gl = SDL_GL_CreateContext(g_window);
     if (!gl) rt_fatal("SDL_GL_CreateContext: %s", SDL_GetError());
@@ -812,7 +819,12 @@ static int render_thread(void *arg) {
         SDL_Event e;
         while (SDL_PollEvent(&e)) {
             if (e.type == SDL_QUIT) g_quit = 1;
-            else if (e.type == SDL_CONTROLLERDEVICEADDED && !g_controller) {
+            else if (e.type == SDL_KEYDOWN && !e.key.repeat &&
+                     (e.key.keysym.sym == SDLK_F11 ||
+                      (e.key.keysym.sym == SDLK_RETURN && (e.key.keysym.mod & KMOD_ALT)))) {
+                g_fullscreen = !g_fullscreen; /* F11 or Alt+Enter: toggle fullscreen */
+                SDL_SetWindowFullscreen(g_window, g_fullscreen ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0);
+            } else if (e.type == SDL_CONTROLLERDEVICEADDED && !g_controller) {
                 g_controller = SDL_GameControllerOpen(e.cdevice.which);
                 if (g_controller) printf("[video] controller: %s\n", SDL_GameControllerName(g_controller));
             } else if (e.type == SDL_CONTROLLERDEVICEREMOVED && g_controller &&

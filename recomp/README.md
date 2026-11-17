@@ -190,13 +190,15 @@ The generator also emits **extra entry points** for calls into the middle of a f
    (about 15% of the guest's time).
 3. **Indirect textures** (the TEV indirect stages, BP `0x10`–`0x27`). Unused through the front end and Mission 1
    (0 of 27 million draws), so this waits until a later stage needs it.
-4. **Packaging:** a release build layout. Linux builds and runs headless (see *Linux and Steam Deck*);
-   still to do: the windowed renderer on Linux and a test on the Steam Deck itself.
+4. **Steam Deck:** release packages exist (see *Release packages*); still to do: the windowed renderer
+   on Linux and a test on the Deck itself (controls, fullscreen under gamescope, speed).
 5. **Longer play:** later parts and bosses of each mission, VS mode menus and the bonus games are
    untested (they need real play, or menu scripts that wait for each menu to accept input).
 
 ### Debugging aids
 
+- **`--help`** lists the options. **`--fullscreen`** and **`--window=WxH`** set up the window; F11 or
+  Alt+Enter toggles fullscreen.
 - **`--dump-frames`, `--no-video`, `--auto-press`.**
 - **`--auto-keys=start,w,down,a,…`** presses one button per 1.5 s step from launch (`w` waits), then
   hands over to `--auto-press`. Directions also move the stick. Menus ignore input for a moment after
@@ -248,6 +250,19 @@ For the Steam Deck, the binary needs glibc 2.34 or newer (its newest symbol is `
 `libSDL2-2.0.so.0`, which SteamOS has. Copy `build/linux/sfa` to the Deck and run it from a folder that
 holds `orig/GF7E01/` (your extracted disc) and `user/` (saves, fonts). If it won't start there, build
 inside Valve's Steam Runtime SDK or on the Deck itself.
+
+### Release packages
+
+`python recomp/tools/package.py` (on Windows) or `python3 recomp/tools/package.py` (on Linux, after the
+Linux build) makes `dist/sfa-recomp-<platform>/` and a `.zip`/`.tar.gz` of it (about 11 MB). It holds the
+executable (stripped on Linux; `SDL2.dll` on Windows), `sfa.sh` on Linux (starts fullscreen), empty
+`orig/GF7E01/` and `user/fonts/` folders and `PLAY.txt` with the setup steps, controls and options. It
+never contains game data: players extract their own disc into `orig/GF7E01/`. `--with-fonts` also copies
+the replacement fonts from `user/fonts/` with their license.
+
+When `orig/GF7E01/sys/main.dol` isn't found from the current directory, the executable switches to its own
+folder, so a package runs from a shortcut, a file manager or Steam (tested on Windows and in WSL Debian:
+the packaged binary run from another directory boots and keeps its save in the package's `user/`).
 
 The generated code is derived from the game's code, so it stays under `build/` and is never committed.
 Regenerate it from your own dump.
