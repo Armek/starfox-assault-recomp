@@ -454,6 +454,8 @@ static const SDL_Color WHITE = {235, 245, 255, 255}, CYAN = {90, 230, 255, 255},
                        GREEN = {120, 255, 140, 255}, RED = {255, 110, 100, 255}, GOLD = {255, 210, 90, 255};
 
 int launcher_run(const char *found_disc, int *fullscreen_io, char *disc_out, size_t disc_n) {
+    SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
+    SDL_SetHint("SDL_JOYSTICK_HIDAPI_STEAMDECK", "1"); /* the Deck's own controls, also when not started from Steam */
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS | SDL_INIT_GAMECONTROLLER) != 0) return -1;
     load_settings();
     if (*fullscreen_io) g_fullscreen = 1;

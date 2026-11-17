@@ -874,6 +874,17 @@ static void render(GxFrame *f) {
     }
 }
 
+/* Open the first connected game controller. Controllers already connected when the game starts
+ * don't send an "added" event here (the start screen took those), so look for them directly. */
+static void open_first_controller(void) {
+    for (int i = 0; i < SDL_NumJoysticks() && !g_controller; i++)
+        if (SDL_IsGameController(i)) {
+            g_controller = SDL_GameControllerOpen(i);
+            if (g_controller) printf("[video] controller: %s\n", SDL_GameControllerName(g_controller));
+        }
+    fflush(stdout);
+}
+
 static int render_thread(void *arg) {
     (void)arg;
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
@@ -898,6 +909,7 @@ static int render_thread(void *arg) {
 #endif
     }
 
+    open_first_controller();
     while (!g_quit) {
         SDL_Event e;
         while (SDL_PollEvent(&e)) {
@@ -917,6 +929,7 @@ static int render_thread(void *arg) {
                 SDL_LockMutex(g_pad_lock);
                 memset(&g_ctl, 0, sizeof g_ctl);
                 SDL_UnlockMutex(g_pad_lock);
+                open_first_controller(); /* another one may still be connected */
             }
         }
         poll_keyboard();
@@ -938,6 +951,7 @@ static int render_thread(void *arg) {
 void video_start(int dump_frames) {
     g_dump = dump_frames;
     SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
+    SDL_SetHint("SDL_JOYSTICK_HIDAPI_STEAMDECK", "1"); /* the Deck's own controls, also when not started from Steam */
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS | SDL_INIT_GAMECONTROLLER) != 0) rt_fatal("SDL_Init: %s", SDL_GetError());
     if (SDL_InitSubSystem(SDL_INIT_AUDIO) == 0) {
         SDL_AudioSpec want = {0}, have;
