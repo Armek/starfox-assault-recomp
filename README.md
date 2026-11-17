@@ -65,7 +65,7 @@ On Linux, `wine` or `wibo` is downloaded automatically for the compilers.
 [recomp/](recomp/README.md) translates `main.dol` to C and links it into a native executable.
 Milestones 1-4 are done: the recompiled game, REL level modules included, runs natively with an
 OpenGL GX renderer (full TEV), AX audio through SDL, keyboard and controller input and an emulated
-memory card. It plays through the front end into Mission 1 gameplay at its 30 fps cap.
+memory card. It plays through the front end into all ten missions, at 60 fps in flight stages and 30 in ground stages.
 
 ## See also
 

@@ -252,6 +252,15 @@ void video_get_pad(int port, PadState *out) {
 static SDL_AudioDeviceID g_audio;
 
 /* 32 kHz interleaved stereo from the AI DMA (host-endian samples). */
+#define AUDIO_RING 16000   /* frames: 0.5 s at 32 kHz */
+#define AUDIO_TARGET 3200  /* frames buffered ahead of the device: 100 ms */
+static int16_t g_ring[AUDIO_RING][2];
+static int g_ring_read, g_ring_write, g_ring_fill, g_audio_waiting = 1;
+static double g_audio_frac;
+static int16_t g_audio_last[2];
+static unsigned g_audio_underruns, g_audio_drops;
+static SDL_SpinLock g_ring_lock;
+
 void video_audio_push(const int16_t *pcm, int frames) {
     static FILE *wav;
     static uint32_t wav_frames;
@@ -274,8 +283,65 @@ void video_audio_push(const int16_t *pcm, int frames) {
         }
     }
     if (!g_audio || frames <= 0) return;
-    if (SDL_GetQueuedAudioSize(g_audio) > 32000 * 4 / 6) return; /* > ~150 ms queued: drop, don't lag */
-    SDL_QueueAudio(g_audio, pcm, (Uint32)frames * 4);
+    SDL_AtomicLock(&g_ring_lock);
+    for (int i = 0; i < frames; i++) {
+        if (g_ring_fill == AUDIO_RING) { /* far too much buffered (the device stalled): drop the oldest */
+            g_ring_read = (g_ring_read + 1) % AUDIO_RING;
+            g_ring_fill--;
+            g_audio_drops++;
+        }
+        g_ring[g_ring_write][0] = pcm[2 * i];
+        g_ring[g_ring_write][1] = pcm[2 * i + 1];
+        g_ring_write = (g_ring_write + 1) % AUDIO_RING;
+        g_ring_fill++;
+    }
+    SDL_AtomicUnlock(&g_ring_lock);
+}
+
+/* The audio device pulls from the ring at a fixed latency target. The game's sample clock and the
+ * sound card drift apart slightly, so instead of dropping or repeating samples (audible clicks) the
+ * read rate is nudged by up to 0.5% toward the target fill, with linear interpolation. After running
+ * dry it fades out and waits until the target is buffered again before resuming. */
+static void audio_callback(void *user, Uint8 *stream, int len) {
+    (void)user;
+    int16_t *out = (int16_t *)stream;
+    int n = len / 4;
+    SDL_AtomicLock(&g_ring_lock);
+    if (g_audio_waiting && g_ring_fill >= AUDIO_TARGET) g_audio_waiting = 0;
+    if (g_ring_fill > AUDIO_TARGET * 4) { /* way behind (e.g. after a long stall): skip to the target */
+        int skip = g_ring_fill - AUDIO_TARGET;
+        g_ring_read = (g_ring_read + skip) % AUDIO_RING;
+        g_ring_fill -= skip;
+        g_audio_drops += (unsigned)skip;
+    }
+    double err = (double)(g_ring_fill - AUDIO_TARGET) / AUDIO_TARGET;
+    if (err > 1) err = 1;
+    if (err < -1) err = -1;
+    double step = 1.0 + 0.005 * err;
+    for (int i = 0; i < n; i++) {
+        if (g_audio_waiting || g_ring_fill < 2) {
+            if (!g_audio_waiting) { g_audio_waiting = 1; g_audio_underruns++; }
+            /* fade the last sample out instead of jumping to silence */
+            g_audio_last[0] = (int16_t)(g_audio_last[0] * 15 / 16);
+            g_audio_last[1] = (int16_t)(g_audio_last[1] * 15 / 16);
+            out[2 * i] = g_audio_last[0];
+            out[2 * i + 1] = g_audio_last[1];
+            continue;
+        }
+        int a = g_ring_read, b = (g_ring_read + 1) % AUDIO_RING;
+        double f = g_audio_frac;
+        for (int c = 0; c < 2; c++) {
+            double v = g_ring[a][c] + (g_ring[b][c] - g_ring[a][c]) * f;
+            out[2 * i + c] = g_audio_last[c] = (int16_t)v;
+        }
+        g_audio_frac += step;
+        while (g_audio_frac >= 1.0 && g_ring_fill >= 2) {
+            g_audio_frac -= 1.0;
+            g_ring_read = (g_ring_read + 1) % AUDIO_RING;
+            g_ring_fill--;
+        }
+    }
+    SDL_AtomicUnlock(&g_ring_lock);
 }
 
 /* ---- frame queue --------------------------------------------------------------------------------- */
@@ -369,6 +435,7 @@ void video_copy_segment(GxFrame *frame) {
 
 /* ---- renderer --------------------------------------------------------------------------------- */
 static SDL_Window *g_window;
+static unsigned g_shader_compiles; /* TEV programs built (each can stall a frame) */
 static int g_fullscreen, g_window_w = 1280, g_window_h = 960;
 void video_set_window(int fullscreen, int w, int h) {
     g_fullscreen = fullscreen;
@@ -550,6 +617,7 @@ static TevProgram *tev_program(const GxTevConfig *cfg) {
     glAttachShader(p->prog, compile(GL_FRAGMENT_SHADER, fs));
     free(fs);
     glLinkProgram(p->prog);
+    g_shader_compiles++;
     glUseProgram(p->prog);
     for (int i = 0; i < 8; i++) {
         char name[8];
@@ -774,19 +842,34 @@ static void render(GxFrame *f) {
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
     SDL_GL_SwapWindow(g_window);
 
-    /* SFA_FPS=1: presented frames per second, every 5 s of wall time */
+    /* SFA_FPS=1: every 5 s of wall time, the presented frame rate, hitches (the longest gap between
+     * frames, and how many gaps exceeded 50 ms), shader compiles, texture uploads and audio trouble */
     static int show_fps = -1;
-    static uint32_t fps_start, fps_frames;
+    static uint32_t fps_start, fps_frames, last_present, worst, slow, uploads;
+    static unsigned last_compiles, last_underruns, last_drops;
     if (show_fps < 0) show_fps = getenv("SFA_FPS") != NULL;
     if (show_fps) {
         uint32_t now = SDL_GetTicks();
         if (!fps_start) fps_start = now;
+        if (last_present) {
+            uint32_t gap = now - last_present;
+            if (gap > worst) worst = gap;
+            if (gap > 50) slow++;
+        }
+        last_present = now;
+        uploads += f->nuploads;
         fps_frames++;
         if (now - fps_start >= 5000) {
-            printf("[fps] %.1f presented frames/s (frame %u)\n", fps_frames * 1000.0 / (now - fps_start), f->number);
+            printf("[fps] %.1f frames/s (frame %u); longest gap %u ms, %u gaps > 50 ms; %u shader compiles, "
+                   "%u texture uploads; audio %u underruns, %u frames dropped\n",
+                   fps_frames * 1000.0 / (now - fps_start), f->number, worst, slow, g_shader_compiles - last_compiles,
+                   uploads, g_audio_underruns - last_underruns, g_audio_drops - last_drops);
             fflush(stdout);
             fps_start = now;
-            fps_frames = 0;
+            fps_frames = worst = slow = uploads = 0;
+            last_compiles = g_shader_compiles;
+            last_underruns = g_audio_underruns;
+            last_drops = g_audio_drops;
         }
     }
 }
@@ -862,6 +945,7 @@ void video_start(int dump_frames) {
         want.format = AUDIO_S16SYS;
         want.channels = 2;
         want.samples = 512;
+        want.callback = audio_callback;
         g_audio = SDL_OpenAudioDevice(NULL, 0, &want, &have, 0);
         if (g_audio) {
             SDL_PauseAudioDevice(g_audio, 0);

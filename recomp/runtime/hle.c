@@ -24,8 +24,11 @@ HLE(__OSInitAudioSystem) { (void)c; }
 /* void __OSInitMemoryProtection(void): MMU/BAT and MI setup through RealMode()/rfi. */
 HLE(__OSInitMemoryProtection) { (void)c; }
 
-/* void GXDrawDone(void): flush and wait for the GPU. With no GPU, the work is done immediately. */
-HLE(GXDrawDone) { F_GXFlush(c); }
+/* void GXDrawDone(void): flush and wait for the GPU (here, the GX thread). */
+HLE(GXDrawDone) {
+    F_GXFlush(c);
+    gx_sync(); /* the commands run on the GX thread: wait for them, like waiting for the GPU */
+}
 
 /* u32 PADRead(PADStatus status[4]). PADStatus (12 bytes): u16 button; s8 stickX, stickY,
  * substickX, substickY; u8 triggerL, triggerR, analogA, analogB; s8 err. Input comes from the

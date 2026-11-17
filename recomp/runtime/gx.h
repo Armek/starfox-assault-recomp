@@ -108,6 +108,7 @@ int video_quit_requested(void);
 
 /* gx.c */
 void gx_fifo_write(uint32_t value, int size);  /* a write to the 0xCC008000 pipe */
+void gx_sync(void);  /* wait until the GX thread has run everything queued (GXDrawDone) */
 void gx_init(void);
 void gx_pi_wptr_write(uint32_t v);   /* PI FIFO write pointer (0xCC003014) */
 uint32_t gx_pi_wptr_read(void);

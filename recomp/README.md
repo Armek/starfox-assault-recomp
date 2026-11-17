@@ -18,9 +18,14 @@ host runtime into a native executable. This is the route toward a PC / Linux / S
   - the **Mission 1 briefing** ("Mission 1: Take Out Oikonny"), loading `m9.rel`, `fpc/s_01_01.fpc` and the map data.
 - **Milestone 4:** audio, and the game reaches **Mission 1 gameplay** ("01 — A New Enemy — Fortuna").
   - It shows the Arwing in combat with the fleet, the full HUD, wingman tags and the pause menu.
-  - Music and sound effects play through SDL.
-  - The mission runs at its 30 fps cap (`SFA_FPS=1` shows 28–38 presented frames/s); the guest CPU is
-    idle about 32% of the time waiting for the retrace.
+  - Music and sound effects play through SDL. The audio device pulls from a ring buffer kept about
+    100 ms ahead; clock drift between the game and the sound card is absorbed by nudging the read rate
+    (±0.5%, interpolated) instead of dropping chunks, and a stall that empties it fades out and refills
+    before resuming. (Before, a queue that started empty and dropped whole chunks past 150 ms crackled.)
+  - Flight stages run at 60 fps and hold it through comm scenes (`SFA_FPS=1`: 59.8–60 frames/s); ground
+    stages run at a steady 30, their own rate. GX commands run on their own thread (see *GX thread*);
+    before that, GX work on the game's thread pushed some frames past 16.7 ms when comm portraits were on
+    screen, and the frame rate dipped to about 40–50.
   - Models are lit with the real GX lighting model (per-vertex lights, attenuation and diffuse functions).
   - The 3D comm portraits (Falco, Slippy, …) and the Arwing's shadow render through EFB-to-texture copies.
 - **System font:** the SDK reads the console's boot-ROM font (`OSInitFont`/`OSLoadFont`). `__OSReadROM` is HLE and
@@ -114,8 +119,15 @@ frame has about 20,000 small draws (fleet, lasers, particles, HUD).
   2.1–2.3 s, waiting on EFB-to-texture copies about 0.8 s, batching about 0.3 s, and the guest idles about
   32%. The "state" figure (about 0.6 s) is mostly the profiler's own clock reads. (Earlier figures in this
   history were per 10,000 profiler samples, about 19 s of wall time, not per 10 s.)
-- **Further headroom:** a GPU vertex shader would take most of the vertex time off the guest thread. The
-  game matches its 30 fps cap on this PC, so this matters for slower CPUs (the Steam Deck) rather than here.
+- **GX thread:** like the real GPU, GX commands run on their own thread. The game's thread only appends
+  pipe bytes to an 8 MB ring (and records display lists itself, which must happen in program order); the
+  GX thread parses and executes them: vertex transform, batching, EFB copies (it waits for the renderer,
+  not the game) and frame submission. The game sees GX progress only through the PE token register,
+  which it polls, and `GXDrawDone`, which now waits until everything queued has run. `SFA_GX_SYNC=1`
+  runs the commands on the game's thread as before.
+- **Remaining hitches:** shader compiles, the first time a new TEV setup appears (28 at once when Mission
+  1's effects first show cause a ~70 ms frame), and loading screens. Texture decoding is minor (about
+  2 ms a second).
   Matrices change about every 18 draws (about 6,000 matrix loads a second), so it needs per-draw matrix
   snapshots in a buffer the shader indexes, not one uniform set per batch.
 
@@ -184,8 +196,8 @@ The generator also emits **extra entry points** for calls into the middle of a f
 
 ## Next
 
-1. **Performance:** GPU-side vertex transform, for headroom on slower CPUs (the game already holds its
-   30 fps cap here; measure on the Steam Deck first).
+1. **Performance:** a disk cache for compiled shaders (removes the first-time hitches), and GPU-side
+   vertex transform if the Steam Deck needs more headroom.
 2. **Performance:** keep EFB-to-texture copies on the GPU instead of reading them back synchronously
    (about 15% of the guest's time).
 3. **Indirect textures** (the TEV indirect stages, BP `0x10`–`0x27`). Unused through the front end and Mission 1
@@ -210,7 +222,8 @@ The generator also emits **extra entry points** for calls into the middle of a f
 - **`SFA_GX_FRAMEDUMP=<n>`** lists every batch of frame *n*.
 - **`SFA_PROFILE=1`** prints the hottest guest functions, the GX stage times, GX frames built and the
   time spent waiting on EFB-to-texture copies, every 10 s of wall time.
-- **`SFA_FPS=1`** prints the presented frame rate every 5 s.
+- **`SFA_FPS=1`** prints, every 5 s, the presented frame rate, the longest gap between frames and how
+  many exceeded 50 ms, shader compiles, texture uploads, and audio underruns and dropped samples.
 - **`SFA_AX_DEBUG=1`** logs AX frame and AI buffer counts. **`SFA_DUMP_AUDIO=1`** writes everything
   played to `build/GF7E01/audio.wav`.
 - **`SFA_GX_TEXADDR=<hex>`** shows which code binds that texture address and which display list sets it.

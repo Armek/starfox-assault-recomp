@@ -12,6 +12,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <SDL.h>
 #include "funcs.h"
 #include "runtime.h"
 #include "gx.h"
@@ -169,6 +170,9 @@ static uint8_t *decode_texture(uint32_t addr, uint32_t fmt, uint32_t w, uint32_t
     return out;
 }
 
+static uint64_t ticks(void);
+static uint64_t g_t_decode, g_t_ndecode, g_t_decode_px; /* texture decode time (profiling) */
+
 /* Texture map n -> GxTexture id (decoding and queueing an upload if new or changed). */
 static uint32_t texture_for_map(int n) {
     uint32_t base_image0 = n < 4 ? 0x88 + n : 0xA8 + (n - 4);
@@ -228,7 +232,11 @@ static uint32_t texture_for_map(int n) {
     GROW(f->uploads, f->nuploads, f->cap_uploads, 64);
     GxTextureUpload *u = &f->uploads[f->nuploads++];
     u->id = e->id; u->width = w; u->height = h;
+    uint64_t td = ticks();
     u->rgba = decode_texture(addr, fmt, w, h, pal, tlut_fmt);
+    g_t_decode += ticks() - td;
+    g_t_ndecode++;
+    g_t_decode_px += (uint64_t)w * h;
     if (g_dbg) {
         uint32_t nz = 0;
         for (uint32_t q = 0; q < size && q < 4096; q++) nz += rd8(addr + q) != 0;
@@ -755,6 +763,9 @@ void gx_profile_report(void) {
     printf("[prof] gx: %llu draws, %llu vertices; state %.0f ms, vertices %.0f ms, batching %.0f ms (per 10 s)\n",
            (unsigned long long)g_t_calls, (unsigned long long)g_t_verts, g_t_state / 40500.0, g_t_vtx / 40500.0,
            g_t_emit / 40500.0);
+    printf("[prof] gx: %llu texture decodes (%.1f Mpixels), %.0f ms (per 10 s)\n", (unsigned long long)g_t_ndecode,
+           g_t_decode_px / 1e6, g_t_decode / 40500.0);
+    g_t_decode = g_t_ndecode = g_t_decode_px = 0;
     static uint32_t last_frames;
     printf("[prof] gx: %u frames (%.1f fps); %llu EFB-to-texture copies, guest waited %.0f ms (per 10 s)\n",
            g_frame_number - last_frames, (g_frame_number - last_frames) / 10.0, (unsigned long long)g_t_ncopy,
@@ -1165,16 +1176,14 @@ static int recording_display_list(void) {
     return pi_base && cp_base && pi_base != cp_base;
 }
 
-void gx_fifo_write(uint32_t value, int size) {
-    if (recording_display_list()) {
-        for (int i = size - 1; i >= 0; i--) wr8(0x80000000u | g_dl_ptr++, (uint8_t)(value >> (i * 8)));
-        return;
-    }
-    if (g_fifo_len + 8 > g_fifo_cap) {
-        g_fifo_cap = g_fifo_cap ? g_fifo_cap * 2 : 1 << 16;
+/* Append bytes to the parse buffer and execute every complete command in it. */
+static void fifo_consume(const uint8_t *bytes, size_t n) {
+    if (g_fifo_len + n > g_fifo_cap) {
+        while (g_fifo_len + n > g_fifo_cap) g_fifo_cap = g_fifo_cap ? g_fifo_cap * 2 : 1 << 16;
         g_fifo = realloc(g_fifo, g_fifo_cap);
     }
-    for (int i = size - 1; i >= 0; i--) g_fifo[g_fifo_len++] = (uint8_t)(value >> (i * 8));
+    memcpy(g_fifo + g_fifo_len, bytes, n);
+    g_fifo_len += n;
     size_t used = run_commands(g_fifo, g_fifo_len, 0, 0);
     if (used) {
         memmove(g_fifo, g_fifo + used, g_fifo_len - used);
@@ -1182,8 +1191,93 @@ void gx_fifo_write(uint32_t value, int size) {
     }
 }
 
+/* ---- GX thread -------------------------------------------------------------------------------
+ * Like the real GPU, the commands run on their own thread: the game's thread only appends pipe
+ * bytes to a ring (and records display lists, which must happen in program order), and the GX
+ * thread parses and executes them: vertex transform, batching, EFB copies (waiting for the
+ * renderer) and frame submission. The game observes GX progress only through the PE token
+ * register, which it polls, and GXDrawDone, which waits until everything queued so far has run.
+ * SFA_GX_SYNC=1 runs the commands on the game's thread instead (the old behaviour). */
+#define GX_RING (8u << 20)
+static uint8_t *g_ring;
+static SDL_atomic_t g_ring_w, g_ring_r, g_ring_done; /* bytes written, taken, fully executed */
+static SDL_atomic_t g_gx_sleeping;
+static SDL_sem *g_gx_wake;
+static int g_gx_threaded;
+static uint32_t g_ring_wlocal; /* producer's private copy of g_ring_w */
+
+static int gx_thread(void *arg) {
+    (void)arg;
+    static uint8_t chunk[1 << 16];
+    uint32_t r = 0;
+    for (;;) {
+        uint32_t w = (uint32_t)SDL_AtomicGet(&g_ring_w);
+        if (w == r) {
+            /* nothing queued: spin briefly (the game writes in bursts), then sleep until woken */
+            int spins = 0;
+            while ((uint32_t)SDL_AtomicGet(&g_ring_w) == r && spins++ < 2000) SDL_CPUPauseInstruction();
+            if ((uint32_t)SDL_AtomicGet(&g_ring_w) == r) {
+                SDL_AtomicSet(&g_gx_sleeping, 1);
+                if ((uint32_t)SDL_AtomicGet(&g_ring_w) == r) SDL_SemWaitTimeout(g_gx_wake, 2);
+                SDL_AtomicSet(&g_gx_sleeping, 0);
+            }
+            continue;
+        }
+        uint32_t n = w - r;
+        if (n > sizeof chunk) n = sizeof chunk;
+        for (uint32_t k = 0; k < n; k++) chunk[k] = g_ring[(r + k) & (GX_RING - 1)];
+        r += n;
+        SDL_AtomicSet(&g_ring_r, (int)r);
+        fifo_consume(chunk, n);
+        SDL_AtomicSet(&g_ring_done, (int)r);
+    }
+    return 0;
+}
+
+static void gx_wake(void) {
+    if (SDL_AtomicGet(&g_gx_sleeping)) SDL_SemPost(g_gx_wake);
+}
+
+/* Wait until the GX thread has executed everything queued so far (GXDrawDone). */
+void gx_sync(void) {
+    if (!g_gx_threaded) return;
+    uint32_t target = g_ring_wlocal;
+    while ((uint32_t)SDL_AtomicGet(&g_ring_done) != target) {
+        gx_wake();
+        SDL_Delay(0);
+    }
+}
+
+void gx_fifo_write(uint32_t value, int size) {
+    if (recording_display_list()) {
+        for (int i = size - 1; i >= 0; i--) wr8(0x80000000u | g_dl_ptr++, (uint8_t)(value >> (i * 8)));
+        return;
+    }
+    uint8_t b[4];
+    for (int i = 0; i < size; i++) b[i] = (uint8_t)(value >> ((size - 1 - i) * 8));
+    if (!g_gx_threaded) {
+        fifo_consume(b, (size_t)size);
+        return;
+    }
+    uint32_t w = g_ring_wlocal;
+    while (w + (uint32_t)size - (uint32_t)SDL_AtomicGet(&g_ring_r) > GX_RING) { /* ring full: let it drain */
+        gx_wake();
+        SDL_Delay(0);
+    }
+    for (int i = 0; i < size; i++) g_ring[(w + (uint32_t)i) & (GX_RING - 1)] = b[i];
+    g_ring_wlocal = w + (uint32_t)size;
+    SDL_AtomicSet(&g_ring_w, (int)g_ring_wlocal);
+    gx_wake();
+}
+
 void gx_init(void) {
     dbg_init();
     bp[0x41] = 0x18; /* color and alpha update */
     bp[0x40] = 0x17; /* z test LEQUAL with update */
+    if (!getenv("SFA_GX_SYNC")) {
+        g_ring = malloc(GX_RING);
+        g_gx_wake = SDL_CreateSemaphore(0);
+        if (g_ring && g_gx_wake && SDL_CreateThread(gx_thread, "gx", NULL)) g_gx_threaded = 1;
+    }
+    printf("[gx] commands run on %s\n", g_gx_threaded ? "their own thread" : "the game's thread");
 }
