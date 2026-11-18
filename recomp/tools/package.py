@@ -30,9 +30,10 @@ Setup
    Dolphin, choose Convert File..., and pick ISO. (An extracted disc also works: Dolphin's
    Properties > Filesystem > Extract Entire Disc, placed here as orig/GF7E01/sys and orig/GF7E01/files.)
 2. Run {run}. A start screen comes up (mouse, keyboard or controller):
-     GAME DISC    finds an .iso next to the program by itself, or browse to yours
-     DISPLAY      window or fullscreen
-     PLAY         start the game (START on a controller)
+     Game disc    finds an .iso next to the program by itself; Browse... opens your system's
+                  file dialog (with a controller, or in the Deck's Game Mode, a built-in browser)
+     Display      window or fullscreen
+     Play         start the game (START on a controller)
    Your choices are remembered in user/launcher.cfg. To skip the start screen, run with --play
    or name the disc image on the command line.
 

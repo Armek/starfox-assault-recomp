@@ -227,8 +227,10 @@ The generator also emits **extra entry points** for calls into the middle of a f
 ### Debugging aids
 
 - **`SFA_LAUNCHER_SCRIPT=down,enter,…`** drives the start screen for testing: every 0.6 s it saves
-  `build/GF7E01/launcher_NN.bmp` and presses the next key (`up down pgdn enter esc start`); it quits
-  after the last one.
+  `build/GF7E01/launcher_NN.bmp` and presses the next key (`up down left right pgdn enter esc start`;
+  anything else waits a step); it quits after the last one. Scripts use the built-in browser unless
+  `SFA_LAUNCHER_DIALOG=1` is set too. With `SDL_VIDEODRIVER=offscreen` (Linux) it runs without a window;
+  a stand-in `zenity` on `PATH` then tests the system-dialog path.
 - **`--help`** lists the options. **`--fullscreen`** and **`--window=WxH`** set up the window; F11 or
   Alt+Enter toggles fullscreen.
 - **`--dump-frames`, `--no-video`, `--auto-press`.**
@@ -300,14 +302,20 @@ executable (stripped on Linux; `SDL2.dll` on Windows), `sfa.sh` on Linux (starts
 never contains game data: players put their own disc image next to the executable, and that's all.
 
 **Start screen** (`launcher.c`): started without a disc on the command line, the program first shows a
-launcher: a warp starfield, the title, and PLAY / GAME DISC / DISPLAY / QUIT. It uses SDL's 2D
-renderer and a built-in 5x7 pixel font, so it needs no files, and works with the mouse, the keyboard or a
-controller (the Steam Deck in Gaming Mode). GAME DISC opens a file browser (places: program folder, home,
-Desktop, Downloads, drives on Windows, `/run/media/$USER` and `/media` on Linux) that shows folders and
-`.iso`/`.gcm` files, offers an extracted disc folder as one entry, and greys out compressed images with a
-note to convert them. A picked disc is checked at once (disc ID GF7E01, and the DOL's size and CRC32), so a
-wrong disc is refused there with the reason. DISPLAY picks window or
-fullscreen. The choices are kept in `user/launcher.cfg`. `--play`, a disc on the command line, any testing
+launcher: a dark gradient with a slow starfield and a planet's glow, the title, a game disc card (the
+disc, its status and Browse…), a Window/Fullscreen switch, and Play and Quit. It uses SDL's 2D renderer
+and needs no files: text is drawn with the system font compiled into the program (Droid Sans: the IPL
+font is Yay0-decompressed and its 2-bit sheet copied into an atlas at 1x, and at 3x upscaled with sharpened
+edges for large text), and rounded shapes come from a generated disc texture. It works with the mouse
+(hover highlights), the keyboard and a controller (a focus ring marks the selected control; button badges
+in the footer). Browse… opens the system's file dialog on its own thread, so the screen keeps drawing:
+Windows' Open dialog (`GetOpenFileName`), or on Linux `kdialog` (KDE, the Steam Deck's desktop) or
+`zenity`, started without `LD_PRELOAD`/`LD_LIBRARY_PATH` so the Steam overlay and runtime stay out of it.
+With a controller, in the Deck's Game Mode (gamescope), or when no dialog program exists, a built-in
+browser opens instead (places: program folder, home, Desktop, Downloads, drives on Windows,
+`/run/media/$USER` and `/media` on Linux), showing folders and `.iso`/`.gcm` files, an extracted disc
+folder as one entry, and compressed images marked for conversion. A picked disc is checked at once (disc
+ID GF7E01, and the DOL's size and CRC32), so a wrong disc is refused there with the reason. The choices are kept in `user/launcher.cfg`. `--play`, a disc on the command line, any testing
 option or `SFA_NO_LAUNCHER=1` skips it; if no window can be opened, the program looks for the game as below.
 Tested on Windows: picking the test ISO in the browser and pressing START boots from it, and a disc with one
 changed DOL byte shows "different version of the game".
