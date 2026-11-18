@@ -161,6 +161,29 @@ void rt_console_putc(char ch) { fputc(ch, stdout); if (ch == '\n') fflush(stdout
 uint32_t g_watch_lo = 0xFFFFFFFFu, g_watch_len = 0;
 void rt_watch_hit(uint32_t addr, uint32_t value, int size) {
     static unsigned hits, zero;
+    static int nan_only = -1; /* SFA_WATCH_NAN=1: only 32-bit writes of an infinite float (=2: or a NaN,
+                               * though -1 markers look like NaNs) */
+    if (nan_only < 0) { const char *s = getenv("SFA_WATCH_NAN"); nan_only = s ? atoi(s) : 0; }
+    if (nan_only && (size != 4 || ((value >> 23) & 0xFF) != 0xFF)) return;
+    if (nan_only == 1 && (value & 0x7FFFFF)) return;
+    if (nan_only) { /* and the guest call stack: these come from deep in shared engine code */
+        Ctx *c = rt_current_ctx();
+        if (c && hits < 60) {
+            printf("[watch] write %08X = %08X (%s) by %s (lr %08X; f0-f5 %g %g %g %g %g %g)", addr, value,
+                   (value & 0x7FFFFF) ? "NaN" : "inf", rt_func_containing(c->lr), c->lr, c->f[0].ps0, c->f[1].ps0,
+                   c->f[2].ps0, c->f[3].ps0, c->f[4].ps0, c->f[5].ps0);
+            for (uint32_t sp = c->r[1], k = 0; k < 10 && sp && ppc_is_ram(sp); k++) {
+                uint32_t next = rd32(sp);
+                if (!ppc_is_ram(next) || next <= sp) break;
+                printf(" < %s", rt_func_containing(rd32(next + 4)));
+                sp = next;
+            }
+            printf("\n");
+            fflush(stdout);
+        }
+        hits++;
+        return;
+    }
     if (!value) { /* zero fills (heap clears) are summarised, not listed */
         if ((++zero & 0xFFF) == 1) printf("[watch] %u zero writes so far (latest %08X)\n", zero, addr);
         return;
@@ -255,8 +278,125 @@ const char *rt_func_name(uint32_t addr) {
     return e ? e->name : "?";
 }
 
+/* SFA_COUNT_CALLS=<name prefix> (testing), e.g. "mb01b:": count calls to the functions whose names
+ * start with it (their generated addresses), and print the counts with rt_count_report. */
+uint32_t g_count_lo, g_count_hi;
+static uint32_t *g_counts;
+
+/* SFA_PROBE=<hex address> (testing, with SFA_COUNT_CALLS covering it): every 997th call of that function,
+ * print the 0x120 bytes its first argument (r3) points to, as floats and hex */
+static uint32_t g_probe_addr;
+
+static uint32_t g_probe_every = 997;
+
+/* SFA_PROBE_NAN=1: instead, keep each object's last copy while the float at +0x80 is a number, and the
+ * first time it is NaN print that copy and the current one (up to 12 objects), to see what broke it */
+static int g_probe_nan;
+static uint32_t g_probe_field = 0x80; /* SFA_PROBE_FIELD=<hex offset> */
+typedef struct { uint32_t obj, reported; uint8_t data[0x120]; } ProbeSnap;
+static ProbeSnap *g_snaps;
+#define PROBE_SNAPS 16384
+
+static void probe_nan(Ctx *c, uint32_t addr) {
+    static int reports;
+    uint32_t o = c->r[3];
+    if (!ppc_is_ram(o) || reports >= 12) return;
+    if (!g_snaps) g_snaps = calloc(PROBE_SNAPS, sizeof *g_snaps);
+    ProbeSnap *s = &g_snaps[((o >> 4) * 2654435761u >> 18) & (PROBE_SNAPS - 1)];
+    uint32_t w = rd32(o + g_probe_field);
+    int nan = ((w >> 23) & 0xFF) == 0xFF;
+    if (!nan) {
+        s->obj = o;
+        s->reported = 0;
+        for (int i = 0; i < 0x120; i++) s->data[i] = rd8(o + (uint32_t)i);
+        return;
+    }
+    if (s->obj != o || s->reported) return;
+    s->reported = 1;
+    reports++;
+    printf("[probe-nan] %s obj %08X: field +%X became NaN since the previous call. Changed words (before -> now):\n",
+           rt_func_name(addr), o, g_probe_field);
+    for (uint32_t k = 0; k < 0x120; k += 4) {
+        uint32_t before = (uint32_t)s->data[k] << 24 | s->data[k + 1] << 16 | s->data[k + 2] << 8 | s->data[k + 3];
+        uint32_t now = rd32(o + k);
+        if (before == now) continue;
+        float fb, fn;
+        memcpy(&fb, &before, 4);
+        memcpy(&fn, &now, 4);
+        printf("    +%03X: %08X (%g) -> %08X (%g)\n", k, before, fb, now, fn);
+    }
+    uint32_t p = o; /* the parent chain (+0x10): world (+0x70) and local (+0x80) positions */
+    for (int lvl = 0; lvl < 5 && ppc_is_ram(p); lvl++, p = rd32(p + 0x10)) {
+        float v[6];
+        for (int k = 0; k < 6; k++) { uint32_t x = rd32(p + (k < 3 ? 0x70 : 0x74) + 4 * k); memcpy(&v[k], &x, 4); }
+        printf("    level %d %08X: world (%g, %g, %g) local (%g, %g, %g)\n", lvl, p, v[0], v[1], v[2], v[3], v[4], v[5]);
+    }
+    fflush(stdout);
+}
+
+void rt_count_call(Ctx *c, uint32_t addr) {
+    uint32_t n = ++g_counts[(addr - g_count_lo) >> 2];
+    if (g_probe_nan && addr == g_probe_addr) { probe_nan(c, addr); return; }
+    if (addr != g_probe_addr || n % g_probe_every != 1 % g_probe_every || !ppc_is_ram(c->r[3])) return;
+    printf("[probe] %s #%u obj %08X:", rt_func_name(addr), n, c->r[3]);
+    for (int r = 4; r <= 6; r++) /* vector arguments, if r4-r6 point at RAM */
+        if (ppc_is_ram(c->r[r])) {
+            float v[3];
+            for (int k = 0; k < 3; k++) { uint32_t w = rd32(c->r[r] + 4 * k); memcpy(&v[k], &w, 4); }
+            printf(" r%d=%08X (%g, %g, %g)", r, c->r[r], v[0], v[1], v[2]);
+        }
+    for (uint32_t o = 0; o < 0x120; o += 4) {
+        uint32_t w = rd32(c->r[3] + o);
+        float f;
+        memcpy(&f, &w, 4);
+        if (o % 32 == 0) printf("\n   +%03X", o);
+        if (w && ((w >> 23) & 0xFF) > 0x60 && ((w >> 23) & 0xFF) < 0xA0) printf(" %10.4g", f);
+        else printf(" %10X", w);
+    }
+    printf("\n");
+    fflush(stdout);
+}
+
+static void count_init(void) {
+    const char *p = getenv("SFA_COUNT_CALLS");
+    if (!p || !*p) return;
+    uint32_t lo = 0xFFFFFFFFu, hi = 0;
+    for (unsigned i = 0; i < g_func_count; i++)
+        if (!strncmp(g_funcs[i].name, p, strlen(p))) {
+            if (g_funcs[i].addr < lo) lo = g_funcs[i].addr;
+            if (g_funcs[i].addr + 4 > hi) hi = g_funcs[i].addr + 4;
+        }
+    if (hi <= lo) { printf("[count] no functions named %s*\n", p); return; }
+    g_counts = calloc((hi - lo) / 4, sizeof *g_counts);
+    g_count_lo = lo;
+    g_count_hi = hi;
+    printf("[count] counting calls to %s* (%08X-%08X)\n", p, lo, hi);
+    const char *pr = getenv("SFA_PROBE");
+    if (pr) g_probe_addr = (uint32_t)strtoul(pr, NULL, 16);
+    const char *pe = getenv("SFA_PROBE_EVERY"); /* default: every 997th call */
+    if (pe && atoi(pe) > 0) g_probe_every = (uint32_t)atoi(pe);
+    g_probe_nan = getenv("SFA_PROBE_NAN") != NULL;
+    const char *pf = getenv("SFA_PROBE_FIELD");
+    if (pf) g_probe_field = (uint32_t)strtoul(pf, NULL, 16);
+}
+
+void rt_count_report(void) {
+    if (!g_counts) return;
+    printf("[count] calls in the last period:");
+    int any = 0;
+    for (uint32_t a = g_count_lo; a < g_count_hi; a += 4) {
+        uint32_t n = g_counts[(a - g_count_lo) >> 2];
+        if (!n) continue;
+        printf(" %s=%u", rt_func_name(a), n);
+        g_counts[(a - g_count_lo) >> 2] = 0;
+        any = 1;
+    }
+    printf(any ? "\n" : " none\n");
+    fflush(stdout);
+}
+
 /* Name of the function containing addr (for return addresses). */
-static const char *func_containing(uint32_t addr) {
+const char *rt_func_containing(uint32_t addr) {
     if (addr >= 0x80000000u) addr = rel_to_generated(addr);
     unsigned lo = 0, hi = g_func_count;
     while (lo < hi) {
@@ -270,7 +410,7 @@ void rt_sdk_enter(Ctx *c, uint32_t addr) {
     g_sdk_calls++;
     if (g_sdk_log && g_sdk_calls <= g_sdk_log_limit)
         fprintf(g_sdk_log, "%6lu %-30s from %08X %-30s r3=%08X r4=%08X r5=%08X\n", g_sdk_calls, rt_func_name(addr),
-                c->lr, func_containing(c->lr), c->r[3], c->r[4], c->r[5]);
+                c->lr, rt_func_containing(c->lr), c->r[3], c->r[4], c->r[5]);
 }
 
 void rt_call(Ctx *c, uint32_t addr) {
@@ -902,6 +1042,7 @@ int main(int argc, char **argv) {
     g_lc = calloc(1, PPC_LC_SIZE);
     if (!g_mem || !g_lc) rt_fatal("out of memory");
     watch_init();
+    count_init();
     rt_boot_setup(root);
     printf("[recomp] %u guest functions linked\n", g_func_count);
     if (run_selftest) return selftest();

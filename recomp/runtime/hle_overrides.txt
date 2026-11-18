@@ -12,6 +12,11 @@ __OSInitAudioSystem
 # Configures BATs and the memory interface via real mode + rfi. Host memory needs no protection setup.
 __OSInitMemoryProtection
 
+# OSInit turns on the FPU's non-IEEE mode (FPSCR NI: denormal results flush to zero). The host FPU must
+# do the same (flush-to-zero and denormals-are-zero), or game code that relies on tiny values becoming
+# exactly 0 goes wrong: see rt_fp_apply_mode in hle.c.
+PPCSetFpNonIEEEMode
+
 
 # Thread switching: each guest thread runs on its own host thread (see threads.c).
 OSSaveContext
@@ -60,3 +65,9 @@ entry OSExitThread
 # fn_8001D5B4(stage) sets the current stage: copies its stage-table record into the game info at
 # 0x802A2B60 (+0x13C stage, +0x13F play type, which picks the gameplay module). --stage swaps it here.
 entry fn_8001D5B4
+# fn_8000ECC8(ctl): the game's main state machine; ctl+0x34 is its state (37 states, jump table at
+# 0x8021D0DC). State 21 ends a stage part and picks the next one from the table at 0x8021CF38.
+# Testing aids in hle.c: SFA_GAME_STATES=1 logs state changes; --skip-part jumps to the next part.
+entry fn_8000ECC8
+# PSVECNormalize(src, dst): testing aid in hle.c (SFA_VEC_DEBUG=1 logs inputs too small to normalise).
+entry PSVECNormalize

@@ -10,6 +10,9 @@
 void rt_fatal(const char *fmt, ...);
 void rt_console_putc(char ch);
 const char *rt_func_name(uint32_t addr);
+const char *rt_func_containing(uint32_t addr); /* name of the function holding a code address */
+void rt_count_report(void); /* SFA_COUNT_CALLS: print and reset the call counts */
+void rt_fp_apply_mode(void); /* the guest's FPU mode on this host thread (see hle.c) */
 void rt_dump_trace(void);
 void rt_sleep_us(unsigned us);
 

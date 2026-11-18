@@ -141,6 +141,7 @@ static void *thread_main(void *arg)
     while (g_running != t) wait(&g_cv, &g_lock);
     unlock(&g_lock);
     t_self = t;
+    rt_fp_apply_mode(); /* the FPU's non-IEEE (flush-to-zero) mode is per host thread */
     printf("[recomp] thread %d starts at %08X %s (sp=%08X)\n", t->id, t->start_pc, rt_func_name(t->start_pc), t->c->r[1]);
     rt_call(t->c, t->start_pc);
     /* The thread function returned: continue at the LR OSCreateThread set up (OSExitThread). */

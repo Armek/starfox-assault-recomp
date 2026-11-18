@@ -215,6 +215,18 @@ static uint32_t texture_for_map(int n) {
             printf("[gx-texaddr] frame %u map %d fmt %u %ux%u bound by:", g_frame_number, n, fmt, w, h);
             for (uint32_t i = 12; i >= 1; i--) printf(" %s", rt_func_name(g_trace_ring[(g_trace_pos - i) & (RT_TRACE_RING - 1)]));
             printf("\n");
+            Ctx *gc = rt_current_ctx(); /* with SFA_GX_SYNC=1 this is the guest thread drawing: walk its stack */
+            if (gc) {
+                printf("[gx-texaddr]   guest call stack (innermost first): %s", rt_func_containing(gc->lr));
+                uint32_t sp = gc->r[1];
+                for (int k = 0; k < 16 && sp && ppc_is_ram(sp); k++) {
+                    uint32_t next = rd32(sp);
+                    if (!ppc_is_ram(next) || next <= sp) break;
+                    printf(" < %s", rt_func_containing(rd32(next + 4)));
+                    sp = next;
+                }
+                printf("\n");
+            }
         }
     }
     if (g_dbg) {

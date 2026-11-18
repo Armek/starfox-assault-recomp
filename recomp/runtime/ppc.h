@@ -226,7 +226,12 @@ extern int g_safepoint_budget;
 void rt_safepoint(Ctx *c);
 #define RT_SAFEPOINT(c) do { if (PPC_UNLIKELY(--g_safepoint_budget <= 0)) rt_safepoint(c); } while (0)
 
-#define RT_ENTER(c, a) (g_trace_ring[g_trace_pos++ & (RT_TRACE_RING - 1)] = (a))
+/* SFA_COUNT_CALLS (testing): calls to functions in [g_count_lo, g_count_hi) are counted; empty otherwise */
+extern uint32_t g_count_lo, g_count_hi;
+void rt_count_call(Ctx *c, uint32_t addr);
+#define RT_ENTER(c, a)                                                                       \
+    ((void)(g_trace_ring[g_trace_pos++ & (RT_TRACE_RING - 1)] = (a)),                       \
+     PPC_UNLIKELY((uint32_t)(a) - g_count_lo < g_count_hi - g_count_lo) ? rt_count_call((c), (a)) : (void)0)
 #define RT_ENTER_SDK(c, a) do { RT_ENTER(c, a); if (g_trace_sdk) rt_sdk_enter((c), (a)); } while (0)
 
 /* ---- Runtime services used by generated code ---------------------------------------------------- */

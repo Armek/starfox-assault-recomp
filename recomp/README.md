@@ -173,6 +173,18 @@ untranslated instructions.
   an address no linked module covers maps to the module linked there most recently (unlinked ranges
   overlap, since modules share the heap). Before this, finishing Mission 1 or a game over stopped with
   "indirect call to unknown address".
+- **The FPU's non-IEEE mode:** `OSInit` calls `PPCSetFpNonIEEEMode`, so the game always runs with FPSCR
+  NI set: a float result too small for a normal number (a denormal) becomes 0, and denormal operands count
+  as 0. Game code relies on it. Mission 1's final boss, after losing its wings, steers toward a point by
+  normalizing (target − position). As it arrives, the squared distance (~1e-39) must become 0, so the
+  distance is 0 and the step is skipped. Kept as a denormal, `PSVECNormalize`'s Newton step overflowed
+  to infinity: the boss's position went to −inf, then NaN, so it was never drawn, and the debris it sheds
+  inherited NaN positions, never landed, never expired, and piled up by the thousand.
+  `PPCSetFpNonIEEEMode` is now HLE: it sets NI and turns on the host's equivalent on every host thread
+  that runs guest code (x86: MXCSR flush-to-zero and denormals-are-zero, which also cover the
+  double-to-single conversions the generated code rounds through; AArch64: FPCR FZ). Besides fixing the
+  boss, it removes slow denormal arithmetic: Mission 1's first stage ran about 50% faster in a like-for-like
+  test.
 
 ### Graphics and input (milestone 3)
 
@@ -226,6 +238,20 @@ The generator also emits **extra entry points** for calls into the middle of a f
 
 ### Debugging aids
 
+- **Reaching later parts:** `SFA_CLEAR_PART=<seconds>[:<stop stage>]` marks each stage part cleared once it
+  has been played that long (until the stop stage), so the game moves on through its own logic (state 16
+  of the state machine `fn_8000ECC8`, outcome byte game info +0x142 = 7) with the state earlier parts
+  build up. With `--stage=0 --auto-press` and `SFA_CLEAR_PART=20:4`, Mission 1's final boss is reached in
+  about two minutes. `SFA_AUTO_CHARGE=1` makes `--auto-press` fire charged lock-on shots, which damage
+  bosses. `SFA_GAME_STATES=1` logs the state machine's states.
+- **Finding what a module does:** `SFA_COUNT_CALLS=<name prefix>` (e.g. `mb01b:`) counts calls to those
+  functions and reports them every 10 s from the stop stage on. `SFA_PROBE=<hex address>` prints the
+  object (`r3`) and vector arguments of every 997th call (`SFA_PROBE_EVERY=n`), and with `SFA_PROBE_NAN=1`
+  (field `SFA_PROBE_FIELD`, default `0x80`) the first calls where that float has turned NaN, with what
+  changed and the `+0x10` parent chain. `SFA_RAM_SNAPSHOTS=<seconds>` saves main RAM to
+  `build/GF7E01/ram_NN.bin`. In a `-DRT_WATCH` build, `SFA_WATCH=<addr>:<len>` with `SFA_WATCH_NAN=1`
+  reports writes of infinite floats with the guest call stack and FPRs. `SFA_VEC_DEBUG=1` logs
+  `PSVECNormalize` inputs too small to normalize.
 - **`SFA_LAUNCHER_SCRIPT=down,enter,…`** drives the start screen for testing: every 0.6 s it saves
   `build/GF7E01/launcher_NN.bmp` and presses the next key (`up down left right pgdn enter esc start`;
   anything else waits a step); it quits after the last one. Scripts use the built-in browser unless

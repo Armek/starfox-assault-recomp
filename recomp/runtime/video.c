@@ -235,7 +235,14 @@ void video_get_pad(int port, PadState *out) {
             return;
         }
     }
-    if (g_auto_press && g_auto_play) { /* in a stage: fire and move, never pause */
+    static int charge = -1; /* SFA_AUTO_CHARGE=1: charged lock-on shots instead (they home in on bosses) */
+    if (charge < 0) charge = getenv("SFA_AUTO_CHARGE") != NULL;
+    if (g_auto_press && g_auto_play && charge) {
+        Uint32 t = SDL_GetTicks();
+        if (t % 2000 < 1600) out->buttons |= 0x100; /* hold A to charge, release to fire */
+        int phase = (int)(t % 6000);                /* a gentle sweep, so the aim stays near the target */
+        out->stick_x = (int8_t)((phase < 3000 ? phase : 6000 - phase) * 40 / 3000 - 20);
+    } else if (g_auto_press && g_auto_play) { /* in a stage: fire and move, never pause */
         Uint32 t = SDL_GetTicks();
         if (t % 500 < 120) out->buttons |= 0x100; /* A: fire, and advances dialogue */
         out->stick_y = 60;                        /* forward */

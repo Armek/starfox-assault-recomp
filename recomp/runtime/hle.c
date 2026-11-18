@@ -8,6 +8,9 @@
 #include "funcs.h"
 #include "runtime.h"
 #include "gx.h"
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+#include <xmmintrin.h> /* _mm_getcsr / _mm_setcsr */
+#endif
 
 /* int __write_console(__file_handle handle, unsigned char *buf, size_t *count, __idle_proc idle) */
 static void write_console(Ctx *c) {
@@ -23,6 +26,37 @@ HLE(__OSInitAudioSystem) { (void)c; }
 
 /* void __OSInitMemoryProtection(void): MMU/BAT and MI setup through RealMode()/rfi. */
 HLE(__OSInitMemoryProtection) { (void)c; }
+
+/* void PPCSetFpNonIEEEMode(void): OSInit calls it, so the game always runs with FPSCR NI set: a float
+ * result too small for a normal number is flushed to zero instead of becoming a denormal (and denormal
+ * operands count as zero). Code relies on it. Mission 1's last boss steers toward a point by normalizing
+ * (target - position); as it arrives, the squared distance (~1e-39) must become exactly 0, so the
+ * distance is 0 and the step is skipped. Kept as a denormal, PSVECNormalize's Newton step overflowed to
+ * infinity, the boss's position went to -inf and then NaN, it vanished, and the debris it sheds piled
+ * up by the thousand (with NaN positions they never landed, so never expired).
+ *
+ * The host FPU gets the same mode: on x86, MXCSR flush-to-zero and denormals-are-zero, which also cover
+ * the float<->double conversions the generated code rounds through (the generated code computes in
+ * double and rounds singles with a conversion). The mode is per host thread: it is applied here and
+ * when each guest thread starts. */
+static volatile int g_fp_ni;
+
+void rt_fp_apply_mode(void) {
+    if (!g_fp_ni) return;
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+    _mm_setcsr(_mm_getcsr() | 0x8040u); /* FTZ (bit 15) | DAZ (bit 6) */
+#elif defined(__aarch64__)
+    uint64_t fpcr;
+    __asm__ volatile("mrs %0, fpcr" : "=r"(fpcr));
+    __asm__ volatile("msr fpcr, %0" : : "r"(fpcr | (1ull << 24))); /* FZ */
+#endif
+}
+
+HLE(PPCSetFpNonIEEEMode) {
+    c->fpscr |= 0x4u; /* NI */
+    g_fp_ni = 1;
+    rt_fp_apply_mode();
+}
 
 /* void GXDrawDone(void): flush and wait for the GPU (here, the GX thread). */
 HLE(GXDrawDone) {
@@ -132,4 +166,84 @@ void rt_hook_8005F470(Ctx *c) {
     printf("[stage] start stage %d (mission %d, part %02X)\n", (int)stage,
            stage < 0x3B ? rd8(0x80223560u + stage * 0x14) + 1 : -1, stage < 0x3B ? rd8(0x80223561u + stage * 0x14) : 0);
     fflush(stdout);
+}
+
+/* fn_8000ECC8(ctl): the game's main state machine, called every frame with its control block; ctl+0x34
+ * is the state (16 = a stage part is being played). SFA_GAME_STATES=1 logs each change with the
+ * current stage.
+ *
+ * In state 16 the game watches the part's outcome, game info +0x142 (0x802A2CA2), which the gameplay
+ * code sets: 7 when a part is finished. The state machine then plays the part's closing scene and moves
+ * to the next part through the table at 0x8021CF38, as in normal play. SFA_CLEAR_PART=<seconds>
+ * (testing; "seconds:stop_stage" leaves stage stop_stage and later alone) sets it once a part has been
+ * played that long, to reach later parts and bosses with the
+ * state the earlier parts build up. */
+void rt_hook_8000ECC8(Ctx *c) {
+    static int log = -1;
+    static double clear_after = -1;
+    static int stop_stage;
+    static uint32_t last = 0xFFFFFFFFu;
+    static uint64_t entered;
+    if (log < 0) {
+        log = getenv("SFA_GAME_STATES") != NULL;
+        const char *s = getenv("SFA_CLEAR_PART"); /* "seconds" or "seconds:stop_stage" */
+        clear_after = s ? atof(s) : 0;
+        const char *colon = s ? strchr(s, ':') : NULL;
+        stop_stage = colon ? atoi(colon + 1) : 0x3B;
+    }
+    uint32_t st = rd32(c->r[3] + 0x34);
+    if (st != last) {
+        if (log) {
+            printf("[state] %d -> %u (stage %u, ctl %08X)\n", (int)last, st, rd8(0x802A2B60u + 0x13C), c->r[3]);
+            fflush(stdout);
+        }
+        last = st;
+        entered = rt_timebase();
+    }
+    if (st == 16 && clear_after > 0 && rd8(0x802A2B60u + 0x13C) < stop_stage &&
+        (double)(rt_timebase() - entered) / 40500000.0 >= clear_after) {
+        wr8(0x802A2B60u + 0x142, 7); /* the part's outcome: finished */
+        printf("[stage] SFA_CLEAR_PART: part of stage %u marked cleared\n", rd8(0x802A2B60u + 0x13C));
+        fflush(stdout);
+        entered = rt_timebase(); /* once per part */
+    }
+    /* SFA_COUNT_CALLS (see runtime.c): report every 10 s from the SFA_CLEAR_PART stop stage on */
+    static uint64_t next_count;
+    if (g_count_hi && rd8(0x802A2B60u + 0x13C) >= stop_stage && rt_timebase() >= next_count) {
+        if (next_count) rt_count_report();
+        next_count = rt_timebase() + 10ull * 40500000ull;
+    }
+    /* SFA_RAM_SNAPSHOTS=<seconds> (testing): while a part is played from the SFA_CLEAR_PART stop stage on,
+     * save main RAM to build/GF7E01/ram_NN.bin that often, to compare the game's state over time */
+    static double snap_every = -1;
+    static uint64_t next_snap;
+    static int snap_n;
+    if (snap_every < 0) { const char *s = getenv("SFA_RAM_SNAPSHOTS"); snap_every = s ? atof(s) : 0; }
+    if (snap_every > 0 && st == 16 && rd8(0x802A2B60u + 0x13C) >= stop_stage && rt_timebase() >= next_snap) {
+        char path[64];
+        snprintf(path, sizeof path, "build/GF7E01/ram_%02d.bin", snap_n++);
+        FILE *f = fopen(path, "wb");
+        if (f) { fwrite(g_mem, 1, PPC_MEM_SIZE, f); fclose(f); }
+        printf("[stage] RAM snapshot %s (stage %u)\n", path, rd8(0x802A2B60u + 0x13C));
+        fflush(stdout);
+        next_snap = rt_timebase() + (uint64_t)(snap_every * 40500000.0);
+    }
+}
+
+/* PSVECNormalize(src, dst): with SFA_VEC_DEBUG=1, log inputs that aren't zero but whose squared length
+ * is zero in single precision (normalising them gives infinities), with the caller. */
+void rt_hook_8013B2EC(Ctx *c) {
+    static int dbg = -1, shown;
+    if (dbg < 0) dbg = getenv("SFA_VEC_DEBUG") != NULL;
+    if (!dbg || shown >= 40) return;
+    float v[3];
+    uint32_t w[3];
+    for (int k = 0; k < 3; k++) { w[k] = rd32(c->r[3] + 4 * (uint32_t)k); memcpy(&v[k], &w[k], 4); }
+    float len2 = v[0] * v[0] + v[1] * v[1] + v[2] * v[2];
+    if (len2 == 0.0f && (v[0] != 0 || v[1] != 0 || v[2] != 0)) {
+        shown++;
+        printf("[vec] PSVECNormalize of a tiny vector (%g, %g, %g) [%08X %08X %08X] from %s\n", v[0], v[1], v[2], w[0],
+               w[1], w[2], rt_func_containing(c->lr));
+        fflush(stdout);
+    }
 }
