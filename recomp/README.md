@@ -56,9 +56,19 @@ then writes a log and a contact sheet per mission to `build/GF7E01/missions/`.
   from RAM that the earlier parts fill in (the stage table points outside the DOL's read-only data), so
   `--stage` on them crashes at once and the runtime warns. Reaching them needs real progress through the
   mission.
-- **Auto-play:** once the game starts a stage, `--auto-press` stops tapping START (which paused the game
-  half the time) and plays instead: A every half second, stick forward with a slow left-right sweep.
-  Mission 1 then flies on to Oikonny's flagship.
+- **Auto-play:** while a stage part is being played (state 16 of the state machine), `--auto-press` stops
+  tapping START (which paused the game half the time) and plays instead: A every half second, stick
+  forward with a slow left-right sweep. Results screens and story scenes between parts get the menu taps
+  again (before, play mode stayed on and runs sat on the first results screen). Mission 1 then flies on
+  to Oikonny's flagship.
+- **Whole-game check (v0.2.1):** every mission run from its first stage with `--auto-press`,
+  `SFA_AUTO_CHARGE=1` and `SFA_CLEAR_PART=30`, 8 minutes each, on Windows (hidden desktop, real
+  rendering) and Linux (`--no-video`). No crashes or fatal errors in either. Between them the runs played
+  every stage of the story's next-part chain (table at `0x8021CF38`): 0, 2–15 and 18–22, and 24–31,
+  including each mission's last part. They also carried on into later missions on their own (2→3→4,
+  6→7, 8→9→10). Stages 1, 16, 17 and 23 are in the stage table but not in that chain. Not covered: the
+  scenes after a boss when it is "cleared" this way (the boss never dies, so the cutscene waits), the
+  ending, VS mode and the bonus games.
 - **Also seen working:** the full opening cinematic (fleet battle, subtitles), Mission 1's story intro
   (General Pepper's briefing and the in-engine cutscene), and the attract demo's 4-player split-screen
   VS matches.
@@ -270,7 +280,9 @@ The generator also emits **extra entry points** for calls into the middle of a f
 - **`SFA_GX_FRAMEDUMP=<n>`** lists every batch of frame *n*.
 - **`SFA_PROFILE=1`** prints the hottest guest functions, the GX stage times, GX frames built and the
   EFB-to-texture copies (with the time spent waiting on them under `SFA_EFB_READBACK`), every 10 s of wall
-  time.
+  time. With `SFA_FPS=1` too, each frame that comes more than 80 ms late prints a `[stall]` line: how long
+  the renderer spent on that frame, and which guest functions (and threads) were sampled during the gap,
+  or how much of it the guest was idle.
 - **`SFA_EFB_READBACK=1`** reads EFB-to-texture copies back into guest RAM (slow; the old path).
 - **Crash reports:** a fatal error (`rt_fatal`) or a host crash (a signal on Linux, an unhandled
   exception on Windows) appends a report to `user/crash.log`: the message, build date, guest registers,

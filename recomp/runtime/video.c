@@ -867,6 +867,7 @@ static void write_bmp(const char *path, const uint8_t *rgba, int w, int h) {
 }
 
 static void render(GxFrame *f) {
+    uint32_t render_start = SDL_GetTicks();
     for (uint32_t i = 0; i < f->nuploads; i++) upload(&f->uploads[i]);
     glBindFramebuffer(GL_FRAMEBUFFER, g_efb_fbo);
     glViewport(0, 0, EFB_WIDTH, EFB_HEIGHT);
@@ -964,6 +965,11 @@ static void render(GxFrame *f) {
             uint32_t gap = now - last_present;
             if (gap > worst) worst = gap;
             if (gap > 50) slow++;
+            if (gap > 80) { /* with SFA_PROFILE: what ran during the hitch */
+                printf("[stall] frame %u: %u ms since the last frame, %u ms of it rendering this one\n", f->number, gap,
+                       now - render_start);
+                rt_prof_stall(gap);
+            }
         }
         last_present = now;
         uploads += f->nuploads;

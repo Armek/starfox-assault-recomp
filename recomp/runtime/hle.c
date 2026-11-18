@@ -199,6 +199,9 @@ void rt_hook_8000ECC8(Ctx *c) {
         }
         last = st;
         entered = rt_timebase();
+        /* --auto-press plays only while a part runs (state 16); results screens and story scenes between
+         * parts and missions get the menu taps again */
+        video_set_auto_play(st == 16);
     }
     if (st == 16 && clear_after > 0 && rd8(0x802A2B60u + 0x13C) < stop_stage &&
         (double)(rt_timebase() - entered) / 40500000.0 >= clear_after) {
