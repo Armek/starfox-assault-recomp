@@ -443,6 +443,8 @@ void video_copy_segment(GxFrame *frame) {
 
 /* ---- renderer --------------------------------------------------------------------------------- */
 static SDL_Window *g_window;
+extern uint64_t g_t_render; /* gx.c, SFA_PROFILE */
+static int g_prof_render;
 static unsigned g_shader_compiles; /* TEV programs built (each can stall a frame) */
 static int g_fullscreen, g_window_w = 1280, g_window_h = 960;
 void video_set_window(int fullscreen, int w, int h) {
@@ -1056,7 +1058,9 @@ static int render_thread(void *arg) {
         SDL_CondBroadcast(g_done_cond); /* a waiting copy segment may queue now */
         SDL_UnlockMutex(g_qlock);
         if (f) {
+            uint64_t t0 = g_prof_render ? rt_timebase() : 0;
             render(f);
+            if (t0) g_t_render += rt_timebase() - t0;
             free_frame(f);
         }
     }
@@ -1065,6 +1069,7 @@ static int render_thread(void *arg) {
 
 void video_start(int dump_frames) {
     g_dump = dump_frames;
+    g_prof_render = getenv("SFA_PROFILE") != NULL;
     SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
     SDL_SetHint("SDL_JOYSTICK_HIDAPI_STEAMDECK", "1"); /* the Deck's own controls, also when not started from Steam */
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS | SDL_INIT_GAMECONTROLLER) != 0) rt_fatal("SDL_Init: %s", SDL_GetError());

@@ -483,22 +483,42 @@ static int vtx_size(const VtxFormat *f) {
     return n;
 }
 
+/* What reading a vertex needs besides its bytes: the vertex format, the attribute arrays (CP 0xA0 + n base,
+ * 0xB0 + n stride) and the default matrix indices (XF 0x1018/0x1019). Snapshotted per draw configuration,
+ * so vertices can be read later on a worker thread. */
+typedef struct {
+    VtxFormat f;
+    uint32_t base[12], stride[12];
+    uint32_t mi_a, mi_b;
+} ReadCtx;
+
+static void read_ctx(ReadCtx *rc, const VtxFormat *f) {
+    rc->f = *f;
+    for (int i = 0; i < 12; i++) {
+        rc->base[i] = 0x80000000u | (cp[0xA0 + i] & 0x03FFFFFF);
+        rc->stride[i] = cp[0xB0 + i] & 0xFF;
+    }
+    rc->mi_a = xf[0x1018];
+    rc->mi_b = xf[0x1019];
+}
+
 /* An attribute's data: inline in the stream at s + *off (which advances), or indexed into an array. */
-static const uint8_t *attr_ptr(int mode, int array, const uint8_t *s, int *off, int direct_size, uint8_t *tmp) {
+static const uint8_t *attr_ptr(const ReadCtx *rc, int mode, int array, const uint8_t *s, int *off, int direct_size,
+                               uint8_t *tmp) {
     if (mode == 1) { const uint8_t *q = s + *off; *off += direct_size; return q; }
     uint32_t idx = mode == 2 ? s[*off] : be16p(s + *off);
     *off += mode == 2 ? 1 : 2;
-    uint32_t a = 0x80000000u | ((cp[0xA0 + array] & 0x03FFFFFF) + idx * (cp[0xB0 + array] & 0xFF));
+    uint32_t a = rc->base[array] + idx * rc->stride[array];
     return vspan(a, (uint32_t)(direct_size > 0 ? direct_size : 1), tmp);
 }
 
-/* Reads one vertex. Fields for attributes the format lacks are left as they are, except the
- * flags and texcoords transform() looks at. */
-static void read_vertex(const VtxFormat *f, uint32_t *p, RawVertex *v) {
-    uint8_t sbuf[256], abuf[64];
-    const uint8_t *s = vspan(*p, (uint32_t)f->size, sbuf);
+/* Reads one vertex from its bytes s (rc->f.size of them). Fields for attributes the format lacks are left
+ * as they are, except the flags and texcoords transform() looks at. */
+static void read_vertex(const ReadCtx *rc, const uint8_t *s, RawVertex *v) {
+    const VtxFormat *f = &rc->f;
+    uint8_t abuf[64];
     int off = 0;
-    uint32_t mi_a = xf[0x1018], mi_b = xf[0x1019];
+    uint32_t mi_a = rc->mi_a, mi_b = rc->mi_b;
     v->pnmtx = f->pnmtx ? s[off++] : (int)(mi_a & 63);
     for (int i = 0; i < 8; i++) {
         int def = i < 4 ? (int)((mi_a >> (6 + 6 * i)) & 63) : (int)((mi_b >> (6 * (i - 4))) & 63);
@@ -507,7 +527,7 @@ static void read_vertex(const VtxFormat *f, uint32_t *p, RawVertex *v) {
     v->pos[0] = v->pos[1] = v->pos[2] = 0;
     if (f->pos) {
         int comps = f->pos_cnt ? 3 : 2;
-        const uint8_t *q = attr_ptr(f->pos, 0, s, &off, comps * k_comp_size[f->pos_fmt], abuf);
+        const uint8_t *q = attr_ptr(rc, f->pos, 0, s, &off, comps * k_comp_size[f->pos_fmt], abuf);
         read_comps(q, f->pos_fmt, f->pos_scale, comps, v->pos);
     }
     v->has_nrm = 0;
@@ -515,10 +535,10 @@ static void read_vertex(const VtxFormat *f, uint32_t *p, RawVertex *v) {
         int comps = f->nrm_cnt ? 9 : 3;
         const uint8_t *q;
         if (f->nrm >= 2 && f->nrm_cnt && f->nrm_idx3) { /* three separate indices; the first is the normal */
-            q = attr_ptr(f->nrm, 1, s, &off, 3 * k_comp_size[f->nrm_fmt], abuf);
+            q = attr_ptr(rc, f->nrm, 1, s, &off, 3 * k_comp_size[f->nrm_fmt], abuf);
             off += 2 * (f->nrm == 2 ? 1 : 2);
         } else {
-            q = attr_ptr(f->nrm, 1, s, &off, comps * k_comp_size[f->nrm_fmt], abuf);
+            q = attr_ptr(rc, f->nrm, 1, s, &off, comps * k_comp_size[f->nrm_fmt], abuf);
         }
         read_comps(q, f->nrm_fmt, f->nrm_scale, 3, v->nrm);
         v->has_nrm = 1;
@@ -526,7 +546,7 @@ static void read_vertex(const VtxFormat *f, uint32_t *p, RawVertex *v) {
     for (int i = 0; i < 2; i++) {
         v->has_col[i] = 0;
         if (!f->col[i]) continue;
-        const uint8_t *q = attr_ptr(f->col[i], 2 + i, s, &off, k_color_size[f->col_fmt[i]], abuf);
+        const uint8_t *q = attr_ptr(rc, f->col[i], 2 + i, s, &off, k_color_size[f->col_fmt[i]], abuf);
         read_color(q, f->col_fmt[i], v->col[i]);
         v->has_col[i] = 1;
     }
@@ -534,10 +554,10 @@ static void read_vertex(const VtxFormat *f, uint32_t *p, RawVertex *v) {
         v->tex[i][0] = v->tex[i][1] = 0;
         if (!f->tex[i]) continue;
         int comps = f->tex_cnt[i] ? 2 : 1;
-        const uint8_t *q = attr_ptr(f->tex[i], 4 + i, s, &off, comps * k_comp_size[f->tex_fmt[i]], abuf);
+        const uint8_t *q = attr_ptr(rc, f->tex[i], 4 + i, s, &off, comps * k_comp_size[f->tex_fmt[i]], abuf);
         read_comps(q, f->tex_fmt[i], f->tex_scale[i], comps, v->tex[i]);
     }
-    *p += (uint32_t)off;
+    (void)off; /* off == f->size */
 }
 
 static void unpack_color(uint32_t rgba, float *c) {
@@ -682,9 +702,17 @@ static void light_channel(const XfSetup *s, const RawVertex *v, int ch, int part
     }
 }
 
-/* Position -> clip space (via the position matrix, projection and viewport); colors; texcoords. */
-static void transform(const XfSetup *s, const RawVertex *v, GxVertex *o) {
-    const float *M = (const float *)&xf[(uint32_t)v->pnmtx * 4];
+/* The XF matrix memory transform() reads, copied when it changes so vertices can be transformed later
+ * (on worker threads, see "Deferred vertex transform"): position/texture matrices xf[0x000..0x110) (row
+ * index up to 63, 3 rows of 4), then normal matrices xf[0x400..0x468) (index up to 31, 3x3). */
+#define MTX_PT_WORDS 0x110u
+#define MTX_NRM_WORDS 0x68u
+#define MTX_WORDS (MTX_PT_WORDS + MTX_NRM_WORDS)
+
+/* Position -> clip space (via the position matrix, projection and viewport); colors; texcoords.
+ * mx: position/texture matrices, mn: normal matrices (live XF memory, or a snapshot as laid out above). */
+static void transform(const XfSetup *s, const uint32_t *mx, const uint32_t *mn, const RawVertex *v, GxVertex *o) {
+    const float *M = (const float *)&mx[(uint32_t)v->pnmtx * 4];
     float x = v->pos[0], y = v->pos[1], z = v->pos[2];
     float vx = M[0] * x + M[1] * y + M[2] * z + M[3];
     float vy = M[4] * x + M[5] * y + M[6] * z + M[7];
@@ -703,7 +731,7 @@ static void transform(const XfSetup *s, const RawVertex *v, GxVertex *o) {
     /* lighting works in view space: transform the normal by the normal matrix */
     float vpos[3] = {vx, vy, vz}, n[3] = {0, 0, 1};
     if (s->any_light && v->has_nrm) {
-        const float *N = (const float *)&xf[0x400u + ((uint32_t)v->pnmtx & 31) * 3];
+        const float *N = (const float *)&mn[((uint32_t)v->pnmtx & 31) * 3];
         n[0] = N[0] * v->nrm[0] + N[1] * v->nrm[1] + N[2] * v->nrm[2];
         n[1] = N[3] * v->nrm[0] + N[4] * v->nrm[1] + N[5] * v->nrm[2];
         n[2] = N[6] * v->nrm[0] + N[7] * v->nrm[1] + N[8] * v->nrm[2];
@@ -732,7 +760,7 @@ static void transform(const XfSetup *s, const RawVertex *v, GxVertex *o) {
         if (src_row == 0) { in0 = x; in1 = y; in2 = z; }
         else if (src_row >= 5 && src_row <= 12) { in0 = v->tex[src_row - 5][0]; in1 = v->tex[src_row - 5][1]; }
         if (!s->tg[tc].abc1) in2 = 1; /* AB11 */
-        const float *T = (const float *)&xf[(uint32_t)v->texmtx[tc] * 4];
+        const float *T = (const float *)&mx[(uint32_t)v->texmtx[tc] * 4];
         float s_ = T[0] * in0 + T[1] * in1 + T[2] * in2 + T[3];
         float t_ = T[4] * in0 + T[5] * in1 + T[6] * in2 + T[7];
         if (s->tg[tc].proj) {
@@ -751,8 +779,11 @@ static uint32_t g_xf_serial = 1; /* bumped by writes to XF lights and registers 
 static uint32_t g_state_serial;
 static int g_state_valid;
 
-static void emit(GxPrimKind kind, const GxState *st, uint32_t serial, const GxVertex *vs, const uint32_t *idx, uint32_t n) {
-    if (!n) return;
+static void gx_drain(void);
+
+/* Adds n vertices to the frame's current batch (or a new one) and returns where they go in f->verts; the
+ * caller (the deferred transform) fills them in. */
+static uint32_t emit(GxPrimKind kind, const GxState *st, uint32_t serial, uint32_t n) {
     GxFrame *f = frame();
     GxBatch *last = f->nbatches ? &f->batches[f->nbatches - 1] : NULL;
     int same = last && last->kind == kind && last->first + last->count == f->nverts &&
@@ -768,13 +799,14 @@ static void emit(GxPrimKind kind, const GxState *st, uint32_t serial, const GxVe
     }
     last->serial = serial;
     if (f->nverts + n > f->cap_verts) {
+        gx_drain(); /* the workers write into f->verts: let them finish before it moves */
         while (f->nverts + n > f->cap_verts) f->cap_verts = f->cap_verts ? f->cap_verts * 2 : 4096;
         f->verts = realloc(f->verts, sizeof *f->verts * f->cap_verts);
     }
-    GxVertex *dst = f->verts + f->nverts;
-    for (uint32_t i = 0; i < n; i++) dst[i] = vs[idx[i]];
+    uint32_t dst = f->nverts;
     f->nverts += n;
     last->count += n;
+    return dst;
 }
 
 /* SFA_GX_DEBUG=1: print each distinct draw configuration once (for finding unhandled GX features). */
@@ -797,6 +829,10 @@ static void debug_draw_config(void) {
 
 /* SFA_PROFILE: time spent in each stage of draw(), reported with the guest profile. */
 static uint64_t g_t_state, g_t_vtx, g_t_emit, g_t_calls, g_t_verts, g_t_copy, g_t_ncopy;
+static uint64_t g_t_sync, g_t_ringfull, g_t_gxbusy; /* guest waiting in GXDrawDone / on a full ring; GX thread working */
+uint64_t g_t_render; /* renderer thread: time in render() (video.c) */
+static uint64_t g_t_xform; /* wall time of the deferred vertex transform's flushes */
+static int g_nworkers;     /* its worker threads */
 static int g_prof_on = -1;
 static uint64_t ticks(void) { /* stage timing only when profiling: the clock call is not free */
     if (g_prof_on < 0) g_prof_on = getenv("SFA_PROFILE") != NULL;
@@ -811,6 +847,11 @@ void gx_profile_report(void) {
            g_t_decode_px / 1e6, g_t_decode / 40500.0);
     g_t_decode = g_t_ndecode = g_t_decode_px = 0;
     static uint32_t last_frames;
+    printf("[prof] split: GX thread busy %.0f ms, renderer %.0f ms; guest waited on GXDrawDone %.0f ms, on a full ring %.0f ms (per 10 s)\n",
+           g_t_gxbusy / 40500.0, g_t_render / 40500.0, g_t_sync / 40500.0, g_t_ringfull / 40500.0);
+    printf("[prof] gx: vertex transform %.0f ms of GX thread time (%d workers; per 10 s)\n", g_t_xform / 40500.0,
+           g_nworkers);
+    g_t_gxbusy = g_t_render = g_t_sync = g_t_ringfull = g_t_xform = 0;
     printf("[prof] gx: %u frames (%.1f fps); %llu EFB-to-texture copies, guest waited %.0f ms (per 10 s)\n",
            g_frame_number - last_frames, (g_frame_number - last_frames) / 10.0, (unsigned long long)g_t_ncopy,
            g_t_copy / 40500.0);
@@ -823,8 +864,13 @@ void gx_profile_report(void) {
  * coordinates work; with GXSetTexCoordScaleManually a game can set any scale and send other units (the
  * system-font text uses texel coordinates with a scale of 1). The renderer samples normalized coordinates,
  * so rescale each texcoord by its SU size over the size of the texture it's sampled from. */
-static void apply_texcoord_scale(GxVertex *vs, uint32_t count) {
-    float ks[8], kt[8];
+/* The setup unit turns texcoords into texel units with SU_SSIZE/SU_TSIZE (BP 0x30 + 2n / 0x31 + 2n, size - 1
+ * for texcoord n). GX normally loads the size of the texture the coordinate is used with, so normalized
+ * coordinates work; with GXSetTexCoordScaleManually a game can set any scale and send other units (the
+ * system-font text uses texel coordinates with a scale of 1). The renderer samples normalized coordinates,
+ * so rescale each texcoord by its SU size over the size of the texture it's sampled from. Returns a mask of
+ * the texcoords that need it, with their factors in ks/kt. */
+static uint32_t texcoord_scale_factors(float *ks, float *kt) {
     uint32_t need = 0, nstages = ((bp[0x00] >> 10) & 15) + 1;
     for (uint32_t k = 0; k < nstages; k++) {
         uint32_t tref = bp[0x28 + k / 2] >> ((k & 1) ? 12 : 0);
@@ -839,11 +885,237 @@ static void apply_texcoord_scale(GxVertex *vs, uint32_t count) {
         kt[coord] = (float)ts / (float)h;
         need |= 1u << coord;
     }
-    if (!need) return;
-    for (uint32_t c = 0; c < 8; c++) {
-        if (!(need & (1u << c))) continue;
-        for (uint32_t i = 0; i < count; i++) { vs[i].uv[c][0] *= ks[c]; vs[i].uv[c][1] *= kt[c]; }
+    return need;
+}
+
+/* Vertices a primitive of `count` vertices becomes (as triangles, lines or points), and its kind. */
+static uint32_t prim_out_count(uint8_t opcode, uint32_t count, GxPrimKind *kind) {
+    *kind = GX_PRIM_TRIANGLES;
+    switch (opcode & 0xF8) {
+    case 0x80: case 0x88: return count / 4 * 6; /* quads */
+    case 0x90: return count / 3 * 3;
+    case 0x98: case 0xA0: return count >= 3 ? (count - 2) * 3 : 0; /* strip, fan */
+    case 0xA8: *kind = GX_PRIM_LINES; return count / 2 * 2;
+    case 0xB0: *kind = GX_PRIM_LINES; return count >= 2 ? (count - 1) * 2 : 0;
+    default: *kind = GX_PRIM_POINTS; return count;
     }
+}
+
+/* Writes a primitive's transformed vertices `vs` out as triangles, lines or points. */
+static void prim_expand(uint8_t opcode, uint32_t count, const GxVertex *vs, GxVertex *out) {
+    uint32_t n = 0;
+    switch (opcode & 0xF8) {
+    case 0x80: case 0x88:
+        for (uint32_t i = 0; i + 3 < count; i += 4) {
+            out[n++] = vs[i]; out[n++] = vs[i + 1]; out[n++] = vs[i + 2];
+            out[n++] = vs[i]; out[n++] = vs[i + 2]; out[n++] = vs[i + 3];
+        }
+        break;
+    case 0x90: for (uint32_t i = 0; i + 2 < count; i += 3) { out[n++] = vs[i]; out[n++] = vs[i + 1]; out[n++] = vs[i + 2]; } break;
+    case 0x98:
+        for (uint32_t i = 0; i + 2 < count; i++) {
+            if (i & 1) { out[n++] = vs[i + 1]; out[n++] = vs[i]; out[n++] = vs[i + 2]; }
+            else { out[n++] = vs[i]; out[n++] = vs[i + 1]; out[n++] = vs[i + 2]; }
+        }
+        break;
+    case 0xA0: for (uint32_t i = 1; i + 1 < count; i++) { out[n++] = vs[0]; out[n++] = vs[i]; out[n++] = vs[i + 1]; } break;
+    case 0xA8: for (uint32_t i = 0; i + 1 < count; i += 2) { out[n++] = vs[i]; out[n++] = vs[i + 1]; } break;
+    case 0xB0: for (uint32_t i = 0; i + 1 < count; i++) { out[n++] = vs[i]; out[n++] = vs[i + 1]; } break;
+    default: for (uint32_t i = 0; i < count; i++) out[n++] = vs[i]; break;
+    }
+}
+
+/* ---- Deferred vertex work -----------------------------------------------------------------------
+ * Reading vertices (indexed lookups into the game's arrays) and transforming them (matrices, lighting,
+ * texgen) is most of the GX thread's work: Mission 10 has about 9,000 draws and 43,000 vertices a frame.
+ * So draw() only copies each draw's vertex bytes, notes what reading and transforming them needs (the
+ * read context, the XF setup and a copy of the matrices, each snapshotted when it changes), reserves the
+ * vertices' place in the frame and publishes the draw as a job. Worker threads take published jobs while
+ * the GX thread goes on with the commands. Each vertex gets exactly the same arithmetic as before, so the
+ * output is identical.
+ *
+ * Workers read the attribute arrays from guest RAM a little later than the GX thread would have. The
+ * game may change an array once the GPU is past the draws that use it, which it learns only through
+ * GXDrawDone and PE tokens, so the GX thread finishes all published jobs before either reports progress
+ * (gx_drain), and before the frame goes to the renderer or anything else reads f->verts
+ * (gx_flush_vertices).
+ *
+ * The job, byte and snapshot arrays have fixed sizes (workers read them while the GX thread adds to them);
+ * when one fills up, or f->verts must grow, the GX thread first waits for the published jobs.
+ * SFA_GX_WORKERS=n sets the number of worker threads (0 = the GX thread alone); SFA_GX_VERIFY=1 redoes every
+ * flush on one thread and reports any difference; SFA_GX_DEFER=0 does it all inline in draw() as before. */
+typedef struct {
+    uint32_t bytes, count;      /* vertex bytes in g_bytes, vertex count */
+    uint32_t dst;               /* first output vertex in the frame */
+    uint32_t rc, xs, mx;        /* indices of the read context, XF setup and matrix snapshots */
+    uint32_t scale_need;        /* texcoords to rescale (see texcoord_scale_factors) */
+    float ks[8], kt[8];
+    uint8_t opcode;
+} VtxJob;
+
+#define BYTES_CAP (16u << 20) /* a draw has at most 65535 vertices of at most ~130 bytes */
+#define JOB_CAP 16384u
+#define RC_CAP 4096u
+#define XS_CAP 2048u
+#define MX_CAP 4096u
+static uint8_t *g_bytes;
+static uint32_t g_nbytes;
+static VtxJob *g_jobs;
+static uint32_t g_njobs;
+static ReadCtx *g_rc_snap;
+static uint32_t g_nrc, g_rc_key[3];       /* (vat + 1, g_cp_serial, g_xf_serial) of the last snapshot */
+static XfSetup *g_xs_snap;
+static uint32_t g_nxs, g_xs_snap_serial;  /* g_xf_serial the last snapshot was taken at (0 = none) */
+static uint32_t *g_mx_snap;
+static uint32_t g_nmx, g_mx_snap_serial;  /* g_mtx_serial the last snapshot was taken at (0 = none) */
+static uint32_t g_mtx_serial = 1;         /* bumped by writes to XF matrix memory */
+static GxFrame *g_job_frame;              /* the frame the pending jobs write into */
+static SDL_atomic_t g_pub, g_claim, g_done, g_sleepers; /* jobs published, taken, finished; idle workers */
+static SDL_sem *g_work_sem;
+#define CLAIM 8 /* jobs a thread takes at a time */
+
+typedef struct { GxVertex *vs; RawVertex *raw; uint32_t cap; } JobBuf;
+
+static void run_job(const VtxJob *jb, JobBuf *b) {
+    if (jb->count > b->cap) {
+        b->cap = jb->count < 1024 ? 1024 : jb->count;
+        b->vs = realloc(b->vs, sizeof *b->vs * b->cap);
+        b->raw = realloc(b->raw, sizeof *b->raw * b->cap);
+    }
+    const ReadCtx *rc = &g_rc_snap[jb->rc];
+    const XfSetup *xs = &g_xs_snap[jb->xs];
+    const uint32_t *mx = &g_mx_snap[(size_t)jb->mx * MTX_WORDS];
+    const uint8_t *s = g_bytes + jb->bytes;
+    uint32_t size = (uint32_t)rc->f.size;
+    for (uint32_t i = 0; i < jb->count; i++) {
+        read_vertex(rc, s + i * size, &b->raw[i]);
+        transform(xs, mx, mx + MTX_PT_WORDS, &b->raw[i], &b->vs[i]);
+    }
+    for (uint32_t c = 0; jb->scale_need && c < 8; c++) {
+        if (!(jb->scale_need & (1u << c))) continue;
+        for (uint32_t i = 0; i < jb->count; i++) { b->vs[i].uv[c][0] *= jb->ks[c]; b->vs[i].uv[c][1] *= jb->kt[c]; }
+    }
+    prim_expand(jb->opcode, jb->count, b->vs, g_job_frame->verts + jb->dst);
+}
+
+/* Takes and runs published jobs until none are left; returns whether it ran any. */
+static int work_some(JobBuf *b) {
+    int ran = 0;
+    for (;;) {
+        int c = SDL_AtomicGet(&g_claim), p = SDL_AtomicGet(&g_pub);
+        if (c >= p) return ran;
+        int n = p - c < CLAIM ? p - c : CLAIM;
+        if (!SDL_AtomicCAS(&g_claim, c, c + n)) continue;
+        for (int j = c; j < c + n; j++) run_job(&g_jobs[j], b);
+        SDL_AtomicAdd(&g_done, n);
+        ran = 1;
+    }
+}
+
+static int gx_worker(void *arg) {
+    (void)arg;
+    JobBuf b = {0};
+    for (;;) {
+        if (work_some(&b)) continue;
+        int spins = 0;
+        while (SDL_AtomicGet(&g_claim) >= SDL_AtomicGet(&g_pub) && spins++ < 2000) SDL_CPUPauseInstruction();
+        if (SDL_AtomicGet(&g_claim) >= SDL_AtomicGet(&g_pub)) {
+            SDL_AtomicIncRef(&g_sleepers);
+            if (SDL_AtomicGet(&g_claim) >= SDL_AtomicGet(&g_pub)) SDL_SemWaitTimeout(g_work_sem, 2);
+            SDL_AtomicDecRef(&g_sleepers);
+        }
+    }
+    return 0;
+}
+
+static void wake_workers(void) {
+    int s = SDL_AtomicGet(&g_sleepers);
+    if (s > 0 && (int)SDL_SemValue(g_work_sem) < s) SDL_SemPost(g_work_sem);
+}
+
+/* Makes the jobs so far available to the workers (in groups, to keep the atomics off the hot path). */
+static void publish_jobs(int force) {
+    int pub = SDL_AtomicGet(&g_pub);
+    if (!force && (int)g_njobs - pub < CLAIM) return;
+    SDL_AtomicSet(&g_pub, (int)g_njobs);
+    if (g_nworkers && (int)g_njobs - SDL_AtomicGet(&g_claim) >= 2 * CLAIM) wake_workers();
+}
+
+static JobBuf g_gx_buf; /* the GX thread's own buffers */
+
+/* Waits until every job so far has run (helping with them). Afterwards f->verts may move, and the game
+ * may be told the GPU is past these draws. */
+static void gx_drain(void) {
+    if (!g_njobs) return;
+    publish_jobs(1);
+    for (int k = 0; k < g_nworkers; k++) wake_workers();
+    work_some(&g_gx_buf);
+    while (SDL_AtomicGet(&g_done) < (int)g_njobs) SDL_CPUPauseInstruction();
+}
+
+/* Finishes every pending vertex and starts the job arrays over. Call before anything reads f->verts. */
+static void gx_flush_vertices(void) {
+    if (!g_njobs) return;
+    uint64_t t0 = ticks();
+    gx_drain();
+    static int verify = -1;
+    if (verify < 0) verify = getenv("SFA_GX_VERIFY") != NULL;
+    if (verify) { /* redo on this thread and compare */
+        GxFrame *f = g_job_frame;
+        uint32_t lo = g_jobs[0].dst, hi = f->nverts;
+        GxVertex *copy = malloc(sizeof *copy * (hi - lo + 1));
+        memcpy(copy, f->verts + lo, sizeof *copy * (hi - lo));
+        for (uint32_t j = 0; j < g_njobs; j++) run_job(&g_jobs[j], &g_gx_buf);
+        static unsigned long checked, bad, next_report;
+        checked += hi - lo;
+        if (memcmp(copy, f->verts + lo, sizeof *copy * (hi - lo))) bad++;
+        if (bad || checked >= next_report) {
+            printf("[gx] verify: %lu vertices checked, %lu flushes differed\n", checked, bad);
+            next_report = checked + 10000000;
+        }
+        free(copy);
+    }
+    /* start over: hide the old jobs from the workers before resetting what they take from */
+    SDL_AtomicSet(&g_pub, 0);
+    SDL_AtomicSet(&g_claim, 0);
+    SDL_AtomicSet(&g_done, 0);
+    g_njobs = g_nbytes = g_nrc = g_nxs = g_nmx = 0;
+    g_rc_key[0] = 0;
+    g_xs_snap_serial = g_mx_snap_serial = 0; /* the next draw snapshots again */
+    g_job_frame = NULL;
+    if (t0) g_t_xform += ticks() - t0;
+}
+
+/* Copies n vertex bytes from guest address p (RAM, or the write-gather staging buffer) to dst. */
+static void copy_vertex_bytes(uint8_t *dst, uint32_t p, uint32_t n) {
+    if (!n) return;
+    uint8_t tmp[1];
+    if (p - STAGE_BASE < 0x10000000u || (ppc_is_ram(p) && ppc_is_ram(p + n - 1))) {
+        const uint8_t *src = vspan(p, n, tmp);
+        if (src != tmp) { memcpy(dst, src, n); return; }
+    }
+    for (uint32_t i = 0; i < n; i++) dst[i] = vrd8(p + i);
+}
+
+static void gx_workers_init(void) {
+    g_bytes = malloc(BYTES_CAP);
+    g_jobs = malloc(sizeof *g_jobs * JOB_CAP);
+    g_rc_snap = malloc(sizeof *g_rc_snap * RC_CAP);
+    g_xs_snap = malloc(sizeof *g_xs_snap * XS_CAP);
+    g_mx_snap = malloc(sizeof *g_mx_snap * MTX_WORDS * MX_CAP);
+    if (!g_bytes || !g_jobs || !g_rc_snap || !g_xs_snap || !g_mx_snap) rt_fatal("out of memory for the vertex job arrays");
+    int n = SDL_GetCPUCount() - 3; /* leave the game, GX and render threads a core each */
+    const char *e = getenv("SFA_GX_WORKERS");
+    if (e) n = atoi(e);
+    if (n < 0) n = 0;
+    if (n > 4 && !e) n = 4;
+    if (n > 8) n = 8;
+    g_work_sem = SDL_CreateSemaphore(0);
+    for (int k = 0; k < n && g_work_sem; k++) {
+        if (!SDL_CreateThread(gx_worker, "gx-vtx", NULL)) break;
+        g_nworkers = k + 1;
+    }
+    printf("[gx] vertex work on %d worker thread%s and the GX thread\n", g_nworkers, g_nworkers == 1 ? "" : "s");
 }
 
 static void draw(uint8_t opcode, uint32_t p, uint32_t count) {
@@ -884,51 +1156,91 @@ static void draw(uint8_t opcode, uint32_t p, uint32_t count) {
         g_state_valid = 1;
     }
     uint64_t t1 = ticks();
-    static GxVertex *vs;
-    static uint32_t *idx, cap;
-    if (count * 6 > cap) {
-        cap = count * 6 + 64;
-        vs = realloc(vs, sizeof *vs * cap);
-        idx = realloc(idx, sizeof *idx * cap);
+    uint32_t size = (uint32_t)fmtp->size;
+    GxPrimKind kind;
+    uint32_t n = prim_out_count(opcode, count, &kind);
+    if (!n) return; /* nothing to draw (the caller skips the vertex data) */
+    GxFrame *f = frame();
+    static int defer = -1;
+    if (defer < 0) defer = !getenv("SFA_GX_DEFER") || atoi(getenv("SFA_GX_DEFER")) != 0;
+    if (!defer) { /* SFA_GX_DEFER=0: read and transform right here on the GX thread, as before (for comparison) */
+        static GxVertex *vs;
+        static RawVertex *raw;
+        static uint32_t cap;
+        static XfSetup xs;
+        static uint32_t xs_serial;
+        if (count > cap) {
+            cap = count + 64;
+            vs = realloc(vs, sizeof *vs * cap);
+            raw = realloc(raw, sizeof *raw * cap);
+        }
+        ReadCtx rc;
+        read_ctx(&rc, fmtp);
+        for (uint32_t i = 0; i < count; i++) {
+            uint8_t sbuf[256];
+            read_vertex(&rc, vspan(p + i * size, size, sbuf), &raw[i]);
+            if (i == 0 && xs_serial != g_xf_serial) { xf_setup(&xs, &raw[0]); xs_serial = g_xf_serial; }
+            transform(&xs, xf, &xf[0x400], &raw[i], &vs[i]);
+        }
+        float ks[8], kt[8];
+        uint32_t need = texcoord_scale_factors(ks, kt);
+        for (uint32_t c = 0; need && c < 8; c++) {
+            if (!(need & (1u << c))) continue;
+            for (uint32_t i = 0; i < count; i++) { vs[i].uv[c][0] *= ks[c]; vs[i].uv[c][1] *= kt[c]; }
+        }
+        uint64_t t2 = ticks();
+        g_t_state += t1 - t0;
+        g_t_vtx += t2 - t1;
+        g_t_calls++;
+        g_t_verts += count;
+        uint32_t dst = emit(kind, &g_state, g_state_serial, n);
+        prim_expand(opcode, count, vs, f->verts + dst);
+        g_t_emit += ticks() - t2;
+        g_stat_draws++;
+        return;
     }
-    static XfSetup xs;
-    static uint32_t xs_serial;
-    for (uint32_t i = 0; i < count; i++) {
-        RawVertex rv;
-        read_vertex(fmtp, &p, &rv);
-        if (i == 0 && xs_serial != g_xf_serial) { xf_setup(&xs, &rv); xs_serial = g_xf_serial; }
-        transform(&xs, &rv, &vs[i]);
+    if (g_job_frame && g_job_frame != f) gx_flush_vertices();
+    /* room in the fixed-size job arrays (workers read them, so they can't move) */
+    if (g_nbytes + count * size > BYTES_CAP || g_njobs == JOB_CAP || g_nrc == RC_CAP || g_nxs == XS_CAP ||
+        g_nmx == MX_CAP)
+        gx_flush_vertices();
+    g_job_frame = f;
+    /* snapshot what reading and transforming the vertices needs, when it has changed */
+    if (g_rc_key[0] != (uint32_t)vat + 1 || g_rc_key[1] != g_cp_serial || g_rc_key[2] != g_xf_serial) {
+        read_ctx(&g_rc_snap[g_nrc++], fmtp);
+        g_rc_key[0] = (uint32_t)vat + 1;
+        g_rc_key[1] = g_cp_serial;
+        g_rc_key[2] = g_xf_serial;
     }
-    apply_texcoord_scale(vs, count);
+    if (g_xs_snap_serial != g_xf_serial) {
+        xf_setup(&g_xs_snap[g_nxs++], NULL);
+        g_xs_snap_serial = g_xf_serial;
+    }
+    if (g_mx_snap_serial != g_mtx_serial) {
+        uint32_t *m = &g_mx_snap[(size_t)g_nmx++ * MTX_WORDS];
+        memcpy(m, &xf[0], MTX_PT_WORDS * 4);
+        memcpy(m + MTX_PT_WORDS, &xf[0x400], MTX_NRM_WORDS * 4);
+        g_mx_snap_serial = g_mtx_serial;
+    }
+    VtxJob *jb = &g_jobs[g_njobs]; /* counted (and published) once emit() has placed it */
+    jb->bytes = g_nbytes;
+    jb->count = count;
+    jb->rc = g_nrc - 1;
+    jb->xs = g_nxs - 1;
+    jb->mx = g_nmx - 1;
+    jb->opcode = opcode;
+    jb->scale_need = texcoord_scale_factors(jb->ks, jb->kt);
+    copy_vertex_bytes(g_bytes + g_nbytes, p, count * size);
+    g_nbytes += count * size;
     uint64_t t2 = ticks();
     g_t_state += t1 - t0;
     g_t_vtx += t2 - t1;
     g_t_calls++;
     g_t_verts += count;
-    uint32_t n = 0;
-    GxPrimKind kind = GX_PRIM_TRIANGLES;
-    switch (opcode & 0xF8) {
-    case 0x80: case 0x88: /* quads */
-        for (uint32_t i = 0; i + 3 < count; i += 4) {
-            idx[n++] = i; idx[n++] = i + 1; idx[n++] = i + 2;
-            idx[n++] = i; idx[n++] = i + 2; idx[n++] = i + 3;
-        }
-        break;
-    case 0x90: for (uint32_t i = 0; i + 2 < count; i += 3) { idx[n++] = i; idx[n++] = i + 1; idx[n++] = i + 2; } break;
-    case 0x98: /* strip */
-        for (uint32_t i = 0; i + 2 < count; i++) {
-            if (i & 1) { idx[n++] = i + 1; idx[n++] = i; idx[n++] = i + 2; }
-            else { idx[n++] = i; idx[n++] = i + 1; idx[n++] = i + 2; }
-        }
-        break;
-    case 0xA0: for (uint32_t i = 1; i + 1 < count; i++) { idx[n++] = 0; idx[n++] = i; idx[n++] = i + 1; } break;
-    case 0xA8: kind = GX_PRIM_LINES; for (uint32_t i = 0; i + 1 < count; i += 2) { idx[n++] = i; idx[n++] = i + 1; } break;
-    case 0xB0: kind = GX_PRIM_LINES; for (uint32_t i = 0; i + 1 < count; i++) { idx[n++] = i; idx[n++] = i + 1; } break;
-    default: kind = GX_PRIM_POINTS; for (uint32_t i = 0; i < count; i++) idx[n++] = i; break;
-    }
-    uint64_t t3 = ticks();
-    emit(kind, &g_state, g_state_serial, vs, idx, n);
-    g_t_emit += ticks() - t3;
+    jb->dst = emit(kind, &g_state, g_state_serial, n);
+    g_njobs++;
+    publish_jobs(0);
+    g_t_emit += ticks() - t2;
     g_stat_draws++;
 }
 
@@ -1019,6 +1331,7 @@ static void efb_copy_to_texture(uint32_t v, int x, int y, int w, int h) {
     static int readback = -1;
     if (readback < 0) readback = getenv("SFA_EFB_READBACK") != NULL;
     if (!readback) { efb_copy_gpu(v, x, y, w, h); return; }
+    gx_flush_vertices(); /* the renderer draws this segment now */
     GxFrame *f = frame();
     GxCopyRequest req = {(uint32_t)x, (uint32_t)y, (uint32_t)w, (uint32_t)h, malloc((size_t)w * h * 4), 0};
     f->copy = &req;
@@ -1073,6 +1386,7 @@ static void efb_copy(uint32_t v) {
                0x80000000u | ((bp[0x4B] & 0xFFFFFF) << 5), ((v >> 4) & 7) + ((v >> 3) & 1) * 8, (v >> 9) & 1);
     if (!to_xfb) efb_copy_to_texture(v, x, y, w, h);
     if (to_xfb) {
+        gx_flush_vertices(); /* the frame goes to the renderer: its vertices must be done */
         GxFrame *f = frame();
         f->copy_rect[0] = (uint16_t)x; f->copy_rect[1] = (uint16_t)y; f->copy_rect[2] = (uint16_t)w; f->copy_rect[3] = (uint16_t)h;
         static int dump_frame = -2;
@@ -1129,6 +1443,7 @@ static void bp_write(uint32_t word) {
         tev_color_write(reg, val);
         break;
     case 0x47: case 0x48: /* PE token: GXReadDrawSync reads it back from PE_TOKEN */
+        gx_drain(); /* the game may reuse vertex arrays once it sees the token: workers must be done with them */
         rt_mmio_set(0x100E, val & 0xFFFF, 2);
         break;
     case 0x52:
@@ -1201,6 +1516,7 @@ static size_t run_commands(const uint8_t *b, size_t n, uint32_t guest_addr, int 
             uint32_t hdr = be32(c + 1), addr = hdr & 0xFFFF, cnt = ((hdr >> 16) & 15) + 1;
             for (uint32_t k = 0; k < cnt; k++)
                 if (addr + k < 0x1100) xf[addr + k] = be32(c + 5 + 4 * k);
+            if (addr < 0x468) g_mtx_serial++; /* matrices: the next draw snapshots them */
             if (addr + cnt > 0x600) g_xf_serial++; /* lights or registers: per-draw setup changes */
             break;
         }
@@ -1208,6 +1524,7 @@ static size_t run_commands(const uint8_t *b, size_t n, uint32_t guest_addr, int 
             uint32_t v = be32(c + 1), arr = 12 + ((op - 0x20) >> 3), index = v >> 16, len = ((v >> 12) & 15) + 1, addr = v & 0xFFF;
             uint32_t src = 0x80000000u | ((cp[0xA0 + arr] & 0x03FFFFFF) + index * (cp[0xB0 + arr] & 0xFF));
             for (uint32_t k = 0; k < len; k++) xf[(addr + k) & 0xFFF] = rd32(src + 4 * k);
+            if (addr < 0x468) g_mtx_serial++;
             if (addr + len > 0x600) g_xf_serial++;
             break;
         }
@@ -1289,7 +1606,7 @@ static void fifo_consume(const uint8_t *bytes, size_t n) {
 #define GX_RING (8u << 20)
 static uint8_t *g_ring;
 static SDL_atomic_t g_ring_w, g_ring_r, g_ring_done; /* bytes written, taken, fully executed */
-static SDL_atomic_t g_gx_sleeping;
+static SDL_atomic_t g_gx_sleeping, g_sync_wanted; /* GX thread asleep; GXDrawDone waiting */
 static SDL_sem *g_gx_wake;
 static int g_gx_threaded;
 static uint32_t g_ring_wlocal; /* producer's private copy of g_ring_w */
@@ -1300,6 +1617,12 @@ static int gx_thread(void *arg) {
     uint32_t r = 0;
     for (;;) {
         uint32_t w = (uint32_t)SDL_AtomicGet(&g_ring_w);
+        if (w == r && (uint32_t)SDL_AtomicGet(&g_ring_done) != r) {
+            /* all taken: finish the vertex jobs, then report everything as executed (GXDrawDone waits for it) */
+            gx_drain();
+            SDL_AtomicSet(&g_ring_done, (int)r);
+            continue;
+        }
         if (w == r) {
             /* nothing queued: spin briefly (the game writes in bursts), then sleep until woken */
             int spins = 0;
@@ -1316,8 +1639,13 @@ static int gx_thread(void *arg) {
         for (uint32_t k = 0; k < n; k++) chunk[k] = g_ring[(r + k) & (GX_RING - 1)];
         r += n;
         SDL_AtomicSet(&g_ring_r, (int)r);
+        uint64_t t0 = ticks();
         fifo_consume(chunk, n);
-        SDL_AtomicSet(&g_ring_done, (int)r);
+        if (SDL_AtomicGet(&g_sync_wanted)) { /* GXDrawDone is waiting: finish the vertex jobs and say so */
+            gx_drain();
+            SDL_AtomicSet(&g_ring_done, (int)r);
+        }
+        if (t0) g_t_gxbusy += ticks() - t0;
     }
     return 0;
 }
@@ -1328,12 +1656,16 @@ static void gx_wake(void) {
 
 /* Wait until the GX thread has executed everything queued so far (GXDrawDone). */
 void gx_sync(void) {
-    if (!g_gx_threaded) return;
+    if (!g_gx_threaded) { gx_drain(); return; } /* commands ran here; their vertex jobs may not have */
     uint32_t target = g_ring_wlocal;
+    uint64_t t0 = ticks();
+    SDL_AtomicIncRef(&g_sync_wanted);
     while ((uint32_t)SDL_AtomicGet(&g_ring_done) != target) {
         gx_wake();
         SDL_Delay(0);
     }
+    SDL_AtomicDecRef(&g_sync_wanted);
+    if (t0) g_t_sync += ticks() - t0;
 }
 
 void gx_fifo_write(uint32_t value, int size) {
@@ -1348,9 +1680,13 @@ void gx_fifo_write(uint32_t value, int size) {
         return;
     }
     uint32_t w = g_ring_wlocal;
-    while (w + (uint32_t)size - (uint32_t)SDL_AtomicGet(&g_ring_r) > GX_RING) { /* ring full: let it drain */
-        gx_wake();
-        SDL_Delay(0);
+    if (w + (uint32_t)size - (uint32_t)SDL_AtomicGet(&g_ring_r) > GX_RING) { /* ring full: let it drain */
+        uint64_t t0 = ticks();
+        while (w + (uint32_t)size - (uint32_t)SDL_AtomicGet(&g_ring_r) > GX_RING) {
+            gx_wake();
+            SDL_Delay(0);
+        }
+        if (t0) g_t_ringfull += ticks() - t0;
     }
     for (int i = 0; i < size; i++) g_ring[(w + (uint32_t)i) & (GX_RING - 1)] = b[i];
     g_ring_wlocal = w + (uint32_t)size;
@@ -1368,4 +1704,5 @@ void gx_init(void) {
         if (g_ring && g_gx_wake && SDL_CreateThread(gx_thread, "gx", NULL)) g_gx_threaded = 1;
     }
     printf("[gx] commands run on %s\n", g_gx_threaded ? "their own thread" : "the game's thread");
+    gx_workers_init();
 }

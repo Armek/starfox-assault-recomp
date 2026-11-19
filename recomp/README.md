@@ -146,6 +146,31 @@ frame has about 20,000 small draws (fleet, lasers, particles, HUD).
   the destination use it. Guest RAM there isn't written; if the CPU later stores something else at that
   address (its hash changes), memory wins again. The same stretch now holds 58-60 fps. `SFA_EFB_READBACK=1`
   brings back the read-back path, for a game that reads copies with the CPU.
+- **Mission 10, part 1 (the heaviest flight stage):** the first ~40 s after the stage starts run at 30 fps.
+  That stretch is the in-engine story scene (Star Wolf joins, no HUD), and the game draws its cutscenes at
+  30: during it the guest idles about half the time and the GX thread is a third busy. Once "Mission
+  Start" shows, it holds 60 fps on an i5-1135G7 with about 9,000 draws and 43,000 vertices a frame. Per
+  10 s there: GX thread busy about 4.8 s (vertices 2.9 s, state 0.7 s, batching 0.35 s), renderer about
+  1 s, guest about 50% busy, and GXDrawDone waits under 0.2 s. A CPU about 1.7 times slower per core (the
+  Steam Deck is roughly that) would push the GX thread past 16.7 ms a frame here, so that is where the
+  Deck dips.
+- **Vertex work on worker threads:** reading vertices (indexed lookups into the game's arrays, mostly
+  memory latency) and transforming them was most of that GX thread time. Now `draw()` only copies a
+  draw's vertex bytes, snapshots what reading and transforming them needs (read context: vertex format,
+  array bases and strides, default matrix indices; the XF setup; the matrix memory, about 1.5 KB, when it
+  changed), reserves the output vertices in the frame and publishes a job. Up to 4 worker threads (CPU
+  count minus 3) take jobs while the GX thread goes on with the commands.
+  - **When the workers must be done:** the workers read the game's arrays a little later than the GX thread
+    would have. The game may only reuse an array once the GPU is past its draws, which it learns through
+    GXDrawDone and PE tokens, so the GX thread finishes all jobs before reporting either. It also finishes
+    them before handing over a frame or growing `f->verts`.
+  - **Same output:** the arithmetic per vertex is unchanged. `SFA_GX_VERIFY=1` redoes each frame on one
+    thread and compares: 250 million vertices in Mission 10 matched exactly.
+  - **Measured in Mission 10, same build:** `SFA_GX_DEFER=0` (the old inline path) against the default,
+    alternating runs. GX thread time per frame fell by 40-60% (6.5 to 3.9 ms, 11.8 to 7.0 ms, 24.4 to
+    10.4 ms at matching points), and its vertex time from 3.4 s to 0.55 s per 10 s. Batching went up
+    from about 0.4 to 0.9 s, which covers the byte copy and publishing jobs.
+  - **Settings:** `SFA_GX_WORKERS=n` sets the number of workers (0 = the GX thread does the jobs itself).
 - **Remaining hitches:** shader compiles, the first time a new TEV setup appears (28 at once when Mission
   1's effects first show cause a ~70 ms frame), and loading screens. Texture decoding is minor (about
   2 ms a second).
@@ -282,8 +307,12 @@ The generator also emits **extra entry points** for calls into the middle of a f
   EFB-to-texture copies (with the time spent waiting on them under `SFA_EFB_READBACK`), every 10 s of wall
   time. With `SFA_FPS=1` too, each frame that comes more than 80 ms late prints a `[stall]` line: how long
   the renderer spent on that frame, and which guest functions (and threads) were sampled during the gap,
-  or how much of it the guest was idle.
+  or how much of it the guest was idle. A `[prof] split` line gives, per 10 s, how long the GX thread
+  worked, how long the renderer spent in its frames, and how long the guest waited in `GXDrawDone` or on
+  a full GX ring. This shows which thread limits the frame rate.
 - **`SFA_EFB_READBACK=1`** reads EFB-to-texture copies back into guest RAM (slow; the old path).
+- **`SFA_GX_WORKERS=n`, `SFA_GX_DEFER=0`, `SFA_GX_VERIFY=1`:** the number of vertex worker threads, the old
+  inline vertex path (for comparison), and checking the workers' output against one thread.
 - **Crash reports:** a fatal error (`rt_fatal`) or a host crash (a signal on Linux, an unhandled
   exception on Windows) appends a report to `user/crash.log`: the message, build date, guest registers,
   current stage and the last 64 guest functions entered. Outside test runs it also shows an error box.
