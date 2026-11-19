@@ -465,6 +465,7 @@ static int check_disc(const char *path, char *msg, size_t n) {
 /* ---- settings ---------------------------------------------------------------------------------- */
 static char g_disc[1024];
 static int g_fullscreen;
+static int g_fps60; /* frame rate: 0 the game's own, 1 60 fps */
 
 static void load_settings(void) {
     FILE *f = fopen("user/launcher.cfg", "r");
@@ -474,6 +475,7 @@ static void load_settings(void) {
         line[strcspn(line, "\r\n")] = 0;
         if (!strncmp(line, "disc=", 5)) snprintf(g_disc, sizeof g_disc, "%s", line + 5);
         else if (!strncmp(line, "fullscreen=", 11)) g_fullscreen = atoi(line + 11) != 0;
+        else if (!strncmp(line, "fps60=", 6)) g_fps60 = atoi(line + 6) != 0;
     }
     fclose(f);
 }
@@ -482,8 +484,14 @@ static void save_settings(void) {
     MKDIR("user");
     FILE *f = fopen("user/launcher.cfg", "w");
     if (!f) return;
-    fprintf(f, "disc=%s\nfullscreen=%d\n", g_disc, g_fullscreen);
+    fprintf(f, "disc=%s\nfullscreen=%d\nfps60=%d\n", g_disc, g_fullscreen, g_fps60);
     fclose(f);
+}
+
+/* The saved frame-rate choice (also used when the start screen is skipped). */
+int launcher_fps60(void) {
+    load_settings();
+    return g_fps60;
 }
 
 /* ---- built-in file browser ------------------------------------------------------------------------ */
@@ -777,7 +785,7 @@ static int in_game_mode(void) {
 #define VW 960
 #define VH 600
 enum { SCREEN_MAIN, SCREEN_BROWSE };
-enum { ITEM_DISC, ITEM_DISPLAY, ITEM_PLAY, ITEM_QUIT, ITEM_COUNT };
+enum { ITEM_DISC, ITEM_DISPLAY, ITEM_FPS, ITEM_PLAY, ITEM_QUIT, ITEM_COUNT };
 #define BROWSE_ROWS 9
 #define ROW_H 40.0f
 
@@ -812,19 +820,22 @@ static void draw_background(SDL_Renderer *r, float dt) {
 }
 
 /* Main-screen layout (logical 960x600). */
-typedef struct { SDL_FRect disc_card, browse, display_card, seg, play, quit; } Layout;
+typedef struct { SDL_FRect disc_card, browse, display_card, seg, fps_card, fps_seg, play, quit; } Layout;
 static Layout main_layout(void) {
     Layout L;
     L.disc_card = (SDL_FRect){64, 214, 560, 104};
     L.browse = (SDL_FRect){64 + 560 - 22 - 124, 214 + 32, 124, 40};
-    L.display_card = (SDL_FRect){64, 334, 560, 68};
-    L.seg = (SDL_FRect){64 + 560 - 14 - 250, 334 + 14, 250, 40};
-    L.play = (SDL_FRect){64, 424, 424, 64};
-    L.quit = (SDL_FRect){64 + 436, 424, 124, 64};
+    L.display_card = (SDL_FRect){64, 330, 560, 60};
+    L.seg = (SDL_FRect){64 + 560 - 12 - 250, 330 + 10, 250, 40};
+    L.fps_card = (SDL_FRect){64, 400, 560, 60};
+    L.fps_seg = (SDL_FRect){64 + 560 - 12 - 250, 400 + 10, 250, 40};
+    L.play = (SDL_FRect){64, 476, 424, 60};
+    L.quit = (SDL_FRect){64 + 436, 476, 124, 60};
     return L;
 }
 static SDL_FRect item_rect(const Layout *L, int item) {
-    return item == ITEM_DISC ? L->browse : item == ITEM_DISPLAY ? L->seg : item == ITEM_PLAY ? L->play : L->quit;
+    return item == ITEM_DISC ? L->browse : item == ITEM_DISPLAY ? L->seg : item == ITEM_FPS ? L->fps_seg
+         : item == ITEM_PLAY ? L->play : L->quit;
 }
 
 static SDL_FRect browse_list(void) { return (SDL_FRect){64, 164, VW - 128, BROWSE_ROWS * ROW_H + 16}; }
@@ -877,7 +888,7 @@ int launcher_run(const char *found_disc, int *fullscreen_io, char *disc_out, siz
     const char *script = getenv("SFA_LAUNCHER_SCRIPT"); /* testing: see below */
     int screen = SCREEN_MAIN, sel = disc_ok ? ITEM_PLAY : ITEM_DISC, bsel = 0, scroll = 0, result = 0;
     int stick_held = 0, msg_ok = disc_ok, dialog_open = 0, pad_input = 0, focus_visible = 0, hover = -1, bhover = -1;
-    float hov[ITEM_COUNT] = {0}, seg_pos = g_fullscreen ? 1.0f : 0.0f, fade = 0;
+    float hov[ITEM_COUNT] = {0}, seg_pos = g_fullscreen ? 1.0f : 0.0f, fps_pos = g_fps60 ? 1.0f : 0.0f, fade = 0;
     Uint32 last = SDL_GetTicks();
     Layout L = main_layout();
 
@@ -901,7 +912,7 @@ int launcher_run(const char *found_disc, int *fullscreen_io, char *disc_out, siz
         } while (0)
 
     for (int running = 1; running;) {
-        int move = 0, side = 0, act = 0, back = 0, play = 0, clicked = -1, wheel = 0, seg_click = -1;
+        int move = 0, side = 0, act = 0, back = 0, play = 0, clicked = -1, wheel = 0, seg_click = -1, fps_click = -1;
         SDL_Event e;
         while (SDL_PollEvent(&e)) {
             if (e.type == SDL_QUIT) { running = 0; result = 0; }
@@ -977,12 +988,15 @@ int launcher_run(const char *found_disc, int *fullscreen_io, char *disc_out, siz
                 if (screen == SCREEN_MAIN) {
                     if (inside(L.disc_card, mx, my)) hit = ITEM_DISC;
                     else if (inside(L.display_card, mx, my)) hit = ITEM_DISPLAY;
+                    else if (inside(L.fps_card, mx, my)) hit = ITEM_FPS;
                     else if (inside(L.play, mx, my)) hit = ITEM_PLAY;
                     else if (inside(L.quit, mx, my)) hit = ITEM_QUIT;
                     hover = hit;
                     if (hit >= 0) sel = hit;
                     if (hit == ITEM_DISPLAY && e.type == SDL_MOUSEBUTTONDOWN)
                         seg_click = inside(L.seg, mx, my) ? (mx >= L.seg.x + L.seg.w / 2) : !g_fullscreen;
+                    if (hit == ITEM_FPS && e.type == SDL_MOUSEBUTTONDOWN)
+                        fps_click = inside(L.fps_seg, mx, my) ? (mx >= L.fps_seg.x + L.fps_seg.w / 2) : !g_fps60;
                 } else {
                     SDL_FRect list = browse_list();
                     bhover = -1;
@@ -1052,21 +1066,25 @@ int launcher_run(const char *found_disc, int *fullscreen_io, char *disc_out, siz
         }
 
         if (screen == SCREEN_MAIN && !dialog_open) {
-            if (clicked >= 0) { sel = clicked; act = clicked != ITEM_DISPLAY || seg_click < 0; }
+            if (clicked >= 0) { sel = clicked; act = (clicked != ITEM_DISPLAY || seg_click < 0) && (clicked != ITEM_FPS || fps_click < 0); }
+            if (fps_click >= 0 && fps_click != g_fps60) { g_fps60 = fps_click; save_settings(); }
             if (seg_click >= 0 && seg_click != g_fullscreen) {
                 g_fullscreen = seg_click;
                 SDL_SetWindowFullscreen(win, g_fullscreen ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0);
                 save_settings();
             }
-            if (move) { /* rows: disc, display, then play | quit */
-                int row = sel == ITEM_DISC ? 0 : sel == ITEM_DISPLAY ? 1 : 2;
-                row = (row + (move > 0 ? 1 : 2)) % 3;
-                sel = row == 0 ? ITEM_DISC : row == 1 ? ITEM_DISPLAY : ITEM_PLAY;
+            if (move) { /* rows: disc, display, frame rate, then play | quit */
+                int row = sel == ITEM_DISC ? 0 : sel == ITEM_DISPLAY ? 1 : sel == ITEM_FPS ? 2 : 3;
+                row = (row + (move > 0 ? 1 : 3)) % 4;
+                sel = row == 0 ? ITEM_DISC : row == 1 ? ITEM_DISPLAY : row == 2 ? ITEM_FPS : ITEM_PLAY;
             }
             if (side) {
                 if (sel == ITEM_DISPLAY && (side > 0) != g_fullscreen) {
                     g_fullscreen = side > 0;
                     SDL_SetWindowFullscreen(win, g_fullscreen ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0);
+                    save_settings();
+                } else if (sel == ITEM_FPS && (side > 0) != g_fps60) {
+                    g_fps60 = side > 0;
                     save_settings();
                 } else if (sel == ITEM_PLAY || sel == ITEM_QUIT) sel = side > 0 ? ITEM_QUIT : ITEM_PLAY;
             }
@@ -1084,6 +1102,10 @@ int launcher_run(const char *found_disc, int *fullscreen_io, char *disc_out, siz
                 case ITEM_DISPLAY:
                     g_fullscreen = !g_fullscreen;
                     SDL_SetWindowFullscreen(win, g_fullscreen ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0);
+                    save_settings();
+                    break;
+                case ITEM_FPS:
+                    g_fps60 = !g_fps60;
                     save_settings();
                     break;
                 case ITEM_QUIT: result = 0; running = 0; break;
@@ -1155,6 +1177,7 @@ int launcher_run(const char *found_disc, int *fullscreen_io, char *disc_out, siz
 
             for (int i = 0; i < ITEM_COUNT; i++) hov[i] = approach(hov[i], hover == i ? 1.0f : 0.0f, dt, 14);
             seg_pos = approach(seg_pos, g_fullscreen ? 1.0f : 0.0f, dt, 16);
+            fps_pos = approach(fps_pos, g_fps60 ? 1.0f : 0.0f, dt, 16);
 
             /* focus ring (keyboard and controller): drawn just before the selected control, which
              * covers all but its edge; it breathes a little */
@@ -1178,18 +1201,24 @@ int launcher_run(const char *found_disc, int *fullscreen_io, char *disc_out, siz
             text_vc(r, "Browse" ELLIPSIS, L.browse.x + (L.browse.w - text_w("Browse" ELLIPSIS, 16, 0)) / 2, L.browse.y,
                     L.browse.h, 16, C_TEXT, 0);
 
-            /* display card with a sliding switch */
-            rrect(r, L.display_card, 16, mix(C_CARD, C_CARD_HI, hov[ITEM_DISPLAY]));
-            text_vc(r, "Display", L.display_card.x + 24, L.display_card.y, L.display_card.h, 18, C_TEXT, 0);
-            FOCUS(ITEM_DISPLAY, 12);
-            rrect(r, L.seg, 12, C_TRACK);
-            SDL_FRect knob = {L.seg.x + 4 + seg_pos * (L.seg.w / 2 - 4), L.seg.y + 4, L.seg.w / 2 - 4, L.seg.h - 8};
-            rrect(r, knob, 9, C_ACCENT);
-            const char *opt[2] = {"Window", "Fullscreen"};
-            for (int k = 0; k < 2; k++) {
-                float cx = L.seg.x + L.seg.w / 4 + k * L.seg.w / 2, w = text_w(opt[k], 15, 0);
-                float on = k ? seg_pos : 1 - seg_pos;
-                text_vc(r, opt[k], cx - w / 2, L.seg.y, L.seg.h, 15, mix(C_MUTED, C_TEXT, on), on > 0.5f);
+            /* display and frame-rate cards, each with a sliding switch */
+            for (int row = 0; row < 2; row++) {
+                int item = row ? ITEM_FPS : ITEM_DISPLAY;
+                SDL_FRect card = row ? L.fps_card : L.display_card, seg = row ? L.fps_seg : L.seg;
+                float pos = row ? fps_pos : seg_pos;
+                rrect(r, card, 16, mix(C_CARD, C_CARD_HI, hov[item]));
+                text_vc(r, row ? "Frame rate" : "Display", card.x + 24, card.y, card.h, 18, C_TEXT, 0);
+                if (row) text_vc(r, "Experimental", card.x + 132, card.y, card.h, 13, C_FAINT, 0);
+                FOCUS(item, 12);
+                rrect(r, seg, 12, C_TRACK);
+                SDL_FRect knob = {seg.x + 4 + pos * (seg.w / 2 - 4), seg.y + 4, seg.w / 2 - 4, seg.h - 8};
+                rrect(r, knob, 9, C_ACCENT);
+                const char *opt[2] = {row ? "Original" : "Window", row ? "60 fps" : "Fullscreen"};
+                for (int k = 0; k < 2; k++) {
+                    float cx = seg.x + seg.w / 4 + k * seg.w / 2, w = text_w(opt[k], 15, 0);
+                    float on = k ? pos : 1 - pos;
+                    text_vc(r, opt[k], cx - w / 2, seg.y, seg.h, 15, mix(C_MUTED, C_TEXT, on), on > 0.5f);
+                }
             }
 
             /* play and quit */

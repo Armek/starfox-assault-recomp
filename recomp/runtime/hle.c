@@ -178,6 +178,8 @@ void rt_hook_8005F470(Ctx *c) {
  * (testing; "seconds:stop_stage" leaves stage stop_stage and later alone) sets it once a part has been
  * played that long, to reach later parts and bosses with the
  * state the earlier parts build up. */
+uint32_t g_game_state; /* the main state machine's state (16 = a part is being played), set below */
+
 void rt_hook_8000ECC8(Ctx *c) {
     static int log = -1;
     static double clear_after = -1;
@@ -192,6 +194,7 @@ void rt_hook_8000ECC8(Ctx *c) {
         stop_stage = colon ? atoi(colon + 1) : 0x3B;
     }
     uint32_t st = rd32(c->r[3] + 0x34);
+    g_game_state = st;
     if (st != last) {
         if (log) {
             printf("[state] %d -> %u (stage %u, ctl %08X)\n", (int)last, st, rd8(0x802A2B60u + 0x13C), c->r[3]);
@@ -230,6 +233,78 @@ void rt_hook_8000ECC8(Ctx *c) {
         printf("[stage] RAM snapshot %s (stage %u)\n", path, rd8(0x802A2B60u + 0x13C));
         fflush(stdout);
         next_snap = rt_timebase() + (uint64_t)(snap_every * 40500000.0);
+    }
+}
+
+/* 60 fps option (launcher "Frame rate: 60 fps", or SFA_60FPS=1; SFA_60FPS=0 turns it off).
+ *
+ * The game keeps its target frame rate at 0x80385AF4: 60 in flight, 30 for on-foot parts (set as the stage
+ * loads) and in-engine cutscenes. fn_8003AEB0(), once a frame, derives from it the frame period (0x80385B04,
+ * in VI units of 0x444) and the time-step constants the game code uses, and each frame then advances game
+ * time by one step: 1/60 or 1/30 s. So the game is correct at either rate as long as frames keep up (measured:
+ * forced to 60, Mission 2's game clock advanced exactly frames / 60), but a PC that can't hold 60 would run the
+ * game slower than real time. While a part is played, the hook therefore checks the frame rate: below about 54
+ * for 2 s, it gives the game its own rate back for 20 s, then tries 60 again (waiting twice as long after each
+ * failure, up to 160 s; a new stage starts over at 20 s). SFA_FPS_LOG=1 logs it all. */
+int g_force_60fps = -1; /* set by runtime.c from the launcher setting; the environment wins */
+
+void rt_hook_8003AEB0(Ctx *c) {
+    (void)c;
+    static int log = -1, force;
+    static uint32_t last, native = 30;
+    if (log < 0) {
+        log = getenv("SFA_FPS_LOG") != NULL;
+        const char *e = getenv("SFA_60FPS");
+        force = e ? atoi(e) != 0 : g_force_60fps > 0;
+        if (force) printf("[fps-rate] 60 fps option on\n");
+    }
+    uint32_t rate = rd32(0x80385AF4u);
+    if (rate != last) {
+        if (log) {
+            printf("[fps-rate] game frame rate %u -> %u (stage %u, state %u)\n", last, rate, rd8(0x802A2B60u + 0x13C),
+                   g_game_state);
+            fflush(stdout);
+        }
+        last = rate;
+    }
+    if (!force) return;
+    if (rate != 60) native = rate; /* the game asked for another rate since the last frame */
+    /* keeping up? frames counted per second of wall time while a part is played */
+    static uint64_t window_start, retry_at;
+    static uint32_t frames, slow_secs, wait_secs = 20, stage = 0xFFFFFFFFu;
+    static int backed_off;
+    uint64_t now = rt_timebase();
+    uint32_t cur_stage = rd8(0x802A2B60u + 0x13C);
+    if (cur_stage != stage) { stage = cur_stage; wait_secs = 20; } /* a new stage: start with a short wait */
+    if (backed_off) {
+        if (now < retry_at) return; /* the game's own rate */
+        backed_off = 0;
+        slow_secs = 0;
+        window_start = 0;
+        printf("[fps-rate] trying 60 fps again\n");
+    }
+    if (g_game_state != 16) { window_start = 0; slow_secs = 0; }
+    else if (!window_start) { window_start = now; frames = 0; }
+    else if (++frames, now - window_start >= 40500000ull) {
+        double fps = frames * 40500000.0 / (double)(now - window_start);
+        slow_secs = fps < 54.0 ? slow_secs + 1 : 0;
+        window_start = now;
+        frames = 0;
+        if (slow_secs >= 2) {
+            backed_off = 1;
+            retry_at = now + (uint64_t)wait_secs * 40500000ull;
+            if (rd32(0x80385AF4u) == 60) wr32(0x80385AF4u, native);
+            last = native;
+            printf("[fps-rate] can't hold 60 fps here (%.0f): back to the game's own %u fps for %u s\n", fps, native,
+                   wait_secs);
+            if (wait_secs < 160) wait_secs *= 2; /* failing again soon: wait longer, so it doesn't keep switching */
+            fflush(stdout);
+            return;
+        }
+    }
+    if (rate != 60) {
+        wr32(0x80385AF4u, 60);
+        last = 60;
     }
 }
 

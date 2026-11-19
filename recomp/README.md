@@ -171,6 +171,23 @@ frame has about 20,000 small draws (fleet, lasers, particles, HUD).
     10.4 ms at matching points), and its vertex time from 3.4 s to 0.55 s per 10 s. Batching went up
     from about 0.4 to 0.9 s, which covers the byte copy and publishing jobs.
   - **Settings:** `SFA_GX_WORKERS=n` sets the number of workers (0 = the GX thread does the jobs itself).
+- **60 fps option (launcher "Frame rate", or `SFA_60FPS=1`; `SFA_60FPS=0` turns it off):**
+  - **How the game sets its rate:** one target frame rate at `0x80385AF4` controls it: 60 in flight, 30
+    set while an on-foot stage loads and for in-engine cutscenes; menus run at 60. Once a frame,
+    `fn_8003AEB0` derives the frame period from it (`0x80385B04`, in VI units of 0x444: the VI callback
+    `fn_8000DE20` pays down a budget at `0x80385B40` each retrace, and the main loop waits while it is
+    positive) and the time-step constants the game code reads. Each frame then advances game time by
+    one step.
+  - **What the hook does:** an entry hook there sets the rate to 60. Measured in Mission 2: the game clock
+    (`0x802A2D3C`, a float in seconds) advanced exactly frames / 60, so at a full 60 fps the game runs at
+    normal speed. Cutscenes, subtitles and the HUD looked right.
+  - **When 60 can't be held:** since game time is per frame, a PC that can't hold 60 would run the game
+    in slow motion. So while a part is played (state 16) the hook counts frames per second. Below 54 for
+    2 s, it gives the game its own rate back and retries after 20 s, doubling the wait after each
+    failure up to 160 s; a new stage starts over at 20 s.
+  - **On-foot missions are CPU-bound:** at 30 fps the game's own code already keeps the CPU 50–70% busy
+    in Mission 2 (17–23 ms a frame on an i5-1135G7), so 60 doesn't hold there and the option falls back
+    to 30. A faster CPU should hold it. `SFA_FPS_LOG=1` logs rate changes and fallbacks.
 - **Remaining hitches:** shader compiles, the first time a new TEV setup appears (28 at once when Mission
   1's effects first show cause a ~70 ms frame), and loading screens. Texture decoding is minor (about
   2 ms a second).

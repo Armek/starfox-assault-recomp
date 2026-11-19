@@ -1037,6 +1037,7 @@ int main(int argc, char **argv) {
             }
         }
     }
+    if (!testing && !run_selftest) g_force_60fps = launcher_fps60(); /* the saved choice, with or without the start screen */
     if (!run_selftest) crash_handling_init();
     g_mem = calloc(1, PPC_MEM_SIZE);
     g_lc = calloc(1, PPC_LC_SIZE);

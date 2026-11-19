@@ -33,7 +33,10 @@ Setup
      Game disc    finds an .iso next to the program by itself; Browse... opens your system's
                   file dialog (with a controller, or in the Deck's Game Mode, a built-in browser)
      Display      window or fullscreen
-     Play         start the game (START on a controller)
+     Frame rate   Original (on-foot missions and cutscenes run at 30 fps, as on the GameCube) or
+                  60 fps everywhere (experimental: needs a fast CPU; where 60 can't be held, the
+                  game goes back to its own rate for a while, so it never runs in slow motion)
+     Play        start the game (START on a controller)
    Your choices are remembered in user/launcher.cfg. To skip the start screen, run with --play
    or name the disc image on the command line.
 

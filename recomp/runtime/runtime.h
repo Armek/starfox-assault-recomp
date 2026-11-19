@@ -49,5 +49,7 @@ extern int g_start_stage;
 /* launcher.c: the start screen. found: a disc already found, or NULL. Returns 1 to play (with
  * disc_out and *fullscreen set), 0 to quit, -1 if it couldn't open a window. */
 int launcher_run(const char *found, int *fullscreen, char *disc_out, size_t disc_n);
+int launcher_fps60(void); /* the start screen's saved frame-rate choice */
+extern int g_force_60fps; /* hle.c: 60 fps option from the launcher (SFA_60FPS overrides) */
 
 #endif
