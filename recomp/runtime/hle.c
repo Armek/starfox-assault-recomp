@@ -268,6 +268,28 @@ void rt_hook_8003AEB0(Ctx *c) {
         }
         last = rate;
     }
+    if (log) { /* every 10 s: frames, how far the game clock (0x802A2D3C, seconds) moved, and the rate in use */
+        static uint64_t rep_start;
+        static uint32_t rep_frames, rep_rate60;
+        static float rep_clock;
+        uint64_t t = rt_timebase();
+        uint32_t cw = rd32(0x802A2D3Cu);
+        float clock;
+        memcpy(&clock, &cw, 4);
+        if (!rep_start) { rep_start = t; rep_clock = clock; rep_frames = 0; rep_rate60 = 0; }
+        rep_frames++;
+        rep_rate60 += rate == 60; /* as the frame began: 60 unless the game (or a fallback) set 30 since */
+        if (t - rep_start >= 10ull * 40500000ull) {
+            double secs = (double)(t - rep_start) / 40500000.0;
+            printf("[fps-rate] 10 s: stage %u state %u: %.1f fps, game clock +%.2f s (%.2fx real time), "
+                   "%u%% of frames at the 60 rate\n", rd8(0x802A2B60u + 0x13C), g_game_state, rep_frames / secs,
+                   clock - rep_clock, (clock - rep_clock) / secs, 100 * rep_rate60 / rep_frames);
+            fflush(stdout);
+            rep_start = t;
+            rep_clock = clock;
+            rep_frames = rep_rate60 = 0;
+        }
+    }
     if (!force) return;
     if (rate != 60) native = rate; /* the game asked for another rate since the last frame */
     /* keeping up? frames counted per second of wall time while a part is played */
