@@ -337,6 +337,28 @@ static void probe_nan(Ctx *c, uint32_t addr) {
 void rt_count_call(Ctx *c, uint32_t addr) {
     uint32_t n = ++g_counts[(addr - g_count_lo) >> 2];
     if (g_probe_nan && addr == g_probe_addr) { probe_nan(c, addr); return; }
+    static int args = -1; /* SFA_PROBE_ARGS=1: each second, the calls to the probed function and its f1 range */
+    if (args < 0) args = getenv("SFA_PROBE_ARGS") != NULL;
+    if (args && addr == g_probe_addr) {
+        static uint64_t sec_start;
+        static uint32_t calls;
+        static double lo, hi;
+        uint64_t t = rt_timebase();
+        double f1 = c->f[1].ps0;
+        if (!calls) lo = hi = f1;
+        if (f1 < lo) lo = f1;
+        if (f1 > hi) hi = f1;
+        calls++;
+        if (!sec_start) sec_start = t;
+        if (t - sec_start >= 40500000ull) {
+            printf("[probe-args] %s: %u calls in %.2f s; f1 %g .. %g\n", rt_func_name(addr), calls,
+                   (double)(t - sec_start) / 40500000.0, lo, hi);
+            fflush(stdout);
+            sec_start = t;
+            calls = 0;
+        }
+        return;
+    }
     if (addr != g_probe_addr || n % g_probe_every != 1 % g_probe_every || !ppc_is_ram(c->r[3])) return;
     printf("[probe] %s #%u obj %08X:", rt_func_name(addr), n, c->r[3]);
     for (int r = 4; r <= 6; r++) /* vector arguments, if r4-r6 point at RAM */

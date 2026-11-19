@@ -75,3 +75,6 @@ entry PSVECNormalize
 # 0x444) and the time-step constants from the target frame rate at 0x80385AF4 (60 or 30). The hook in
 # hle.c logs rate changes (SFA_FPS_LOG=1) and can force 60 (SFA_60FPS=1).
 entry fn_8003AEB0
+# fn_800FA400: cubic Bezier curve length, summed over 1,000 steps. hle.c does the same float operations natively;
+# when Mission 1's fleet is set up the game measures ~680 curves at once, which made a 25-42 ms frame.
+fn_800FA400

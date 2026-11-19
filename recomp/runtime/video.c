@@ -830,6 +830,7 @@ static GLuint texture_slot(uint32_t id, uint32_t w, uint32_t h, const void *rgba
     return g_textures[id];
 }
 
+static Uint32 g_last_upload_ms; /* time render() spent uploading textures, last frame */
 static void upload(GxTextureUpload *u) { texture_slot(u->id, u->width, u->height, u->rgba); }
 
 /* Run an EFB copy to texture on the GPU. The caller restores the EFB framebuffer and state. */
@@ -937,7 +938,9 @@ static void write_bmp(const char *path, const uint8_t *rgba, int w, int h) {
 
 static void render(GxFrame *f) {
     uint32_t render_start = SDL_GetTicks();
+    Uint32 up0 = SDL_GetTicks();
     for (uint32_t i = 0; i < f->nuploads; i++) upload(&f->uploads[i]);
+    g_last_upload_ms = SDL_GetTicks() - up0;
     glBindFramebuffer(GL_FRAMEBUFFER, g_efb_fbo);
     glViewport(0, 0, EFB_WIDTH, EFB_HEIGHT);
     glBindVertexArray(g_vao);
@@ -1034,9 +1037,11 @@ static void render(GxFrame *f) {
             uint32_t gap = now - last_present;
             if (gap > worst) worst = gap;
             if (gap > 50) slow++;
-            if (gap > 80) { /* with SFA_PROFILE: what ran during the hitch */
-                printf("[stall] frame %u: %u ms since the last frame, %u ms of it rendering this one\n", f->number, gap,
-                       now - render_start);
+            static int stall_ms = -1; /* SFA_STALL_MS: report frames later than this (default 80) */
+            if (stall_ms < 0) stall_ms = getenv("SFA_STALL_MS") ? atoi(getenv("SFA_STALL_MS")) : 80;
+            if (gap > (uint32_t)stall_ms) { /* with SFA_PROFILE: what ran during the hitch */
+                printf("[stall] frame %u: %u ms since the last frame, %u ms of it rendering this one (%u texture uploads, "
+                       "%u ms of them)\n", f->number, gap, now - render_start, f->nuploads, g_last_upload_ms);
                 rt_prof_stall(gap);
             }
         }

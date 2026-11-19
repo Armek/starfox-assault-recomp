@@ -185,7 +185,7 @@ static unsigned long g_prof_total, g_prof_idle;
 
 /* the last 1024 samples (time, function, guest thread or 0 when idle), for rt_prof_stall */
 #define STALL_RING 1024
-static struct { uint32_t ms, addr, thread; } g_stall_ring[STALL_RING];
+static struct { uint32_t ms, addr, prev, thread; } g_stall_ring[STALL_RING]; /* prev: the guest's lr (return address) */
 static volatile uint32_t g_stall_pos;
 
 static void prof_sample(void) {
@@ -195,6 +195,8 @@ static void prof_sample(void) {
     uint32_t sp = g_stall_pos & (STALL_RING - 1);
     g_stall_ring[sp].ms = (uint32_t)(rt_timebase() / 40500u);
     g_stall_ring[sp].addr = a;
+    HThread *run = g_running; /* the guest's link register: where the current function returns to */
+    g_stall_ring[sp].prev = run && run->c ? run->c->lr : 0;
     g_stall_ring[sp].thread = cur;
     g_stall_pos++;
     if (cur == 0) { g_prof_idle++; return; }
@@ -211,15 +213,15 @@ void rt_prof_stall(uint32_t gap_ms) {
     if (on < 0) on = getenv("SFA_PROFILE") != NULL;
     if (!on) return;
     uint32_t now = (uint32_t)(rt_timebase() / 40500u), end = g_stall_pos;
-    uint32_t addr[32], hits[32], thr[32], n = 0, total = 0, idle = 0;
+    uint32_t addr[32], prv[32], hits[32], thr[32], n = 0, total = 0, idle = 0;
     for (uint32_t i = 1; i <= STALL_RING; i++) {
         uint32_t k = (end - i) & (STALL_RING - 1);
         if (now - g_stall_ring[k].ms > gap_ms || !g_stall_ring[k].ms) break;
         total++;
         if (!g_stall_ring[k].thread) { idle++; continue; }
         uint32_t j = 0;
-        while (j < n && (addr[j] != g_stall_ring[k].addr || thr[j] != g_stall_ring[k].thread)) j++;
-        if (j == n && n < 32) { addr[n] = g_stall_ring[k].addr; thr[n] = g_stall_ring[k].thread; hits[n++] = 0; }
+        while (j < n && (addr[j] != g_stall_ring[k].addr || prv[j] != g_stall_ring[k].prev || thr[j] != g_stall_ring[k].thread)) j++;
+        if (j == n && n < 32) { addr[n] = g_stall_ring[k].addr; prv[n] = g_stall_ring[k].prev; thr[n] = g_stall_ring[k].thread; hits[n++] = 0; }
         if (j < n) hits[j]++;
     }
     printf("[stall] %u ms frame gap: %u samples, %u idle;", gap_ms, total, idle);
@@ -227,7 +229,7 @@ void rt_prof_stall(uint32_t gap_ms) {
         uint32_t best = 0, bi = n;
         for (uint32_t j = 0; j < n; j++) if (hits[j] > best) best = hits[j], bi = j;
         if (bi == n) break;
-        printf(" %s@%08X x%u;", rt_func_name(addr[bi]), thr[bi], hits[bi]);
+        printf(" %s (lr in %s)@%08X x%u;", rt_func_name(addr[bi]), prv[bi] ? rt_func_containing(prv[bi]) : "-", thr[bi], hits[bi]);
         hits[bi] = 0;
     }
     printf("\n");

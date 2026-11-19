@@ -52,6 +52,155 @@ void rt_fp_apply_mode(void) {
 #endif
 }
 
+/* fn_800FA400(p0, p1, p2, p3, end) -> f1: the length of the cubic Bezier curve p0..p3 (float[3] each) from
+ * t = 0 to end, summed over steps of 0.001 (so ~1,000 steps). When Mission 1's fleet is set up the game
+ * measures ~680 curves at once; recompiled (each step calls a vector subtract and a vector length, with
+ * every value going through Ctx and guest memory) that took 25-42 ms in one frame, a visible hitch. This
+ * does the same float operations in the same order (every rounding to single, every fused multiply-add,
+ * the same rsqrt and Newton steps of the length function fn_8015ECE4), so the result is identical, in
+ * host registers. SFA_CURVE_VERIFY=1 also runs the game's own helpers for every call and compares bits. */
+static inline __attribute__((always_inline)) double curve_vec_length(double x, double y, double z, double k0, double k_half, double k_three, double k_neg,
+                               double k_nan) {
+    double xx = rs(x * x), yy = rs(y * y), zz = rs(z * z);
+    double s = rs(xx + yy), f4 = rs(zz + s);
+    if (f4 > k0) { /* fn_8015ECE4: an rsqrt estimate, three Newton steps in double, then x * rsqrt(x) */
+        double r = ppc_frsqrte(f4), e;
+        e = r * r; r = k_half * r; e = -fma(f4, e, -k_three); r = r * e;
+        e = r * r; r = k_half * r; e = -fma(f4, e, -k_three); r = r * e;
+        e = r * r; r = k_half * r; e = -fma(f4, e, -k_three); e = r * e;
+        return rs(f4 * e);
+    }
+    if (f4 < k_neg) return k_nan;
+    return f4 != f4 ? k_nan : f4; /* NaN gives the constant; zero, denormals and infinity themselves */
+}
+
+static inline __attribute__((always_inline)) double curve_length_core(Ctx *c) {
+    float p[4][3];
+    for (int k = 0; k < 4; k++)
+        for (int i = 0; i < 3; i++) p[k][i] = u2f(rd32(c->r[3 + k] + 4u * (uint32_t)i));
+    double t = rs(u2f(rd32(0x80389BE4u))), len = t, one = rs(u2f(rd32(0x80389C00u)));
+    double three = rs(u2f(rd32(0x80389C04u))), step = rs(u2f(rd32(0x80389C08u))), end = c->f[1].ps0;
+    uint32_t r2 = c->r[2]; /* fn_8015ECE4's constants, small-data relative */
+    double k0 = rs(u2f(rd32(r2 - 0x40B0u))), k_half = u2d(rd64(r2 - 0x40A8u)), k_three = u2d(rd64(r2 - 0x40A0u));
+    double k_neg = u2d(rd64(r2 - 0x4098u)), k_nan = rs(u2f(rd32(0x80385AA8u)));
+    float prev[3] = {p[0][0], p[0][1], p[0][2]};
+    while (t <= end) {
+        double f9 = rs(one - t), f8 = rs(t * t);
+        double f1 = rs(f9 * f9), f2 = rs(three * f9), f0 = rs(f8 * t), f3 = rs(three * f1);
+        f1 = rs(f1 * f9);
+        f2 = rs(f2 * f8);
+        f8 = rs(f3 * t);
+        float cur[3];
+        for (int i = 0; i < 3; i++) {
+            double a = rs(p[1][i] * f8);
+            a = rs(fma(f1, p[0][i], a));
+            a = rs(fma(p[2][i], f2, a));
+            a = rs(fma(f0, p[3][i], a));
+            cur[i] = (float)a;
+        }
+        double dx = rs((double)cur[0] - prev[0]), dy = rs((double)cur[1] - prev[1]), dz = rs((double)cur[2] - prev[2]);
+        len = rs(len + curve_vec_length(dx, dy, dz, k0, k_half, k_three, k_neg, k_nan));
+        t = rs(t + step);
+        memcpy(prev, cur, sizeof prev);
+    }
+    return len;
+}
+
+/* The same loop built twice: for any x86-64 CPU (fma() is then a library call, which keeps the CPU from
+ * overlapping steps), and with the FMA instruction for CPUs that have it (Haswell/Piledriver and later,
+ * the Steam Deck). Both round identically: fma() is exact either way. */
+static double curve_length_plain(Ctx *c) { return curve_length_core(c); }
+#if defined(__x86_64__) && (defined(__clang__) || defined(__GNUC__))
+#include <cpuid.h>
+/* FMA3 (CPUID 1: ECX bit 12), with AVX state enabled by the OS (OSXSAVE, ECX bit 27; XCR0 bits 1-2). */
+static int cpu_has_fma(void) {
+    unsigned a, b, c, d;
+    if (!__get_cpuid(1, &a, &b, &c, &d)) return 0;
+    if (!(c & (1u << 12)) || !(c & (1u << 27))) return 0;
+    unsigned lo, hi;
+    __asm__ volatile("xgetbv" : "=a"(lo), "=d"(hi) : "c"(0));
+    return (lo & 6) == 6;
+}
+#endif
+#if defined(__x86_64__) && (defined(__clang__) || defined(__GNUC__))
+__attribute__((target("fma"))) static double curve_length_fma(Ctx *c) { return curve_length_core(c); }
+#endif
+static double curve_length_native(Ctx *c) {
+#if defined(__x86_64__) && (defined(__clang__) || defined(__GNUC__))
+    static int has_fma = -1;
+    if (has_fma < 0) has_fma = cpu_has_fma();
+    if (has_fma) return curve_length_fma(c);
+#endif
+    return curve_length_plain(c);
+}
+
+/* The same loop through the game's own helpers (fn_8015E8A8 subtract, fn_8015ECE4 length), for checking. */
+static double curve_length_helpers(Ctx *c) {
+    Ctx k = *c;
+    uint32_t buf = c->r[1] - 0x100u; /* scratch below the caller's stack, as the original's frame would be */
+    float pts[4][3];
+    for (int q = 0; q < 4; q++)
+        for (int i = 0; i < 3; i++) pts[q][i] = u2f(rd32(c->r[3 + q] + 4u * (uint32_t)i));
+    double t = rs(u2f(rd32(0x80389BE4u))), len = t, one = rs(u2f(rd32(0x80389C00u)));
+    double three = rs(u2f(rd32(0x80389C04u))), step = rs(u2f(rd32(0x80389C08u))), end = c->f[1].ps0;
+    for (int i = 0; i < 3; i++) wr32(buf + 0x20 + 4u * (uint32_t)i, f2u(pts[0][i]));
+    k.r[1] = buf;
+    while (t <= end) {
+        double f9 = rs(one - t), f8 = rs(t * t);
+        double f1 = rs(f9 * f9), f2 = rs(three * f9), f0 = rs(f8 * t), f3 = rs(three * f1);
+        f1 = rs(f1 * f9);
+        f2 = rs(f2 * f8);
+        f8 = rs(f3 * t);
+        for (int i = 0; i < 3; i++) {
+            double a = rs(pts[1][i] * f8);
+            a = rs(fma(f1, pts[0][i], a));
+            a = rs(fma(pts[2][i], f2, a));
+            a = rs(fma(f0, pts[3][i], a));
+            wr32(buf + 0x30 + 4u * (uint32_t)i, f2u((float)a));
+        }
+        k.r[3] = buf + 0x10; k.r[4] = buf + 0x30; k.r[5] = buf + 0x20;
+        f_8015E8A8(&k);
+        k.r[3] = buf + 0x10;
+        f_8015ECE4(&k);
+        len = rs(len + k.f[1].ps0);
+        t = rs(t + step);
+        for (int i = 0; i < 3; i++) wr32(buf + 0x20 + 4u * (uint32_t)i, rd32(buf + 0x30 + 4u * (uint32_t)i));
+    }
+    return len;
+}
+
+HLE(fn_800FA400) {
+    static int verify = -1, timing = -1;
+    if (verify < 0) verify = getenv("SFA_CURVE_VERIFY") != NULL;
+    if (timing < 0) timing = getenv("SFA_PROFILE") != NULL;
+    uint64_t t0 = timing ? rt_timebase() : 0;
+    double len = curve_length_native(c);
+    if (timing) { /* SFA_PROFILE: report bursts of curve measuring (calls less than 50 ms apart) */
+        static uint64_t burst_start, burst_last, burst_ticks;
+        static unsigned burst_calls;
+        uint64_t t1 = rt_timebase();
+        if (burst_calls && t0 - burst_last > 50ull * 40500ull) {
+            if (burst_ticks > 2ull * 40500ull)
+                printf("[curve] %u curve lengths took %.1f ms over %.1f ms\n", burst_calls, burst_ticks / 40500.0,
+                       (burst_last - burst_start) / 40500.0);
+            burst_calls = 0;
+        }
+        if (!burst_calls) { burst_start = t0; burst_ticks = 0; }
+        burst_calls++;
+        burst_ticks += t1 - t0;
+        burst_last = t1;
+    }
+    if (verify) {
+        static unsigned long calls, bad;
+        double ref = curve_length_helpers(c);
+        calls++;
+        if (f2u((float)len) != f2u((float)ref) && bad++ < 20)
+            printf("[curve] native %.9g, game helpers %.9g (end %g)\n", len, ref, c->f[1].ps0);
+        if (calls % 1000 == 0) printf("[curve] %lu curve lengths checked, %lu differed\n", calls, bad);
+    }
+    c->f[1].ps0 = len; /* fmr f1, f29 */
+}
+
 HLE(PPCSetFpNonIEEEMode) {
     c->fpscr |= 0x4u; /* NI */
     g_fp_ni = 1;

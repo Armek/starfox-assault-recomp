@@ -202,6 +202,22 @@ frame has about 20,000 small draws (fleet, lasers, particles, HUD).
   - **Measured in Mission 1:** the first run saved 44 setups (9 KB), including the 28 that used to
     compile at once when Mission 1's effects first show (a 77 ms frame). On the second run 43 were
     built during the logos, and none were compiled during play.
+- **Curve lengths (`fn_800FA400`), Mission 1's biggest hitch:** when a part starts, the game measures the
+  lengths of its fleet's flight paths, cubic Bézier curves summed over 1,000 steps each: 542 curves at
+  the start of part 1 and 679 at part 3.
+  - **Before:** recompiled, each step called a vector subtract and a vector length through Ctx and guest
+    memory, which took 25-42 ms in one frame (85-114 ms frames, the same moments every run).
+  - **The replacement:** an HLE in `hle.c` does the same float operations in the same order (every
+    rounding to single, every fused multiply-add, the rsqrt and three Newton steps of `fn_8015ECE4`). It
+    is built twice: plain, and with the FMA instruction, chosen with CPUID (the library `fma()` call keeps
+    the CPU from overlapping steps).
+  - **Same output:** `SFA_CURVE_VERIFY=1` also runs the game's own helpers for every call and compares bits;
+    no differences in 2,000 curves checked.
+  - **After:** the bursts take 11.7 ms and 15.0 ms, and the longest frames there are 34-40 ms.
+  - **Measuring it:** `SFA_PROFILE` reports each burst (`[curve]`). `SFA_STALL_MS=n` lowers the `[stall]`
+    threshold, and stall lines now give each sample's caller (the guest's lr) and the frame's texture uploads.
+    `SFA_PROBE=<addr>` with `SFA_COUNT_CALLS` and `SFA_PROBE_ARGS=1` counts a function's calls per second
+    and the range of its `f1` argument.
 - **Remaining hitches:** loading screens, and new textures: about 48 at once near Mission 1's first
   effects still coincided with an 80 ms frame. Texture decoding itself is minor (about 2 ms a second).
   Matrices change about every 18 draws (about 6,000 matrix loads a second), so it needs per-draw matrix
