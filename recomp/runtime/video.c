@@ -445,7 +445,7 @@ void video_copy_segment(GxFrame *frame) {
 static SDL_Window *g_window;
 extern uint64_t g_t_render; /* gx.c, SFA_PROFILE */
 static int g_prof_render;
-static unsigned g_shader_compiles; /* TEV programs built (each can stall a frame) */
+static unsigned g_shader_compiles; /* TEV programs built for the game (see the shader cache) */
 static int g_fullscreen, g_window_w = 1280, g_window_h = 960;
 void video_set_window(int fullscreen, int w, int h) {
     g_fullscreen = fullscreen;
@@ -658,9 +658,77 @@ static GLuint compile(GLenum type, const char *src) {
 
 static GLuint g_vs_shader;
 
-static TevProgram *tev_program(const GxTevConfig *cfg) {
+/* ---- shader cache --------------------------------------------------------------------------------
+ * Building a TEV program the first time an effect appears can take tens of milliseconds (28 at once
+ * when Mission 1's effects first show made a ~70 ms frame), and it used to happen again every session.
+ * So every TEV configuration the game uses is appended to user/shaders.bin when it's first built, and
+ * at start the renderer builds the saved ones in the background, a few milliseconds a frame (the logos
+ * and menus are light), so they are ready before they're needed. The file is a header (magic, record
+ * size) and GxTevConfig records; a file that doesn't match is started over. SFA_SHADER_CACHE=0 turns
+ * the cache off. */
+#define SHADER_CACHE_PATH "user/shaders.bin"
+static const char k_cache_magic[8] = {'S', 'F', 'A', 'T', 'E', 'V', '0', '1'};
+static GxTevConfig *g_warm;          /* saved configurations still to build */
+static unsigned g_nwarm, g_warm_next, g_warm_built;
+static FILE *g_cache_out;            /* append new configurations here */
+
+static void shader_cache_open(void) {
+    const char *e = getenv("SFA_SHADER_CACHE");
+    if (e && atoi(e) == 0) return;
+    uint32_t rec = (uint32_t)sizeof(GxTevConfig);
+    FILE *f = fopen(SHADER_CACHE_PATH, "rb");
+    int valid = 0;
+    if (f) {
+        char magic[8];
+        uint32_t size = 0;
+        if (fread(magic, 1, 8, f) == 8 && fread(&size, 4, 1, f) == 1 && !memcmp(magic, k_cache_magic, 8) && size == rec) {
+            valid = 1;
+            GxTevConfig cfg;
+            while (fread(&cfg, rec, 1, f) == 1) {
+                if (g_nwarm % 64 == 0) g_warm = realloc(g_warm, sizeof *g_warm * (g_nwarm + 64));
+                g_warm[g_nwarm++] = cfg;
+            }
+        }
+        fclose(f);
+    }
+    if (valid) g_cache_out = fopen(SHADER_CACHE_PATH, "ab");
+    else if ((g_cache_out = fopen(SHADER_CACHE_PATH, "wb"))) { /* new, or from another version: start over */
+        fwrite(k_cache_magic, 1, 8, g_cache_out);
+        fwrite(&rec, 4, 1, g_cache_out);
+        fflush(g_cache_out);
+    }
+    printf("[video] shader cache: %u saved shader setups to build\n", g_nwarm);
+}
+
+static TevProgram *tev_program_build(const GxTevConfig *cfg, int for_game);
+
+/* Builds saved configurations for up to budget_ms (on the render thread, between frames). */
+static void shader_cache_warm(Uint32 budget_ms) {
+    if (g_warm_next >= g_nwarm) return;
+    Uint32 start = SDL_GetTicks();
+    while (g_warm_next < g_nwarm && SDL_GetTicks() - start < budget_ms) tev_program_build(&g_warm[g_warm_next++], 0);
+    if (g_warm_next == g_nwarm) {
+        printf("[video] shader cache: %u shader setups built ahead of time\n", g_warm_built);
+        fflush(stdout);
+        free(g_warm);
+        g_warm = NULL;
+    }
+}
+
+static TevProgram *tev_program(const GxTevConfig *cfg) { return tev_program_build(cfg, 1); }
+
+static TevProgram *tev_program_build(const GxTevConfig *cfg, int for_game) {
     for (unsigned i = 0; i < g_nprogs; i++)
         if (!memcmp(&g_progs[i].cfg, cfg, sizeof *cfg)) return &g_progs[i];
+    if (for_game) {
+        g_shader_compiles++;
+        if (g_cache_out) { /* remember it for next time */
+            fwrite(cfg, sizeof *cfg, 1, g_cache_out);
+            fflush(g_cache_out);
+        }
+    } else {
+        g_warm_built++;
+    }
     if (g_nprogs == g_cap_progs) {
         g_cap_progs = g_cap_progs ? g_cap_progs * 2 : 64;
         g_progs = realloc(g_progs, sizeof *g_progs * g_cap_progs);
@@ -673,7 +741,6 @@ static TevProgram *tev_program(const GxTevConfig *cfg) {
     glAttachShader(p->prog, compile(GL_FRAGMENT_SHADER, fs));
     free(fs);
     glLinkProgram(p->prog);
-    g_shader_compiles++;
     glUseProgram(p->prog);
     for (int i = 0; i < 8; i++) {
         char name[8];
@@ -1018,6 +1085,7 @@ static int render_thread(void *arg) {
     SDL_GL_SetSwapInterval(0);
     gl_setup();
     printf("[video] OpenGL renderer ready\n");
+    shader_cache_open();
     if (g_dump) {
 #ifdef _WIN32
         system("if not exist build\\GF7E01\\frames mkdir build\\GF7E01\\frames");
@@ -1062,6 +1130,7 @@ static int render_thread(void *arg) {
             render(f);
             if (t0) g_t_render += rt_timebase() - t0;
             free_frame(f);
+            shader_cache_warm(6); /* saved shader setups, a few ms a frame until all are built */
         }
     }
     return 0;

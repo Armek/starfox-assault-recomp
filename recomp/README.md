@@ -195,9 +195,15 @@ frame has about 20,000 small draws (fleet, lasers, particles, HUD).
     - `restrict` on the generated functions' context pointer, so guest stores through `uint8_t*` no
       longer force register reloads.
     - Batching the write-gather pipe's ring updates (2,500-8,000 writes a frame, each with locked atomics).
-- **Remaining hitches:** shader compiles, the first time a new TEV setup appears (28 at once when Mission
-  1's effects first show cause a ~70 ms frame), and loading screens. Texture decoding is minor (about
-  2 ms a second).
+- **Shader cache:** every TEV setup the game uses is appended to `user/shaders.bin` (a header, then
+  `GxTevConfig` records) the first time it's built. At start, the renderer builds the saved ones in the
+  background, up to 6 ms a frame, during the logos and menus. A file whose header doesn't match is
+  started over, and `SFA_SHADER_CACHE=0` turns the cache off.
+  - **Measured in Mission 1:** the first run saved 44 setups (9 KB), including the 28 that used to
+    compile at once when Mission 1's effects first show (a 77 ms frame). On the second run 43 were
+    built during the logos, and none were compiled during play.
+- **Remaining hitches:** loading screens, and new textures: about 48 at once near Mission 1's first
+  effects still coincided with an 80 ms frame. Texture decoding itself is minor (about 2 ms a second).
   Matrices change about every 18 draws (about 6,000 matrix loads a second), so it needs per-draw matrix
   snapshots in a buffer the shader indexes, not one uniform set per batch.
 

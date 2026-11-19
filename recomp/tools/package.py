@@ -57,6 +57,8 @@ Options
 -------
 {help}
 Saves (memory card files) are kept in user/GF7E01/card_a/.
+user/shaders.bin remembers the game's graphics effects, so they're prepared at start instead of
+causing a short hitch the first time each one appears. It fills in as you play; deleting it is safe.
 
 If the game stops with an error or crashes, a report is added to user/crash.log. When it isn't
 started from a terminal (from Steam, a file manager, or the Deck's game mode), everything it prints
