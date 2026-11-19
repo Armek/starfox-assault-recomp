@@ -182,12 +182,19 @@ frame has about 20,000 small draws (fleet, lasers, particles, HUD).
     (`0x802A2D3C`, a float in seconds) advanced exactly frames / 60, so at a full 60 fps the game runs at
     normal speed. Cutscenes, subtitles and the HUD looked right.
   - **When 60 can't be held:** since game time is per frame, a PC that can't hold 60 would run the game
-    in slow motion. So while a part is played (state 16) the hook counts frames per second. Below 54 for
-    2 s, it gives the game its own rate back and retries after 20 s, doubling the wait after each
-    failure up to 160 s; a new stage starts over at 20 s.
-  - **On-foot missions are CPU-bound:** at 30 fps the game's own code already keeps the CPU 50–70% busy
-    in Mission 2 (17–23 ms a frame on an i5-1135G7), so 60 doesn't hold there and the option falls back
-    to 30. A faster CPU should hold it. `SFA_FPS_LOG=1` logs rate changes and fallbacks.
+    in slow motion. So while a part is played (state 16, after its first 5 s, which have loading
+    hitches and shader compiles) the hook counts frames per second. Below 54 for 2 s, it gives the
+    game its own rate back and retries after 20 s, doubling the wait after each failure up to 160 s; a
+    new stage starts over at 20 s.
+  - **On-foot missions hold 60 on an i5-1135G7:** Mission 2 ran at 59-60 fps for most of a 2-minute run
+    (52-57 in its busiest stretch), with the guest idle about half the time. At 30 fps the guest is
+    idle 68-75% (8-10 ms of work a frame). Earlier figures of 17-23 ms came from runs while the laptop
+    was busy with other work. `SFA_FPS_LOG=1` logs rate changes and fallbacks.
+  - **Tried without gain** (Mission 2 at 30 fps, alternating runs; the difference was smaller than the
+    spread between runs):
+    - `restrict` on the generated functions' context pointer, so guest stores through `uint8_t*` no
+      longer force register reloads.
+    - Batching the write-gather pipe's ring updates (2,500-8,000 writes a frame, each with locked atomics).
 - **Remaining hitches:** shader compiles, the first time a new TEV setup appears (28 at once when Mission
   1's effects first show cause a ~70 ms frame), and loading screens. Texture decoding is minor (about
   2 ms a second).

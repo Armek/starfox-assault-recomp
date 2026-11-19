@@ -243,7 +243,8 @@ void rt_hook_8000ECC8(Ctx *c) {
  * in VI units of 0x444) and the time-step constants the game code uses, and each frame then advances game
  * time by one step: 1/60 or 1/30 s. So the game is correct at either rate as long as frames keep up (measured:
  * forced to 60, Mission 2's game clock advanced exactly frames / 60), but a PC that can't hold 60 would run the
- * game slower than real time. While a part is played, the hook therefore checks the frame rate: below about 54
+ * game slower than real time. While a part is played (after its first 5 s, which have loading hitches), the
+ * hook therefore checks the frame rate: below about 54
  * for 2 s, it gives the game its own rate back for 20 s, then tries 60 again (waiting twice as long after each
  * failure, up to 160 s; a new stage starts over at 20 s). SFA_FPS_LOG=1 logs it all. */
 int g_force_60fps = -1; /* set by runtime.c from the launcher setting; the environment wins */
@@ -283,7 +284,10 @@ void rt_hook_8003AEB0(Ctx *c) {
         window_start = 0;
         printf("[fps-rate] trying 60 fps again\n");
     }
-    if (g_game_state != 16) { window_start = 0; slow_secs = 0; }
+    static uint64_t playing_since;
+    if (g_game_state != 16) { window_start = 0; slow_secs = 0; playing_since = 0; }
+    else if (!playing_since) playing_since = now;
+    else if (now - playing_since < 5ull * 40500000ull) { /* the first seconds of play: loading hitches, shaders */ }
     else if (!window_start) { window_start = now; frames = 0; }
     else if (++frames, now - window_start >= 40500000ull) {
         double fps = frames * 40500000.0 / (double)(now - window_start);

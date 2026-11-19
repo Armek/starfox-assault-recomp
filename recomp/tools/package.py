@@ -34,7 +34,7 @@ Setup
                   file dialog (with a controller, or in the Deck's Game Mode, a built-in browser)
      Display      window or fullscreen
      Frame rate   Original (on-foot missions and cutscenes run at 30 fps, as on the GameCube) or
-                  60 fps everywhere (experimental: needs a fast CPU; where 60 can't be held, the
+                  60 fps everywhere (experimental; where your PC can't hold 60, the
                   game goes back to its own rate for a while, so it never runs in slow motion)
      Play        start the game (START on a controller)
    Your choices are remembered in user/launcher.cfg. To skip the start screen, run with --play
