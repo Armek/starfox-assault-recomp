@@ -3,9 +3,6 @@
  * Guest memory, the indirect-call dispatcher, tracing and diagnostics, boot setup (the low-memory
  * state the GameCube IPL and apploader leave behind) and the entry point.
  */
-#if !defined(_WIN32) && !defined(_GNU_SOURCE)
-#define _GNU_SOURCE /* REG_RIP and REG_RSP in the crash handler's ucontext */
-#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdarg.h>
@@ -193,10 +190,11 @@ static LONG WINAPI on_crash(EXCEPTION_POINTERS *ep) {
 }
 #else
 static void on_crash(int sig, siginfo_t *si, void *uc) {
-#if defined(__x86_64__)
-    g_crash_pc = (void *)((ucontext_t *)uc)->uc_mcontext.gregs[REG_RIP];
+#if defined(__x86_64__) /* gregs indices for x86-64 glibc; not REG_RIP/REG_RSP, which need _GNU_SOURCE, and that
+                          * would make the binary need glibc 2.38 (C23 strtol/sscanf) */
+    g_crash_pc = (void *)((ucontext_t *)uc)->uc_mcontext.gregs[16 /* REG_RIP */];
     if (!g_crash_pc) { /* a call through a null function pointer: the caller's return address is on top of the stack */
-        void **sp = (void **)((ucontext_t *)uc)->uc_mcontext.gregs[REG_RSP];
+        void **sp = (void **)((ucontext_t *)uc)->uc_mcontext.gregs[15 /* REG_RSP */];
         g_crash_pc = (void *)1;
         if (sp) g_crash_stack[g_crash_depth++] = sp[0];
     }
