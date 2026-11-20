@@ -72,6 +72,9 @@ typedef struct HThread {
     int exiting;           /* thread function returned; it is running OSExitThread */
     uint32_t start_pc, exit_pc;
     int id;
+#ifdef _WIN32
+    HANDLE os;             /* the host thread (SFA_PROFILE_NATIVE samples it) */
+#endif
 } HThread;
 
 #define MAX_THREADS 64
@@ -164,7 +167,7 @@ static HThread *new_thread(uint32_t ctx) {
 #ifdef _WIN32
     HANDLE h = CreateThread(NULL, 8 << 20, thread_main, t, 0, NULL);
     if (!h) rt_fatal("CreateThread failed");
-    CloseHandle(h);
+    t->os = h; /* kept for SFA_PROFILE_NATIVE */
 #else
     pthread_t pt;
     pthread_attr_t attr;
@@ -254,6 +257,185 @@ static void prof_report(void) {
     g_prof_total = g_prof_idle = 0;
 }
 
+
+#ifdef _WIN32
+/* ---- native sampling profiler (SFA_PROFILE_NATIVE=1, Windows) ------------------------------------
+ * Every millisecond, briefly suspend the host thread running guest code and note its instruction
+ * pointer; every 10 s print the hottest source lines (via the build's debug info and DbgHelp). Each
+ * line of generated code is one guest instruction, so this shows which kinds of operations cost the
+ * most. Inlined helpers (rd32, set_single, ...) show as their ppc.h lines. */
+#include <dbghelp.h>
+#define NAT_SLOTS 65536
+static uint64_t g_nat_ip[NAT_SLOTS];
+static uint32_t g_nat_hits[NAT_SLOTS];
+static unsigned long g_nat_total;
+
+static void native_sample(void) {
+    HThread *t = g_running;
+    if (!t || !t->os || rd32(OS_CURRENT_THREAD) == 0) return;
+    if (SuspendThread(t->os) == (DWORD)-1) return;
+    CONTEXT ctx;
+    ctx.ContextFlags = CONTEXT_CONTROL;
+    uint64_t ip = GetThreadContext(t->os, &ctx) ? ctx.Rip : 0;
+    ResumeThread(t->os);
+    if (!ip) return;
+    g_nat_total++;
+    uint32_t h = (uint32_t)((ip * 0x9E3779B97F4A7C15ull) >> 48);
+    for (int p = 0; p < 64; p++) {
+        uint32_t k = (h + (uint32_t)p) & (NAT_SLOTS - 1);
+        if (g_nat_ip[k] == ip || !g_nat_ip[k]) { g_nat_ip[k] = ip; g_nat_hits[k]++; return; }
+    }
+}
+
+typedef struct { char key[300]; uint32_t hits; } NatLine;
+static int nat_cmp(const void *a, const void *b) { return (int)((const NatLine *)b)->hits - (int)((const NatLine *)a)->hits; }
+
+/* the text of a source line; files are read once and kept, split into lines */
+typedef struct { char path[300]; char *data; char **line; unsigned nlines; } SrcFile;
+static SrcFile g_src[256];
+static unsigned g_nsrc;
+
+static void line_text(const char *file, DWORD line, char *out, size_t n) {
+    out[0] = 0;
+    SrcFile *sf = NULL;
+    for (unsigned i = 0; i < g_nsrc && !sf; i++)
+        if (!strcmp(g_src[i].path, file)) sf = &g_src[i];
+    if (!sf) {
+        if (g_nsrc == 256) return;
+        sf = &g_src[g_nsrc++];
+        snprintf(sf->path, sizeof sf->path, "%s", file);
+        FILE *f = fopen(file, "rb");
+        if (!f) return;
+        fseek(f, 0, SEEK_END);
+        long size = ftell(f);
+        fseek(f, 0, SEEK_SET);
+        sf->data = malloc((size_t)size + 1);
+        if (!sf->data || fread(sf->data, 1, (size_t)size, f) != (size_t)size) { fclose(f); free(sf->data); sf->data = NULL; return; }
+        fclose(f);
+        sf->data[size] = 0;
+        unsigned cap = 1024;
+        sf->line = malloc(sizeof *sf->line * cap);
+        sf->line[sf->nlines++] = sf->data;
+        for (char *p = sf->data; *p; p++)
+            if (*p == '\n') {
+                *p = 0;
+                if (sf->nlines == cap) { cap *= 2; sf->line = realloc(sf->line, sizeof *sf->line * cap); }
+                sf->line[sf->nlines++] = p + 1;
+            }
+    }
+    if (!sf->data || line < 1 || line > sf->nlines) return;
+    const char *s = sf->line[line - 1];
+    while (*s == ' ') s++;
+    snprintf(out, n, "%s", s);
+    out[strcspn(out, "\r")] = 0;
+}
+
+static void native_report(void) {
+    static int sym_ready;
+    HANDLE proc = GetCurrentProcess();
+    if (!sym_ready) {
+        SymSetOptions(SYMOPT_LOAD_LINES | SYMOPT_DEFERRED_LOADS);
+        sym_ready = SymInitialize(proc, NULL, TRUE) ? 1 : -1;
+    }
+    if (sym_ready < 0 || !g_nat_total) return;
+    /* by source line, and by kind: which file (generated code or a runtime file) */
+    static NatLine lines[8192];
+    unsigned nl = 0;
+    char kinds[16][64];
+    uint32_t khits[16] = {0};
+    unsigned nk = 0;
+    for (unsigned k = 0; k < NAT_SLOTS; k++) {
+        if (!g_nat_hits[k]) continue;
+        IMAGEHLP_LINE64 li = {sizeof li};
+        DWORD disp = 0;
+        char key[300], kind[64] = "?";
+        if (SymGetLineFromAddr64(proc, g_nat_ip[k], &disp, &li)) {
+            const char *base = strrchr(li.FileName, '\\');
+            base = base ? base + 1 : li.FileName;
+            snprintf(key, sizeof key, "%s:%lu", li.FileName, (unsigned long)li.LineNumber);
+            snprintf(kind, sizeof kind, "%s", strncmp(base, "recomp_", 7) ? base : "generated code");
+        } else {
+            char sb[sizeof(SYMBOL_INFO) + 256];
+            SYMBOL_INFO *si = (SYMBOL_INFO *)sb;
+            si->SizeOfStruct = sizeof(SYMBOL_INFO);
+            si->MaxNameLen = 255;
+            DWORD64 d64;
+            if (SymFromAddr(proc, g_nat_ip[k], &d64, si)) snprintf(key, sizeof key, "[%s]", si->Name);
+            else snprintf(key, sizeof key, "[%llx]", (unsigned long long)g_nat_ip[k]);
+            snprintf(kind, sizeof kind, "outside the program (%s)", key);
+            if (strlen(kind) > 60) kind[60] = 0;
+        }
+        unsigned j = 0;
+        while (j < nk && strcmp(kinds[j], kind)) j++;
+        if (j == nk && nk < 16) { snprintf(kinds[nk], sizeof kinds[nk], "%s", kind); nk++; }
+        if (j < nk) khits[j] += g_nat_hits[k];
+        unsigned i = 0;
+        while (i < nl && strcmp(lines[i].key, key)) i++;
+        if (i == nl && nl < 8192) { snprintf(lines[nl].key, sizeof lines[nl].key, "%s", key); lines[nl].hits = 0; nl++; }
+        if (i < nl) lines[i].hits += g_nat_hits[k];
+    }
+    printf("[native] %lu samples of guest code; by file:", g_nat_total);
+    for (unsigned j = 0; j < nk; j++) printf(" %s %.1f%%;", kinds[j], 100.0 * khits[j] / g_nat_total);
+    printf("\n");
+    qsort(lines, nl, sizeof *lines, nat_cmp);
+    /* generated code by kind of guest operation, from each sampled line's text */
+    static const char *const cls_name[] = {"loads", "stores", "paired-single load/store", "compares and CR",
+                                           "branches", "calls", "float ops", "integer ops", "loop safepoints",
+                                           "compiler-made code (line 0)", "other"};
+    enum { C_LD, C_ST, C_PSQ, C_CMP, C_BR, C_CALL, C_FP, C_INT, C_SP, C_ZERO, C_OTHER, C_N };
+    uint32_t cls[C_N] = {0}, gen_total = 0;
+    for (unsigned i = 0; i < nl; i++) {
+        const char *bs = strrchr(lines[i].key, '\\');
+        if (!bs || strncmp(bs + 1, "recomp_", 7) && strncmp(bs + 1, "rel_", 4)) continue;
+        gen_total += lines[i].hits;
+        char file[300], text[400] = "";
+        snprintf(file, sizeof file, "%s", lines[i].key);
+        char *colon = strrchr(file, ':');
+        long ln = colon ? atol(colon + 1) : 0;
+        int c;
+        if (ln == 0) c = C_ZERO;
+        else {
+            *colon = 0;
+            line_text(file, (DWORD)ln, text, sizeof text);
+            const char *code = strstr(text, "*/");
+            code = code ? code + 2 : text;
+            if (strstr(code, "psq_")) c = C_PSQ;
+            else if (strstr(code, "RT_SAFEPOINT")) c = C_SP;
+            else if (strstr(code, "cmp_") || strstr(code, "cr_")) c = (strstr(code, "goto") ? C_BR : C_CMP);
+            else if (strstr(code, "goto") || strstr(code, "return")) c = C_BR;
+            else if (strstr(code, " f_") || strstr(code, "rt_call") || strstr(code, "RT_ENTER")) c = C_CALL;
+            else if (strstr(code, "wr8(") || strstr(code, "wr16(") || strstr(code, "wr32(") || strstr(code, "wr64(")) c = C_ST;
+            else if (strstr(code, "rd8(") || strstr(code, "rd16(") || strstr(code, "rd32(") || strstr(code, "rd64(")) c = C_LD;
+            else if (strstr(code, "c->f[") || strstr(code, "set_single")) c = C_FP;
+            else if (strstr(code, "c->r[")) c = C_INT;
+            else c = C_OTHER;
+        }
+        cls[c] += lines[i].hits;
+    }
+    if (gen_total) {
+        printf("[native] generated code by kind:");
+        for (int c = 0; c < C_N; c++) printf(" %s %.1f%%;", cls_name[c], 100.0 * cls[c] / gen_total);
+        printf("\n");
+    }
+    for (unsigned i = 0; i < nl && i < 40; i++) {
+        char text[200] = "";
+        char file[300];
+        snprintf(file, sizeof file, "%s", lines[i].key);
+        char *colon = strrchr(file, ':');
+        if (colon && file[0] != '[') {
+            *colon = 0;
+            line_text(file, (DWORD)atol(colon + 1), text, sizeof text);
+        }
+        const char *base = strrchr(lines[i].key, '\\');
+        printf("[native] %5.2f%%  %-28s %s\n", 100.0 * lines[i].hits / g_nat_total, base ? base + 1 : lines[i].key, text);
+    }
+    fflush(stdout);
+    memset(g_nat_hits, 0, sizeof g_nat_hits);
+    memset(g_nat_ip, 0, sizeof g_nat_ip);
+    g_nat_total = 0;
+}
+#endif
+
 #ifdef _WIN32
 static DWORD WINAPI prof_thread(LPVOID arg)
 #else
@@ -264,13 +446,22 @@ static void *prof_thread(void *arg)
     /* sample about every millisecond, report every 10 s of wall time (sleeps overshoot, so a fixed
      * number of samples would stretch the interval) */
     uint64_t next = rt_timebase() + 10ull * 40500000ull;
+#ifdef _WIN32
+    int native = getenv("SFA_PROFILE_NATIVE") != NULL;
+#endif
     for (;;) {
         rt_sleep_us(1000);
         prof_sample();
+#ifdef _WIN32
+        if (native) native_sample();
+#endif
         if (rt_timebase() >= next) {
             next += 10ull * 40500000ull;
             prof_report();
             gx_profile_report();
+#ifdef _WIN32
+            if (native) native_report();
+#endif
         }
     }
     return 0;
@@ -280,6 +471,9 @@ void rt_threads_init(Ctx *main_ctx) {
     HThread *t = calloc(1, sizeof *t);
     t->c = main_ctx;
     t->id = 0;
+#ifdef _WIN32
+    DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &t->os, 0, FALSE, DUPLICATE_SAME_ACCESS);
+#endif
     g_threads[g_thread_count++] = t;
     g_running = t;
     t_self = t;

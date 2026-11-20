@@ -3,6 +3,9 @@
  * Guest memory, the indirect-call dispatcher, tracing and diagnostics, boot setup (the low-memory
  * state the GameCube IPL and apploader leave behind) and the entry point.
  */
+#if !defined(_WIN32) && !defined(_GNU_SOURCE)
+#define _GNU_SOURCE /* REG_RIP and REG_RSP in the crash handler's ucontext */
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdarg.h>
@@ -10,10 +13,14 @@
 #include <string.h>
 #ifdef _WIN32
 #include <windows.h>
+#include <dbghelp.h>
 #include <io.h>
 #include <direct.h>
 #else
 #include <unistd.h>
+#include <sys/mman.h>
+#include <execinfo.h>
+#include <ucontext.h>
 #include <dirent.h>
 #include <signal.h>
 #include <sys/stat.h>
@@ -28,8 +35,27 @@ typedef struct { uint32_t addr; GuestFn fn; const char *name; } FuncEntry;
 extern const unsigned g_func_count;
 extern const FuncEntry g_funcs[];
 
-uint8_t *g_mem;
+int g_mem_ready;
 uint8_t *g_lc;
+
+/* Map guest RAM at its fixed host address (see PPC_MEM_HOST in ppc.h), zeroed. */
+static void rt_mem_init(void) {
+    void *want = (void *)(uintptr_t)PPC_MEM_HOST;
+#ifdef _WIN32
+    void *got = VirtualAlloc(want, PPC_MEM_SIZE, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+#else
+#ifndef MAP_FIXED_NOREPLACE
+#define MAP_FIXED_NOREPLACE 0x100000
+#endif
+    void *got = mmap(want, PPC_MEM_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
+    if (got == MAP_FAILED) got = NULL;
+#endif
+    if (got != want)
+        rt_fatal("could not reserve guest memory at 0x%llx (got %p); please report this",
+                 (unsigned long long)PPC_MEM_HOST, got);
+    g_mem_ready = 1;
+}
+
 static Ctx g_ctx;
 
 /* ---- diagnostics ------------------------------------------------------------------------------- */
@@ -56,6 +82,44 @@ void rt_dump_trace(void) { dump_trace_to(stderr, 24); }
  * happened, the guest registers and the last guest functions entered. Players can send that file.
  * When the program wasn't started from a terminal (Steam, a file manager, the Deck's game mode),
  * everything it prints goes to user/sfa.log too, for the last run. */
+/* Where the host CPU was when it crashed (set by the crash handlers), for the report. */
+static void *g_crash_pc;
+static void *g_crash_stack[32];
+static int g_crash_depth;
+
+static void host_location(FILE *f) {
+    if (!g_crash_pc) return;
+#ifdef _WIN32
+    HANDLE proc = GetCurrentProcess();
+    static int ready;
+    if (!ready) { SymSetOptions(SYMOPT_LOAD_LINES | SYMOPT_DEFERRED_LOADS); ready = SymInitialize(proc, NULL, TRUE) ? 1 : -1; }
+    fprintf(f, "[recomp] host call stack (innermost first):\n");
+    for (int i = 0; i < g_crash_depth; i++) {
+        DWORD64 a = (DWORD64)(uintptr_t)g_crash_stack[i], d = 0;
+        char sb[sizeof(SYMBOL_INFO) + 256];
+        SYMBOL_INFO *si = (SYMBOL_INFO *)sb;
+        si->SizeOfStruct = sizeof(SYMBOL_INFO);
+        si->MaxNameLen = 255;
+        IMAGEHLP_LINE64 li = {sizeof li};
+        DWORD ld = 0;
+        int has_sym = ready > 0 && SymFromAddr(proc, a, &d, si);
+        int has_line = ready > 0 && SymGetLineFromAddr64(proc, a, &ld, &li);
+        fprintf(f, "    %p %s", (void *)(uintptr_t)a, has_sym ? si->Name : "?");
+        if (has_line) {
+            const char *base = strrchr(li.FileName, '\\');
+            fprintf(f, " (%s:%lu)", base ? base + 1 : li.FileName, (unsigned long)li.LineNumber);
+        }
+        fprintf(f, "\n");
+    }
+#else
+    /* raw addresses: resolve with `addr2line -f -e sfa <address - base>` for this build */
+    extern char __executable_start;
+    fprintf(f, "[recomp] host call stack (innermost first; program loaded at %p):\n", (void *)&__executable_start);
+    for (int i = 0; i < g_crash_depth; i++)
+        fprintf(f, "    %p (+0x%lx)\n", g_crash_stack[i], (unsigned long)((char *)g_crash_stack[i] - &__executable_start));
+#endif
+}
+
 static void write_report(FILE *f, const char *what) {
     time_t now = time(NULL);
     char when[64];
@@ -66,11 +130,12 @@ static void write_report(FILE *f, const char *what) {
     if (!c) c = &g_ctx;
     fprintf(f, "[recomp] guest registers: r1=%08X lr=%08X ctr=%08X r3=%08X r4=%08X r5=%08X msr=%08X\n",
             c->r[1], c->lr, c->ctr, c->r[3], c->r[4], c->r[5], c->msr);
-    if (g_mem) {
+    if (g_mem_ready) {
         uint32_t stage = rd8(0x802A2B60u + 0x13C);
         fprintf(f, "[recomp] current stage %u (mission %d)\n", stage, stage < 0x3B ? rd8(0x80223560u + stage * 0x14) + 1 : -1);
     }
     dump_trace_to(f, 64);
+    host_location(f);
     fflush(f);
 }
 
@@ -104,6 +169,21 @@ void rt_fatal(const char *fmt, ...) {
 
 #ifdef _WIN32
 static LONG WINAPI on_crash(EXCEPTION_POINTERS *ep) {
+    g_crash_pc = ep->ExceptionRecord->ExceptionAddress;
+    { /* walk the faulting thread's stack from the exception's CPU state */
+        HANDLE proc = GetCurrentProcess();
+        SymSetOptions(SYMOPT_LOAD_LINES | SYMOPT_DEFERRED_LOADS);
+        SymInitialize(proc, NULL, TRUE);
+        CONTEXT ctx = *ep->ContextRecord;
+        STACKFRAME64 sf;
+        memset(&sf, 0, sizeof sf);
+        sf.AddrPC.Offset = ctx.Rip; sf.AddrPC.Mode = AddrModeFlat;
+        sf.AddrFrame.Offset = ctx.Rbp; sf.AddrFrame.Mode = AddrModeFlat;
+        sf.AddrStack.Offset = ctx.Rsp; sf.AddrStack.Mode = AddrModeFlat;
+        while (g_crash_depth < 32 && StackWalk64(IMAGE_FILE_MACHINE_AMD64, proc, GetCurrentThread(), &sf, &ctx, NULL,
+                                                 SymFunctionTableAccess64, SymGetModuleBase64, NULL) && sf.AddrPC.Offset)
+            g_crash_stack[g_crash_depth++] = (void *)(uintptr_t)sf.AddrPC.Offset;
+    }
     char msg[256];
     snprintf(msg, sizeof msg, "the program crashed (exception 0x%08lX at %p, address %p)",
              (unsigned long)ep->ExceptionRecord->ExceptionCode, ep->ExceptionRecord->ExceptionAddress,
@@ -113,7 +193,20 @@ static LONG WINAPI on_crash(EXCEPTION_POINTERS *ep) {
 }
 #else
 static void on_crash(int sig, siginfo_t *si, void *uc) {
+#if defined(__x86_64__)
+    g_crash_pc = (void *)((ucontext_t *)uc)->uc_mcontext.gregs[REG_RIP];
+    if (!g_crash_pc) { /* a call through a null function pointer: the caller's return address is on top of the stack */
+        void **sp = (void **)((ucontext_t *)uc)->uc_mcontext.gregs[REG_RSP];
+        g_crash_pc = (void *)1;
+        if (sp) g_crash_stack[g_crash_depth++] = sp[0];
+    }
+#else
     (void)uc;
+#endif
+    if (g_crash_pc != (void *)1) g_crash_stack[g_crash_depth++] = g_crash_pc; /* the faulting instruction, then the callers */
+    void *bt[32];
+    int n = backtrace(bt, 32);
+    for (int i = 0; i < n && g_crash_depth < 32; i++) g_crash_stack[g_crash_depth++] = bt[i];
     char msg[256];
     snprintf(msg, sizeof msg, "the program crashed (%s at address %p)", strsignal(sig), si ? si->si_addr : NULL);
     crash_report(msg);
@@ -230,7 +323,25 @@ static uint32_t rel_to_generated(uint32_t addr) {
     return addr;
 }
 
+static const FuncEntry *find_func_search(uint32_t addr);
+
+/* Indirect calls (bctrl through function pointers and vtables) look their target up here. A direct-mapped
+ * cache in front of the search makes repeated calls cheap (the search was ~1.7% of the game's CPU time).
+ * REL module code moves when a module is relinked, so the cache is cleared then (rt_find_func_reset). */
+#define FIND_CACHE 4096
+static struct { uint32_t addr; const FuncEntry *e; } g_find_cache[FIND_CACHE];
+
+void rt_find_func_reset(void) { memset(g_find_cache, 0, sizeof g_find_cache); }
+
 static const FuncEntry *find_func(uint32_t addr) {
+    uint32_t k = (addr >> 2) & (FIND_CACHE - 1);
+    if (g_find_cache[k].addr == addr && g_find_cache[k].e) return g_find_cache[k].e;
+    const FuncEntry *e = find_func_search(addr);
+    if (e) { g_find_cache[k].addr = addr; g_find_cache[k].e = e; }
+    return e;
+}
+
+static const FuncEntry *find_func_search(uint32_t addr) {
     if (addr >= 0x80000000u) addr = rel_to_generated(addr);
     unsigned lo = 0, hi = g_func_count;
     while (lo < hi) {
@@ -255,6 +366,7 @@ static void rel_notify(Ctx *c, int linked) {
         if (linked) {
             for (uint32_t k = 0; k < nsec && k < 32; k++) g_rel[i].sec[k] = rd32(si + k * 8) & ~3u;
             g_rel[i].loaded = REL_LINKED;
+            rt_find_func_reset(); /* module code moved: cached call targets are stale */
             g_rel_link_seq[i] = ++g_rel_links;
             printf("[rel] linked %s: text 0x%08X, %u sections\n", ri->name, g_rel[i].sec[ri->text_sec], nsec);
         } else {
@@ -264,6 +376,7 @@ static void rel_notify(Ctx *c, int linked) {
              * the old code from freed memory; here it used to stop with "indirect call to unknown
              * address" (after a game over, or finishing Mission 1). */
             g_rel[i].loaded = REL_UNLINKED;
+            rt_find_func_reset();
             printf("[rel] unlinked %s\n", ri->name);
         }
         return;
@@ -429,8 +542,8 @@ const char *rt_func_containing(uint32_t addr) {
 }
 
 void rt_sdk_enter(Ctx *c, uint32_t addr) {
-    g_sdk_calls++;
-    if (g_sdk_log && g_sdk_calls <= g_sdk_log_limit)
+    if (++g_sdk_calls > g_sdk_log_limit) { g_trace_sdk = 0; return; } /* the log is full: stop the per-call cost */
+    if (g_sdk_log)
         fprintf(g_sdk_log, "%6lu %-30s from %08X %-30s r3=%08X r4=%08X r5=%08X\n", g_sdk_calls, rt_func_name(addr),
                 c->lr, rt_func_containing(c->lr), c->r[3], c->r[4], c->r[5]);
 }
@@ -1061,9 +1174,9 @@ int main(int argc, char **argv) {
     }
     if (!testing && !run_selftest) g_force_60fps = launcher_fps60(); /* the saved choice, with or without the start screen */
     if (!run_selftest) crash_handling_init();
-    g_mem = calloc(1, PPC_MEM_SIZE);
+    rt_mem_init();
     g_lc = calloc(1, PPC_LC_SIZE);
-    if (!g_mem || !g_lc) rt_fatal("out of memory");
+    if (!g_lc) rt_fatal("out of memory");
     watch_init();
     count_init();
     rt_boot_setup(root);

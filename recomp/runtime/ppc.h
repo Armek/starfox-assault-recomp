@@ -52,7 +52,13 @@ typedef void (*GuestFn)(Ctx *c);
 #define PPC_MEM_SIZE 0x01800000u /* 24 MB main RAM */
 #define PPC_LC_SIZE 0x4000u      /* 16 KB locked L1 cache at 0xE0000000 */
 
-extern uint8_t *g_mem; /* PPC_MEM_SIZE bytes, mirrored at 0x80000000 and 0xC0000000 */
+/* Guest RAM (PPC_MEM_SIZE bytes, mirrored at 0x80000000 and 0xC0000000) lives at a fixed host address,
+ * reserved at start (rt_mem_init). Its base is then a constant in every access: with a global pointer the
+ * compiler reloaded it after each guest store (a byte store may alias anything), one extra dependent load
+ * on every guest memory access, which are most of the game's CPU time. */
+#define PPC_MEM_HOST 0x200000000000ull
+#define g_mem ((uint8_t *)(uintptr_t)PPC_MEM_HOST)
+extern int g_mem_ready; /* set once guest RAM is mapped */
 extern uint8_t *g_lc;
 
 /* Slow paths, implemented by the runtime: hardware registers (0xCC000000, including the GX
@@ -180,9 +186,13 @@ PPC_INLINE uint64_t ppc_fctiw(double v, int trunc) {
 PPC_INLINE double ppc_fres(double v) { return rs(1.0 / v); }
 PPC_INLINE double ppc_frsqrte(double v) { return 1.0 / sqrt(v); }
 
+/* 2^e for |e| <= 32, built from its exponent bits: exactly ldexp(1.0, e), without the library call (which
+ * was 6-7% of the game's CPU time, paid on every quantized paired-single load and store). */
+PPC_INLINE double pow2i(int e) { return u2d((uint64_t)(1023 + e) << 52); }
+
 /* Paired-single quantized loads and stores (GQR types: 0 float, 4 u8, 5 u16, 6 s8, 7 s16). */
 PPC_INLINE double psq_dequant(uint32_t a, uint32_t type, uint32_t scale, uint32_t *size) {
-    double s = ldexp(1.0, -(int)((int32_t)(scale << 26) >> 26));
+    double s = pow2i(-(int)((int32_t)(scale << 26) >> 26));
     switch (type) {
     case 4: *size = 1; return rd8(a) * s;
     case 5: *size = 2; return rd16(a) * s;
@@ -198,7 +208,7 @@ PPC_INLINE void psq_l(Ctx *c, int d, uint32_t a, int w, int i) {
 }
 PPC_INLINE double psq_clamp(double v, double lo, double hi) { return v < lo ? lo : v > hi ? hi : v; }
 PPC_INLINE uint32_t psq_quant(uint32_t a, double v, uint32_t type, uint32_t scale) {
-    double s = ldexp(1.0, (int)((int32_t)(scale << 26) >> 26));
+    double s = pow2i((int)((int32_t)(scale << 26) >> 26));
     switch (type) {
     case 4: wr8(a, (uint8_t)psq_clamp(v * s, 0, 255)); return 1;
     case 5: wr16(a, (uint16_t)psq_clamp(v * s, 0, 65535)); return 2;

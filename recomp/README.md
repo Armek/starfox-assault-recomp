@@ -154,6 +154,21 @@ frame has about 20,000 small draws (fleet, lasers, particles, HUD).
   1 s, guest about 50% busy, and GXDrawDone waits under 0.2 s. A CPU about 1.7 times slower per core (the
   Steam Deck is roughly that) would push the GX thread past 16.7 ms a frame here, so that is where the
   Deck dips.
+- **Guest code overhead, from an instruction-level profile (`SFA_PROFILE_NATIVE=1`):**
+  - **`ldexp`:** 6-7% of the game thread's time went to the C library `ldexp`, called on every quantized
+    paired-single load and store for a power-of-two scale. `pow2i()` builds that value from its exponent
+    bits instead (exact for these exponents).
+  - **Indirect calls (`bctrl`):** each binary-searched all 7,694 functions (`find_func`, 1.7%); a 4,096-entry
+    direct-mapped cache now answers repeats, and is cleared whenever a REL module is linked or unlinked.
+  - **SDK call tracing:** it stops once its log is full, instead of costing a call on every SDK function.
+  - **Measured:** together, in Mission 2 at 30 fps, alternating with v0.2.7: the game thread was busy 18.9-20.0%
+    against 21.0-22.0%, about 9% less.
+  - **Fixed-address guest RAM:** guest RAM is mapped at host address `0x200000000000` (`PPC_MEM_HOST`), so its
+    base is a constant: with a global pointer, every guest access reloaded it, since a byte store may alias
+    anything. That gave about 3-7%, within the noise of the measurement.
+  - **Where the time goes now:** about 70% of the generated code's time is in guest memory accesses (loads 40%,
+    stores 20%, paired-single loads/stores 10%), then compares, float and integer ops (5-8% each).
+  - **The biggest lever was the compiler:** see *Linux and Steam Deck* below.
 - **Vertex work on worker threads:** reading vertices (indexed lookups into the game's arrays, mostly
   memory latency) and transforming them was most of that GX thread time. Now `draw()` only copies a
   draw's vertex bytes, snapshots what reading and transforming them needs (read context: vertex format,
@@ -171,6 +186,11 @@ frame has about 20,000 small draws (fleet, lasers, particles, HUD).
     10.4 ms at matching points), and its vertex time from 3.4 s to 0.55 s per 10 s. Batching went up
     from about 0.4 to 0.9 s, which covers the byte copy and publishing jobs.
   - **Settings:** `SFA_GX_WORKERS=n` sets the number of workers (0 = the GX thread does the jobs itself).
+  - **A race, fixed after v0.2.7:** the job counters used to reset to 0 for each batch. A worker that had read
+    them just before a reset could win a claim on job numbers that weren't published yet in the new batch,
+    and crash on a job that wasn't filled in: 3-6 of 40 boots on Linux, in the intro. Job numbers now only
+    grow (compared by difference, so they may wrap), and each job carries its frame. After the fix, 0 of
+    40 boots crashed.
 - **60 fps option (launcher "Frame rate", or `SFA_60FPS=1`; `SFA_60FPS=0` turns it off):**
   - **How the game sets its rate:** one target frame rate at `0x80385AF4` controls it: 60 in flight, 30
     set while an on-foot stage loads and for in-engine cutscenes; menus run at 60. Once a frame,
@@ -349,6 +369,11 @@ The generator also emits **extra entry points** for calls into the middle of a f
 - **`SFA_GX_DEBUG=1`** logs draw configurations, textures (with how many source bytes are non-zero),
   TMEM preloads, EFB-to-texture copies and ARAM DMA, and saves decoded textures as images.
 - **`SFA_GX_FRAMEDUMP=<n>`** lists every batch of frame *n*.
+- **`SFA_PROFILE_NATIVE=1`** (Windows, with `SFA_PROFILE=1`) samples the instruction the game thread is
+  running every millisecond. Every 10 s it prints the hottest source lines through the build's debug info,
+  and a breakdown of the generated code by kind of guest operation.
+- **Crash reports** include the host call stack: function and line on Windows, and offsets on Linux to
+  resolve with `addr2line -f -e sfa <offset>`.
 - **`SFA_PROFILE=1`** prints the hottest guest functions, the GX stage times, GX frames built and the
   EFB-to-texture copies (with the time spent waiting on them under `SFA_EFB_READBACK`), every 10 s of wall
   time. With `SFA_FPS=1` too, each frame that comes more than 80 ms late prints a `[stall]` line: how long
@@ -387,13 +412,16 @@ On Windows with Visual Studio's bundled clang, also pass
 
 ### Linux and Steam Deck
 
-Any gcc or clang works, with CMake, Ninja and the SDL2 development package. On Debian or Ubuntu:
+Build with clang, which the release packages use. gcc works too, but its code for the generated sources is
+much slower: in Mission 2 (headless, alternating runs on an i5-1135G7) the game's code was busy 27.7-29.3%
+of the time built with gcc 14 against 16.5-17.4% with clang 19. On the Steam Deck that is the difference
+between holding 60 fps on foot or not. On Debian or Ubuntu:
 
 ```sh
-sudo apt-get install build-essential cmake ninja-build pkg-config libsdl2-dev
-cmake -S recomp -B build/linux -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo
-cmake --build build/linux
-build/linux/sfa --selftest               # run from the project root
+sudo apt-get install build-essential clang cmake ninja-build pkg-config libsdl2-dev
+CC=clang cmake -S recomp -B build/linux-clang -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo
+cmake --build build/linux-clang
+build/linux-clang/sfa --selftest         # run from the project root
 ```
 
 The generated sources from `ppcrecomp.py` are the same on every platform, so a Windows checkout can be

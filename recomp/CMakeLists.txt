@@ -56,7 +56,7 @@ endif()
 find_package(SDL2 REQUIRED CONFIG)
 target_link_libraries(sfa PRIVATE SDL2::SDL2)
 if(WIN32)
-  target_link_libraries(sfa PRIVATE winmm comdlg32 ole32)  # timeBeginPeriod (1 ms sleeps); the Open dialog
+  target_link_libraries(sfa PRIVATE winmm comdlg32 ole32 dbghelp)  # timeBeginPeriod (1 ms sleeps); the Open dialog
 endif()
 if(WIN32)
   add_custom_command(TARGET sfa POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different

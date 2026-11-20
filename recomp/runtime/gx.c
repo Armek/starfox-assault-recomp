@@ -951,6 +951,7 @@ typedef struct {
     uint32_t scale_need;        /* texcoords to rescale (see texcoord_scale_factors) */
     float ks[8], kt[8];
     uint8_t opcode;
+    GxFrame *frame;             /* the frame its vertices go to */
 } VtxJob;
 
 #define BYTES_CAP (16u << 20) /* a draw has at most 65535 vertices of at most ~130 bytes */
@@ -970,6 +971,12 @@ static uint32_t *g_mx_snap;
 static uint32_t g_nmx, g_mx_snap_serial;  /* g_mtx_serial the last snapshot was taken at (0 = none) */
 static uint32_t g_mtx_serial = 1;         /* bumped by writes to XF matrix memory */
 static GxFrame *g_job_frame;              /* the frame the pending jobs write into */
+/* Job numbers only grow (g_pub, g_claim, g_done count jobs ever published, taken, finished; they wrap, so
+ * they are compared by difference): g_jobs[k] is job g_job_base + k. Resetting them to 0 for each batch let
+ * a worker that had read the old counters just before a reset win a claim on numbers that, in the new
+ * batch, weren't published yet, and run a job that wasn't filled in (a crash, ~1 in 10 boots on Linux). */
+static SDL_atomic_t g_job_base;
+static int seq_after(int a, int b) { return (int)((unsigned)a - (unsigned)b) > 0; } /* a > b, wrapping */
 static SDL_atomic_t g_pub, g_claim, g_done, g_sleepers; /* jobs published, taken, finished; idle workers */
 static SDL_sem *g_work_sem;
 #define CLAIM 8 /* jobs a thread takes at a time */
@@ -995,7 +1002,7 @@ static void run_job(const VtxJob *jb, JobBuf *b) {
         if (!(jb->scale_need & (1u << c))) continue;
         for (uint32_t i = 0; i < jb->count; i++) { b->vs[i].uv[c][0] *= jb->ks[c]; b->vs[i].uv[c][1] *= jb->kt[c]; }
     }
-    prim_expand(jb->opcode, jb->count, b->vs, g_job_frame->verts + jb->dst);
+    prim_expand(jb->opcode, jb->count, b->vs, jb->frame->verts + jb->dst);
 }
 
 /* Takes and runs published jobs until none are left; returns whether it ran any. */
@@ -1003,10 +1010,12 @@ static int work_some(JobBuf *b) {
     int ran = 0;
     for (;;) {
         int c = SDL_AtomicGet(&g_claim), p = SDL_AtomicGet(&g_pub);
-        if (c >= p) return ran;
-        int n = p - c < CLAIM ? p - c : CLAIM;
-        if (!SDL_AtomicCAS(&g_claim, c, c + n)) continue;
-        for (int j = c; j < c + n; j++) run_job(&g_jobs[j], b);
+        if (!seq_after(p, c)) return ran;
+        int avail = (int)((unsigned)p - (unsigned)c), n = avail < CLAIM ? avail : CLAIM;
+        if (!SDL_AtomicCAS(&g_claim, c, (int)((unsigned)c + (unsigned)n))) continue;
+        /* the base can't change while we hold unfinished jobs: the GX thread waits for them first */
+        unsigned first = (unsigned)c - (unsigned)SDL_AtomicGet(&g_job_base);
+        for (unsigned j = first; j < first + (unsigned)n; j++) run_job(&g_jobs[j], b);
         SDL_AtomicAdd(&g_done, n);
         ran = 1;
     }
@@ -1018,10 +1027,10 @@ static int gx_worker(void *arg) {
     for (;;) {
         if (work_some(&b)) continue;
         int spins = 0;
-        while (SDL_AtomicGet(&g_claim) >= SDL_AtomicGet(&g_pub) && spins++ < 2000) SDL_CPUPauseInstruction();
-        if (SDL_AtomicGet(&g_claim) >= SDL_AtomicGet(&g_pub)) {
+        while (!seq_after(SDL_AtomicGet(&g_pub), SDL_AtomicGet(&g_claim)) && spins++ < 2000) SDL_CPUPauseInstruction();
+        if (!seq_after(SDL_AtomicGet(&g_pub), SDL_AtomicGet(&g_claim))) {
             SDL_AtomicIncRef(&g_sleepers);
-            if (SDL_AtomicGet(&g_claim) >= SDL_AtomicGet(&g_pub)) SDL_SemWaitTimeout(g_work_sem, 2);
+            if (!seq_after(SDL_AtomicGet(&g_pub), SDL_AtomicGet(&g_claim))) SDL_SemWaitTimeout(g_work_sem, 2);
             SDL_AtomicDecRef(&g_sleepers);
         }
     }
@@ -1035,10 +1044,10 @@ static void wake_workers(void) {
 
 /* Makes the jobs so far available to the workers (in groups, to keep the atomics off the hot path). */
 static void publish_jobs(int force) {
-    int pub = SDL_AtomicGet(&g_pub);
-    if (!force && (int)g_njobs - pub < CLAIM) return;
-    SDL_AtomicSet(&g_pub, (int)g_njobs);
-    if (g_nworkers && (int)g_njobs - SDL_AtomicGet(&g_claim) >= 2 * CLAIM) wake_workers();
+    int pub = SDL_AtomicGet(&g_pub), target = (int)((unsigned)SDL_AtomicGet(&g_job_base) + g_njobs);
+    if (!force && (int)((unsigned)target - (unsigned)pub) < CLAIM) return;
+    SDL_AtomicSet(&g_pub, target);
+    if (g_nworkers && (int)((unsigned)target - (unsigned)SDL_AtomicGet(&g_claim)) >= 2 * CLAIM) wake_workers();
 }
 
 static JobBuf g_gx_buf; /* the GX thread's own buffers */
@@ -1050,7 +1059,8 @@ static void gx_drain(void) {
     publish_jobs(1);
     for (int k = 0; k < g_nworkers; k++) wake_workers();
     work_some(&g_gx_buf);
-    while (SDL_AtomicGet(&g_done) < (int)g_njobs) SDL_CPUPauseInstruction();
+    int target = (int)((unsigned)SDL_AtomicGet(&g_job_base) + g_njobs);
+    while (seq_after(target, SDL_AtomicGet(&g_done))) SDL_CPUPauseInstruction();
 }
 
 /* Finishes every pending vertex and starts the job arrays over. Call before anything reads f->verts. */
@@ -1075,10 +1085,8 @@ static void gx_flush_vertices(void) {
         }
         free(copy);
     }
-    /* start over: hide the old jobs from the workers before resetting what they take from */
-    SDL_AtomicSet(&g_pub, 0);
-    SDL_AtomicSet(&g_claim, 0);
-    SDL_AtomicSet(&g_done, 0);
+    /* start the arrays over; job numbers carry on from where they are (all published jobs are done) */
+    SDL_AtomicSet(&g_job_base, (int)((unsigned)SDL_AtomicGet(&g_job_base) + g_njobs));
     g_njobs = g_nbytes = g_nrc = g_nxs = g_nmx = 0;
     g_rc_key[0] = 0;
     g_xs_snap_serial = g_mx_snap_serial = 0; /* the next draw snapshots again */
@@ -1229,6 +1237,7 @@ static void draw(uint8_t opcode, uint32_t p, uint32_t count) {
     jb->xs = g_nxs - 1;
     jb->mx = g_nmx - 1;
     jb->opcode = opcode;
+    jb->frame = f;
     jb->scale_need = texcoord_scale_factors(jb->ks, jb->kt);
     copy_vertex_bytes(g_bytes + g_nbytes, p, count * size);
     g_nbytes += count * size;
