@@ -32,6 +32,7 @@ add_executable(sfa "${FONTS_C}" runtime/runtime.c runtime/hle.c runtime/threads.
 # The release version (recomp/VERSION, bumped for each release): shown on the start screen and compared
 # with GitHub's releases by the updater.
 file(STRINGS "${CMAKE_CURRENT_SOURCE_DIR}/VERSION" SFA_VERSION LIMIT_COUNT 1)
+string(STRIP "${SFA_VERSION}" SFA_VERSION)  # a checkout may have CRLF line endings
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/VERSION")
 target_compile_definitions(sfa PRIVATE SFA_VERSION="${SFA_VERSION}")
 target_include_directories(sfa PRIVATE runtime "${GENERATED_DIR}")
