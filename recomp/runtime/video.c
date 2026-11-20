@@ -1049,10 +1049,16 @@ static void render(GxFrame *f) {
         uploads += f->nuploads;
         fps_frames++;
         if (now - fps_start >= 5000) {
+            extern unsigned long g_ax_clipped; /* ax.c */
+            extern double g_ax_min_gain;
+            static unsigned long last_clipped;
             printf("[fps] %.1f frames/s (frame %u); longest gap %u ms, %u gaps > 50 ms; %u shader compiles, "
-                   "%u texture uploads; audio %u underruns, %u frames dropped\n",
+                   "%u texture uploads; audio %u underruns, %u frames dropped, %lu samples clipped, limiter down to %.2f\n",
                    fps_frames * 1000.0 / (now - fps_start), f->number, worst, slow, g_shader_compiles - last_compiles,
-                   uploads, g_audio_underruns - last_underruns, g_audio_drops - last_drops);
+                   uploads, g_audio_underruns - last_underruns, g_audio_drops - last_drops, g_ax_clipped - last_clipped,
+                   g_ax_min_gain);
+            last_clipped = g_ax_clipped;
+            g_ax_min_gain = 1.0;
             fflush(stdout);
             fps_start = now;
             fps_frames = worst = slow = uploads = 0;

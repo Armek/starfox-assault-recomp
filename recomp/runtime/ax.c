@@ -11,6 +11,7 @@
  */
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
 #include "funcs.h"
 #include "runtime.h"
 
@@ -19,7 +20,7 @@
 
 static int32_t g_main[3][FRAME], g_auxa[3][FRAME], g_auxb[3][FRAME]; /* L, R, S */
 static uint32_t g_pb_list;
-unsigned long g_ax_frames, g_ax_voices_played;
+unsigned long g_ax_frames, g_ax_voices_played, g_ax_clipped; /* clipped: output samples past 16 bits */
 
 /* ---- ARAM sample access -------------------------------------------------------------------------- */
 static uint8_t aram8(uint32_t a) { const uint8_t *m = rt_aram(); return m ? m[a & (RT_ARAM_SIZE - 1)] : 0; }
@@ -168,6 +169,48 @@ static void process_voice(uint32_t addr) {
     for (int i = 0; i < PB_WORDS; i++) wr16(addr + (uint32_t)i * 2, pb[i]);
 }
 
+/* Final-mix limiter, standing in for the AX microcode's compressor (command 0x12, which the game enables).
+ * The game's mix runs hot: in loud scenes the sum of its voices goes well past 16 bits (in Mission 1 up
+ * to ~3x full scale), and hard-clipping that was the distortion heard there. The console's compressor
+ * turns the output down instead; this does the same with a look-ahead limiter over the 5 ms frame:
+ *  - each sample has the gain at which it just fits in 16 bits (1 below full scale);
+ *  - a backward pass turns those into an envelope that falls toward each loud sample over 1 ms before
+ *    it arrives (so the gain eases down rather than stepping, which would click);
+ *  - a forward pass follows that envelope down and recovers toward 1 with a ~150 ms time constant.
+ * Quiet passages pass through unchanged. SFA_AUDIO_LIMIT=0 turns it off (for comparison). */
+static double g_limit_gain = 1.0;
+double g_ax_min_gain = 1.0; /* lowest limiter gain since the last SFA_FPS report */
+
+static void limit_output(void) {
+    const double release = 1.0 - 1.0 / (0.150 * 32000.0); /* per sample */
+    const double attack = 1.0 / SUB;                       /* the envelope's largest step per sample */
+    double env[FRAME + 1];
+    env[FRAME] = 1.0;
+    for (int i = FRAME - 1; i >= 0; i--) {
+        int32_t a = 0;
+        for (int ch = 0; ch < 2; ch++) {
+            int32_t v = g_main[ch][i] < 0 ? -g_main[ch][i] : g_main[ch][i];
+            if (v > a) a = v;
+        }
+        double need = a > 32767 ? 32767.0 / a : 1.0, next = env[i + 1] + attack;
+        env[i] = need < next ? need : next;
+    }
+    if (g_limit_gain >= 1.0 && env[0] >= 1.0) { /* nothing to do this frame unless a later sample needs it */
+        int busy = 0;
+        for (int i = 1; i < FRAME && !busy; i++) busy = env[i] < 1.0;
+        if (!busy) return;
+    }
+    for (int i = 0; i < FRAME; i++) {
+        double g = 1.0 - (1.0 - g_limit_gain) * release;
+        if (g > env[i]) g = env[i];
+        g_limit_gain = g;
+        if (g < 1.0) {
+            for (int ch = 0; ch < 3; ch++) g_main[ch][i] = (int32_t)(g_main[ch][i] * g);
+            if (g < g_ax_min_gain) g_ax_min_gain = g;
+        }
+    }
+}
+
 /* Aux bus: hand this frame's send to the CPU's effects and add the processed return. */
 static void aux_exchange(int32_t bus[3][FRAME], uint32_t send, uint32_t ret) {
     for (int ch = 0; ch < 3; ch++)
@@ -202,10 +245,20 @@ void rt_ax_command_list(uint32_t cl) {
         case 0x05: aux_exchange(g_auxb, ARG32(0), ARG32(1)); cl += 8; break;
         case 0x10: cl += 8; break;                 /* Dolby Pro Logic II aux B */
         case 0x13: cl += 24; break;                /* Dolby Pro Logic II aux A */
-        case 0x12: cl += 8; break;                 /* compressor */
+        case 0x12: {                               /* compressor: see limit_output */
+            static int shown;
+            if (!shown++) printf("[ax] compressor command: %04X %04X %08X\n", rd16(cl), rd16(cl + 2), ARG32(1));
+            cl += 8;
+            break;
+        }
         case 0x0E: {                               /* final output: interleaved big-endian stereo */
             uint32_t sbuf = ARG32(0), out = ARG32(1);
+            static int limit = -1; /* SFA_AUDIO_LIMIT=0: off (for comparison) */
+            if (limit < 0) limit = !getenv("SFA_AUDIO_LIMIT") || atoi(getenv("SFA_AUDIO_LIMIT")) != 0;
+            if (limit) limit_output();
             for (int i = 0; i < FRAME; i++) {
+                for (int ch = 0; ch < 2; ch++) /* SFA_FPS reports these: the mix went past 16 bits */
+                    if (g_main[ch][i] > 32767 || g_main[ch][i] < -32768) g_ax_clipped++;
                 wr16(out + (uint32_t)i * 4, (uint16_t)clamp16(g_main[0][i]));
                 wr16(out + (uint32_t)i * 4 + 2, (uint16_t)clamp16(g_main[1][i]));
                 if (sbuf) wr32(sbuf + (uint32_t)i * 4, (uint32_t)g_main[2][i]);

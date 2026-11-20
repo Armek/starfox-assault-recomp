@@ -390,7 +390,13 @@ The generator also emits **extra entry points** for calls into the middle of a f
   When stdout isn't a terminal and it isn't a test run, all output goes to `user/sfa.log` (the last
   run), so runs started from Steam or a file manager leave a log too.
 - **`SFA_FPS=1`** prints, every 5 s, the presented frame rate, the longest gap between frames and how
-  many exceeded 50 ms, shader compiles, texture uploads, and audio underruns and dropped samples.
+  many exceeded 50 ms, shader compiles, texture uploads, audio underruns and dropped samples, output
+  samples that went past 16 bits, and how far the audio limiter turned the mix down.
+- **Audio limiter:** the game's mix goes well past 16 bits in loud scenes (up to ~3x in Mission 1),
+  and the console's DSP compressor, which the game turns on, brings it back down. `ax.c` stands in
+  for that with a look-ahead limiter on the final mix: it eases the gain down over 1 ms before a loud
+  peak and back up over ~150 ms. Without it, a fifth of the samples in Mission 1's loudest stretch
+  were hard-clipped (heard as distortion). `SFA_AUDIO_LIMIT=0` turns it off, for comparison.
 - **`SFA_AX_DEBUG=1`** logs AX frame and AI buffer counts. **`SFA_DUMP_AUDIO=1`** writes everything
   played to `build/GF7E01/audio.wav`.
 - **`SFA_GX_TEXADDR=<hex>`** shows which code binds that texture address and which display list sets it.

@@ -39,8 +39,10 @@ target_include_directories(sfa PRIVATE runtime "${GENERATED_DIR}")
 
 if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
   # Generated code has a label per branch target and compares registers to themselves.
+  # GENERATED_OPT: optimization level for the generated code (-O1 builds faster; -O2 runs faster)
+  set(GENERATED_OPT "-O1" CACHE STRING "Optimization flag for the generated sources")
   set_source_files_properties(${GENERATED_SOURCES} PROPERTIES
-    COMPILE_OPTIONS "-Wno-unused-label;-Wno-unused-variable;-Wno-parentheses-equality;-O1")
+    COMPILE_OPTIONS "-Wno-unused-label;-Wno-unused-variable;-Wno-parentheses-equality;${GENERATED_OPT}")
   if(NOT WIN32)
     target_link_libraries(sfa PRIVATE m)
   endif()
