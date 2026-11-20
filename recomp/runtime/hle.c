@@ -401,7 +401,7 @@ int g_force_60fps = -1; /* set by runtime.c from the launcher setting; the envir
 void rt_hook_8003AEB0(Ctx *c) {
     (void)c;
     static int log = -1, force;
-    static uint32_t last, native = 30;
+    static uint32_t last, native = 60; /* the rate the game itself asked for in this stage */
     if (log < 0) {
         log = getenv("SFA_FPS_LOG") != NULL;
         const char *e = getenv("SFA_60FPS");
@@ -440,14 +440,18 @@ void rt_hook_8003AEB0(Ctx *c) {
         }
     }
     if (!force) return;
-    if (rate != 60) native = rate; /* the game asked for another rate since the last frame */
     /* keeping up? frames counted per second of wall time while a part is played */
     static uint64_t window_start, retry_at;
     static uint32_t frames, slow_secs, wait_secs = 20, stage = 0xFFFFFFFFu;
     static int backed_off;
     uint64_t now = rt_timebase();
     uint32_t cur_stage = rd8(0x802A2B60u + 0x13C);
-    if (cur_stage != stage) { stage = cur_stage; wait_secs = 20; } /* a new stage: start with a short wait */
+    if (cur_stage != stage) { /* a new stage: start with a short wait; its own rate is 60 until it sets another */
+        stage = cur_stage;
+        wait_secs = 20;
+        native = 60;
+    }
+    if (rate != 60) native = rate; /* the game asked for another rate since the last frame */
     if (backed_off) {
         if (now < retry_at) return; /* the game's own rate */
         backed_off = 0;
@@ -465,7 +469,7 @@ void rt_hook_8003AEB0(Ctx *c) {
         slow_secs = fps < 54.0 ? slow_secs + 1 : 0;
         window_start = now;
         frames = 0;
-        if (slow_secs >= 2) {
+        if (slow_secs >= 2 && native != 60) { /* where the game itself runs at 60 (flight), there's nothing lower to go back to */
             backed_off = 1;
             retry_at = now + (uint64_t)wait_secs * 40500000ull;
             if (rd32(0x80385AF4u) == 60) wr32(0x80385AF4u, native);
