@@ -434,6 +434,27 @@ For the Steam Deck, the binary needs glibc 2.34 or newer (its newest symbol is `
 image next to it. If it won't start there, build
 inside Valve's Steam Runtime SDK or on the Deck itself.
 
+### Updates
+
+`updater.c`: `recomp/VERSION` holds the release version, compiled in as `SFA_VERSION`, shown on the start
+screen and logged at boot. Bump it before each release, and tag the release `v` plus that version.
+- **The check:** when the start screen opens (unless `check_updates=0` in `user/launcher.cfg`, or
+  `SFA_NO_UPDATE_CHECK` is set), a background thread fetches the repository's releases from GitHub's API
+  and picks the newest one above this version that has this platform's package. Pre-releases count. The
+  download URL must be a GitHub release asset of this repository.
+- **The offer:** a banner reads "Update available". Y, U or a click installs it.
+- **Installing:**
+  - It downloads into `user/update/` and checks the file against the size GitHub reports.
+  - It unpacks with `tar`, which also reads `.zip` on Windows 10/11.
+  - It moves the files over the program's. On Windows the running `sfa.exe` and `SDL2.dll` are renamed to
+    `*.old` first, and removed at the next start; on Linux the old binary is unlinked.
+  - It restarts with the same arguments (`execv`, or a new process on Windows).
+- **Tools:** downloads use `curl`, or `wget` where there's no curl. Both run without the Steam runtime's
+  `LD_PRELOAD`/`LD_LIBRARY_PATH`, so no libraries are added.
+- **Tested end to end:** with `SFA_VERSION_OVERRIDE=0.2.0` and `SFA_UPDATE_TEST=1`, which allows the check in
+  scripted runs, from a copy of each package. On Windows (curl) and Linux (wget) it found v0.2.8, installed
+  it byte-identical to the release's program, and restarted into it.
+
 ### Release packages
 
 `python recomp/tools/package.py` (on Windows) or `python3 recomp/tools/package.py` (on Linux, after the

@@ -19,6 +19,7 @@
 #include <SDL_syswm.h>
 #include "funcs.h"
 #include "runtime.h"
+#include "updater.h"
 #ifdef _WIN32
 #include <windows.h>
 #include <commdlg.h>
@@ -466,6 +467,7 @@ static int check_disc(const char *path, char *msg, size_t n) {
 static char g_disc[1024];
 static int g_fullscreen;
 static int g_fps60; /* frame rate: 0 the game's own, 1 60 fps */
+static int g_check_updates = 1; /* look for a newer release on GitHub when the start screen opens */
 
 static void load_settings(void) {
     FILE *f = fopen("user/launcher.cfg", "r");
@@ -476,6 +478,7 @@ static void load_settings(void) {
         if (!strncmp(line, "disc=", 5)) snprintf(g_disc, sizeof g_disc, "%s", line + 5);
         else if (!strncmp(line, "fullscreen=", 11)) g_fullscreen = atoi(line + 11) != 0;
         else if (!strncmp(line, "fps60=", 6)) g_fps60 = atoi(line + 6) != 0;
+        else if (!strncmp(line, "check_updates=", 14)) g_check_updates = atoi(line + 14) != 0;
     }
     fclose(f);
 }
@@ -484,7 +487,8 @@ static void save_settings(void) {
     MKDIR("user");
     FILE *f = fopen("user/launcher.cfg", "w");
     if (!f) return;
-    fprintf(f, "disc=%s\nfullscreen=%d\nfps60=%d\n", g_disc, g_fullscreen, g_fps60);
+    fprintf(f, "disc=%s\nfullscreen=%d\nfps60=%d\ncheck_updates=%d\n", g_disc, g_fullscreen, g_fps60,
+            g_check_updates);
     fclose(f);
 }
 
@@ -819,6 +823,26 @@ static void draw_background(SDL_Renderer *r, float dt) {
     circle(r, VW - 52, VH + 392, 556, (SDL_Color){9, 15, 33, 255});
 }
 
+/* The update banner (top right): shown when a newer release is offered, and while it installs. */
+static SDL_FRect update_banner(void) { return (SDL_FRect){VW - 64 - 300, 96, 300, 72}; }
+
+static void draw_update_banner(SDL_Renderer *r, Uint32 now) {
+    int st = updater_state();
+    if (st != UPD_AVAILABLE && st != UPD_DOWNLOADING && st != UPD_INSTALLING && st != UPD_DONE && st != UPD_FAILED) return;
+    SDL_FRect b = update_banner();
+    float pulse = st == UPD_AVAILABLE ? 0.5f + 0.5f * sinf((float)now / 420.0f) : 0;
+    rrect(r, b, 14, st == UPD_FAILED ? (SDL_Color){60, 24, 32, 255} : mix(C_CARD, (SDL_Color){30, 58, 110, 255}, pulse));
+    const char *title = st == UPD_AVAILABLE ? "Update available" : st == UPD_FAILED ? "Update failed"
+                      : st == UPD_DONE ? "Updated" : "Updating";
+    text(r, title, b.x + 18, b.y + 12, 16, st == UPD_FAILED ? C_RED : C_TEXT);
+    char line[160];
+    if (st == UPD_AVAILABLE) snprintf(line, sizeof line, "v%s  " BULLET "  Y / click to install", updater_new_version());
+    else snprintf(line, sizeof line, "%s", updater_message());
+    char fit[160];
+    ellipsize(fit, sizeof fit, line, 14, b.w - 36, 0);
+    text(r, fit, b.x + 18, b.y + 40, 14, st == UPD_FAILED ? C_RED : C_MUTED);
+}
+
 /* Main-screen layout (logical 960x600). */
 typedef struct { SDL_FRect disc_card, browse, display_card, seg, fps_card, fps_seg, play, quit; } Layout;
 static Layout main_layout(void) {
@@ -886,6 +910,7 @@ int launcher_run(const char *found_disc, int *fullscreen_io, char *disc_out, siz
         if (SDL_IsGameController(i)) pad = SDL_GameControllerOpen(i);
 
     const char *script = getenv("SFA_LAUNCHER_SCRIPT"); /* testing: see below */
+    if (g_check_updates && !getenv("SFA_NO_UPDATE_CHECK") && (!script || getenv("SFA_UPDATE_TEST"))) updater_check_start();
     int screen = SCREEN_MAIN, sel = disc_ok ? ITEM_PLAY : ITEM_DISC, bsel = 0, scroll = 0, result = 0;
     int stick_held = 0, msg_ok = disc_ok, dialog_open = 0, pad_input = 0, focus_visible = 0, hover = -1, bhover = -1;
     float hov[ITEM_COUNT] = {0}, seg_pos = g_fullscreen ? 1.0f : 0.0f, fps_pos = g_fps60 ? 1.0f : 0.0f, fade = 0;
@@ -912,7 +937,7 @@ int launcher_run(const char *found_disc, int *fullscreen_io, char *disc_out, siz
         } while (0)
 
     for (int running = 1; running;) {
-        int move = 0, side = 0, act = 0, back = 0, play = 0, clicked = -1, wheel = 0, seg_click = -1, fps_click = -1;
+        int move = 0, side = 0, act = 0, back = 0, play = 0, clicked = -1, wheel = 0, seg_click = -1, fps_click = -1, update = 0;
         SDL_Event e;
         while (SDL_PollEvent(&e)) {
             if (e.type == SDL_QUIT) { running = 0; result = 0; }
@@ -934,6 +959,7 @@ int launcher_run(const char *found_disc, int *fullscreen_io, char *disc_out, siz
                     } else act = 1;
                     break;
                 case SDLK_ESCAPE: case SDLK_BACKSPACE: back = 1; break;
+                case SDLK_u: update = 1; break;
                 case SDLK_F11:
                     g_fullscreen = !g_fullscreen;
                     SDL_SetWindowFullscreen(win, g_fullscreen ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0);
@@ -955,6 +981,7 @@ int launcher_run(const char *found_disc, int *fullscreen_io, char *disc_out, siz
                 case SDL_CONTROLLER_BUTTON_A: act = 1; break;
                 case SDL_CONTROLLER_BUTTON_B: back = 1; break;
                 case SDL_CONTROLLER_BUTTON_START: play = 1; break;
+                case SDL_CONTROLLER_BUTTON_Y: update = 1; break;
                 default: break;
                 }
             } else if (e.type == SDL_CONTROLLERAXISMOTION &&
@@ -1006,6 +1033,9 @@ int launcher_run(const char *found_disc, int *fullscreen_io, char *disc_out, siz
                         if (k < BROWSE_ROWS && scroll + k < g_nentries) { hit = scroll + k; bsel = hit; bhover = hit; }
                     }
                 }
+                if (e.type == SDL_MOUSEBUTTONDOWN && e.button.button == SDL_BUTTON_LEFT && screen == SCREEN_MAIN &&
+                    inside(update_banner(), mx, my))
+                    update = 1;
                 if (e.type == SDL_MOUSEBUTTONDOWN && e.button.button == SDL_BUTTON_LEFT) {
                     if (hit == -2) back = 1;
                     else if (hit >= 0) clicked = hit;
@@ -1035,6 +1065,7 @@ int launcher_run(const char *found_disc, int *fullscreen_io, char *disc_out, siz
             else if (!strncmp(script, "enter", n) && n == 5) act = 1;
             else if (!strncmp(script, "esc", n) && n == 3) back = 1;
             else if (!strncmp(script, "start", n) && n == 5) play = 1;
+            else if (!strncmp(script, "update", n) && n == 6) update = 1;
             script += n + (script[n] == ',');
         }
 
@@ -1089,6 +1120,7 @@ int launcher_run(const char *found_disc, int *fullscreen_io, char *disc_out, siz
                 } else if (sel == ITEM_PLAY || sel == ITEM_QUIT) sel = side > 0 ? ITEM_QUIT : ITEM_PLAY;
             }
             if (back) sel = ITEM_QUIT;
+            if (update) updater_install_start(); /* only does something when an update is offered */
             if (play && disc_ok) { result = 1; running = 0; }
             if (act) {
                 switch (sel) {
@@ -1174,6 +1206,10 @@ int launcher_run(const char *found_disc, int *fullscreen_io, char *disc_out, siz
             text_ex(r, "STATIC RECOMPILATION", 64, 70, 13, alpha(C_ACCENT_HI, fade), 2.6f, 1);
             text_ex(r, "Star Fox: Assault", 62, 90, 58, alpha(C_TEXT, fade), -0.6f, 1);
             text(r, "Native for PC and Steam Deck  " BULLET "  GameCube, USA", 64, 162, 17, alpha(C_MUTED, fade));
+            snprintf(tmp, sizeof tmp, "v%s", updater_version());
+            text(r, tmp, VW - 64 - text_w(tmp, 14, 0), 70, 14, alpha(C_FAINT, fade));
+            draw_update_banner(r, now);
+            if (updater_state() == UPD_DONE) { SDL_RenderPresent(r); SDL_Delay(600); updater_restart(); }
 
             for (int i = 0; i < ITEM_COUNT; i++) hov[i] = approach(hov[i], hover == i ? 1.0f : 0.0f, dt, 14);
             seg_pos = approach(seg_pos, g_fullscreen ? 1.0f : 0.0f, dt, 16);
@@ -1235,8 +1271,8 @@ int launcher_run(const char *found_disc, int *fullscreen_io, char *disc_out, siz
             rrect(r, L.quit, 16, mix(C_CARD, C_CARD_HI, hov[ITEM_QUIT]));
             text_vc(r, "Quit", L.quit.x + (L.quit.w - text_w("Quit", 18, 0)) / 2, L.quit.y, L.quit.h, 18, C_MUTED, 0);
 
-            static const char *const h[] = {"A", "Select", "B", "Back", "#START", "Play", "#F11", "Fullscreen"};
-            hints(r, h, 8);
+            static const char *const h[] = {"A", "Select", "B", "Back", "#START", "Play", "#F11", "Fullscreen", "Y", "Update"};
+            hints(r, h, updater_state() == UPD_AVAILABLE || updater_state() == UPD_FAILED ? 10 : 8);
             #undef FOCUS
         } else {
             /* the built-in browser */

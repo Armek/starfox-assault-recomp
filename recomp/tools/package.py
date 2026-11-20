@@ -40,6 +40,11 @@ Setup
    Your choices are remembered in user/launcher.cfg. To skip the start screen, run with --play
    or name the disc image on the command line.
 
+Updates: when the start screen opens, it asks GitHub whether there's a newer release. If there
+is, it shows "Update available": press Y on a controller, U on the keyboard, or click it, and the
+program downloads the new version, replaces its own files and restarts. Your saves and settings
+in user/ are kept. To turn the check off, set check_updates=0 in user/launcher.cfg.
+
 The GameCube's system font (dialog text, comm subtitles) is built in: replacement fonts made from
 Droid Sans by the Dolphin project, under the Apache License 2.0 (see font-licenses.txt). A dump of
 your own console's boot ROM at user/GF7E01/ipl.bin, or font files in user/fonts/, are used instead

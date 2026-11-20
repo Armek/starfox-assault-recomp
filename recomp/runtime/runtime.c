@@ -27,6 +27,7 @@
 #include "funcs.h"
 #include "runtime.h"
 #include "gx.h"
+#include "updater.h"
 
 typedef struct { uint32_t addr; GuestFn fn; const char *name; } FuncEntry;
 extern const unsigned g_func_count;
@@ -1134,6 +1135,7 @@ static void usage(void) {
 }
 
 int main(int argc, char **argv) {
+    updater_init(argc, argv); /* the program's folder; removes files a previous update set aside */
     const char *root = NULL, *sdk_log = "build/GF7E01/sdk_trace.txt";
     int run_selftest = 0, dump_frames = 0, no_video = 0, root_given = 0, testing = 0, skip_launcher = 0, fullscreen = 0;
     for (int i = 1; i < argc; i++) {
@@ -1178,7 +1180,7 @@ int main(int argc, char **argv) {
     watch_init();
     count_init();
     rt_boot_setup(root);
-    printf("[recomp] %u guest functions linked\n", g_func_count);
+    printf("[recomp] version %s; %u guest functions linked\n", updater_version(), g_func_count);
     if (run_selftest) return selftest();
 
     if (*sdk_log && (g_sdk_log = fopen(sdk_log, "w"))) g_trace_sdk = 1;
