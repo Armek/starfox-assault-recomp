@@ -202,7 +202,7 @@ frame has about 20,000 small draws (fleet, lasers, particles, HUD).
     (`0x802A2D3C`, a float in seconds) advanced exactly frames / 60, so at a full 60 fps the game runs at
     normal speed. Cutscenes, subtitles and the HUD looked right.
   - **When 60 can't be held:** since game time is per frame, a PC that can't hold 60 would run the game
-    in slow motion. So while a part is played (state 16, after its first 5 s, which have loading
+    in slow motion. So while a part or a VS match is played (state 16 or 22, after its first 5 s, which have loading
     hitches and shader compiles) the hook counts frames per second. Below 54 for 2 s, it gives the
     game its own rate back and retries after 20 s, doubling the wait after each failure up to 160 s; a
     new stage starts over at 20 s.

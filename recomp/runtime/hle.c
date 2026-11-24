@@ -363,7 +363,7 @@ void rt_hook_8000ECC8(Ctx *c) {
         entered = rt_timebase();
         /* --auto-press plays only while a part runs (state 16); results screens and story scenes between
          * parts and missions get the menu taps again */
-        video_set_auto_play(st == 16);
+        video_set_auto_play(st == 16 || st == 22); /* 22: a VS match */
     }
     if (st == 16 && clear_after > 0 && rd8(0x802A2B60u + 0x13C) < stop_stage &&
         (double)(rt_timebase() - entered) / 40500000.0 >= clear_after) {
@@ -402,7 +402,7 @@ void rt_hook_8000ECC8(Ctx *c) {
  * in VI units of 0x444) and the time-step constants the game code uses, and each frame then advances game
  * time by one step: 1/60 or 1/30 s. So the game is correct at either rate as long as frames keep up (measured:
  * forced to 60, Mission 2's game clock advanced exactly frames / 60), but a PC that can't hold 60 would run the
- * game slower than real time. While a part is played (after its first 5 s, which have loading hitches), the
+ * game slower than real time. While a part or a VS match is played (state 16 or 22; after its first 5 s, which have loading hitches), the
  * hook therefore checks the frame rate: below about 54
  * for 2 s, it gives the game its own rate back for 20 s, then tries 60 again (waiting twice as long after each
  * failure, up to 160 s; a new stage starts over at 20 s). SFA_FPS_LOG=1 logs it all. */
@@ -459,7 +459,7 @@ void rt_hook_8003AEB0(Ctx *c) {
     static uint32_t last, native = 60; /* the rate the game itself asked for in this stage */
     static double slow_ms = -1; /* SFA_FRAME_SLOW_MS=<ms> (testing): busy-wait that long each frame, as on a slower PC */
     if (slow_ms < 0) slow_ms = getenv("SFA_FRAME_SLOW_MS") ? atof(getenv("SFA_FRAME_SLOW_MS")) : 0;
-    if (slow_ms > 0 && g_game_state == 16) {
+    if (slow_ms > 0 && (g_game_state == 16 || g_game_state == 22)) {
         uint64_t until = rt_timebase() + (uint64_t)(slow_ms * 40500.0);
         while (rt_timebase() < until) {}
     }
@@ -503,6 +503,9 @@ void rt_hook_8003AEB0(Ctx *c) {
         }
     }
     if (!force) return;
+    static double force_from = -1; /* SFA_60FPS_FROM=<s> (testing): the option only from that many seconds on */
+    if (force_from < 0) force_from = getenv("SFA_60FPS_FROM") ? atof(getenv("SFA_60FPS_FROM")) : 0;
+    if (force_from > 0 && rt_timebase() < (uint64_t)(force_from * 40500000.0)) return;
     /* keeping up? frames counted per second of wall time while a part is played */
     static uint64_t window_start, retry_at;
     static uint32_t frames, slow_secs, wait_secs = 20, stage = 0xFFFFFFFFu;
@@ -523,7 +526,8 @@ void rt_hook_8003AEB0(Ctx *c) {
         printf("[fps-rate] trying 60 fps again\n");
     }
     static uint64_t playing_since;
-    if (g_game_state != 16) { window_start = 0; slow_secs = 0; playing_since = 0; }
+    /* a story part (16) or a VS match (22) is being played */
+    if (g_game_state != 16 && g_game_state != 22) { window_start = 0; slow_secs = 0; playing_since = 0; }
     else if (!playing_since) playing_since = now;
     else if (now - playing_since < 5ull * 40500000ull) { /* the first seconds of play: loading hitches, shaders */ }
     else if (!window_start) { window_start = now; frames = 0; }
