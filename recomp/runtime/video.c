@@ -112,12 +112,15 @@ static const GLenum k_blend_factor[8] = {0 /*ZERO*/, 1 /*ONE*/, 0x0306 /*DST_COL
                                          0x0304 /*DST_ALPHA*/, 0x0305 /*1-DST_ALPHA*/};
 
 /* ---- input ----------------------------------------------------------------------------------------
- * Port 1 = keyboard + the first game controller (Steam Deck controls included), merged.
- * Keyboard: arrows/WASD = stick, Enter = START, Space/J = A, K/Backspace = B, L = X, I = Y,
- * Q/E = L/R, Z = Z, IJKL-style C-stick on the numpad (8/4/6/2). */
+ * Up to four game controllers, one per GameCube port: each controller takes the lowest free port when
+ * it's connected and keeps it until it's unplugged (so players don't swap mid-match), and its player
+ * light, where it has one, shows that number. Port 1 also takes the keyboard: arrows/WASD = stick,
+ * Enter = START, Space/J = A, K/Backspace = B, L = X, I = Y, Q/E = L/R, Z = Z, C-stick on the numpad
+ * (8/4/6/2). Ports without a controller read as unplugged, as on the console. */
+#define NPADS 4
 static SDL_mutex *g_pad_lock;
-static PadState g_kbd, g_ctl;
-static SDL_GameController *g_controller;
+static PadState g_kbd, g_ctl[NPADS];
+static SDL_GameController *g_controllers[NPADS];
 static int g_auto_press;
 
 void video_set_auto_press(int on) { g_auto_press = on; }
@@ -153,29 +156,62 @@ static int8_t axis8(Sint16 v) {
     return (int8_t)(x > 127 ? 127 : x < -127 ? -127 : x);
 }
 
-static void poll_controller(void) {
-    if (!g_controller) return;
+static void poll_controller(int slot) {
+    SDL_GameController *gc = g_controllers[slot];
     PadState p = {0};
-    static const struct { SDL_GameControllerButton b; uint16_t bit; } map[] = {
-        {SDL_CONTROLLER_BUTTON_A, 0x100}, {SDL_CONTROLLER_BUTTON_B, 0x200}, {SDL_CONTROLLER_BUTTON_X, 0x400},
-        {SDL_CONTROLLER_BUTTON_Y, 0x800}, {SDL_CONTROLLER_BUTTON_START, 0x1000},
-        {SDL_CONTROLLER_BUTTON_RIGHTSHOULDER, 0x10}, {SDL_CONTROLLER_BUTTON_DPAD_LEFT, 0x1},
-        {SDL_CONTROLLER_BUTTON_DPAD_RIGHT, 0x2}, {SDL_CONTROLLER_BUTTON_DPAD_DOWN, 0x4}, {SDL_CONTROLLER_BUTTON_DPAD_UP, 0x8},
-    };
-    for (size_t i = 0; i < sizeof map / sizeof map[0]; i++)
-        if (SDL_GameControllerGetButton(g_controller, map[i].b)) p.buttons |= map[i].bit;
-    p.stick_x = axis8(SDL_GameControllerGetAxis(g_controller, SDL_CONTROLLER_AXIS_LEFTX));
-    p.stick_y = (int8_t)-axis8(SDL_GameControllerGetAxis(g_controller, SDL_CONTROLLER_AXIS_LEFTY));
-    p.substick_x = axis8(SDL_GameControllerGetAxis(g_controller, SDL_CONTROLLER_AXIS_RIGHTX));
-    p.substick_y = (int8_t)-axis8(SDL_GameControllerGetAxis(g_controller, SDL_CONTROLLER_AXIS_RIGHTY));
-    p.trigger_l = (uint8_t)(SDL_GameControllerGetAxis(g_controller, SDL_CONTROLLER_AXIS_TRIGGERLEFT) / 128);
-    p.trigger_r = (uint8_t)(SDL_GameControllerGetAxis(g_controller, SDL_CONTROLLER_AXIS_TRIGGERRIGHT) / 128);
-    if (p.trigger_l > 200) p.buttons |= 0x40; /* digital L/R click at the end of the travel */
-    if (p.trigger_r > 200) p.buttons |= 0x20;
-    p.connected = 1;
+    if (gc) {
+        static const struct { SDL_GameControllerButton b; uint16_t bit; } map[] = {
+            {SDL_CONTROLLER_BUTTON_A, 0x100}, {SDL_CONTROLLER_BUTTON_B, 0x200}, {SDL_CONTROLLER_BUTTON_X, 0x400},
+            {SDL_CONTROLLER_BUTTON_Y, 0x800}, {SDL_CONTROLLER_BUTTON_START, 0x1000},
+            {SDL_CONTROLLER_BUTTON_RIGHTSHOULDER, 0x10}, {SDL_CONTROLLER_BUTTON_DPAD_LEFT, 0x1},
+            {SDL_CONTROLLER_BUTTON_DPAD_RIGHT, 0x2}, {SDL_CONTROLLER_BUTTON_DPAD_DOWN, 0x4}, {SDL_CONTROLLER_BUTTON_DPAD_UP, 0x8},
+        };
+        for (size_t i = 0; i < sizeof map / sizeof map[0]; i++)
+            if (SDL_GameControllerGetButton(gc, map[i].b)) p.buttons |= map[i].bit;
+        p.stick_x = axis8(SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_LEFTX));
+        p.stick_y = (int8_t)-axis8(SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_LEFTY));
+        p.substick_x = axis8(SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_RIGHTX));
+        p.substick_y = (int8_t)-axis8(SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_RIGHTY));
+        p.trigger_l = (uint8_t)(SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_TRIGGERLEFT) / 128);
+        p.trigger_r = (uint8_t)(SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_TRIGGERRIGHT) / 128);
+        if (p.trigger_l > 200) p.buttons |= 0x40; /* digital L/R click at the end of the travel */
+        if (p.trigger_r > 200) p.buttons |= 0x20;
+        p.connected = 1;
+    }
     SDL_LockMutex(g_pad_lock);
-    g_ctl = p;
+    g_ctl[slot] = p;
     SDL_UnlockMutex(g_pad_lock);
+}
+
+/* A controller was connected: give it the lowest free port. */
+static void add_controller(int device_index) {
+    SDL_JoystickID id = SDL_JoystickGetDeviceInstanceID(device_index);
+    for (int i = 0; i < NPADS; i++) /* already ours (it was open before the game started) */
+        if (g_controllers[i] && SDL_JoystickInstanceID(SDL_GameControllerGetJoystick(g_controllers[i])) == id) return;
+    for (int i = 0; i < NPADS; i++)
+        if (!g_controllers[i]) {
+            g_controllers[i] = SDL_GameControllerOpen(device_index);
+            if (!g_controllers[i]) return;
+            SDL_GameControllerSetPlayerIndex(g_controllers[i], i); /* the controller's player light, if any */
+            printf("[video] controller: %s -> player %d\n", SDL_GameControllerName(g_controllers[i]), i + 1);
+            fflush(stdout);
+            return;
+        }
+    printf("[video] controller ignored (4 already connected): %s\n", SDL_GameControllerNameForIndex(device_index));
+    fflush(stdout);
+}
+
+static void remove_controller(SDL_JoystickID id) {
+    for (int i = 0; i < NPADS; i++)
+        if (g_controllers[i] && SDL_JoystickInstanceID(SDL_GameControllerGetJoystick(g_controllers[i])) == id) {
+            printf("[video] player %d's controller disconnected\n", i + 1);
+            fflush(stdout);
+            SDL_GameControllerClose(g_controllers[i]);
+            g_controllers[i] = NULL;
+            SDL_LockMutex(g_pad_lock);
+            memset(&g_ctl[i], 0, sizeof g_ctl[i]);
+            SDL_UnlockMutex(g_pad_lock);
+        }
 }
 
 static void poll_keyboard(void) {
@@ -205,11 +241,40 @@ static void poll_keyboard(void) {
 
 void video_get_pad(int port, PadState *out) {
     memset(out, 0, sizeof *out);
-    if (port != 0) return;
+    if (port < 0 || port >= NPADS) return;
+    if (port != 0) { /* ports 2-4: their controller, if one is connected */
+        if (g_pad_lock) {
+            SDL_LockMutex(g_pad_lock);
+            *out = g_ctl[port];
+            SDL_UnlockMutex(g_pad_lock);
+        }
+        /* SFA_FAKE_PADS=N[:S] (testing): ports 2..N act as connected controllers; in menus they tap A
+         * every 3 s, from S seconds after launch (default 0) */
+        static int fake = -1;
+        static Uint32 fake_from;
+        if (fake < 0) {
+            const char *e = getenv("SFA_FAKE_PADS");
+            fake = e ? atoi(e) : 0;
+            const char *colon = e ? strchr(e, ':') : NULL;
+            fake_from = colon ? (Uint32)(atof(colon + 1) * 1000) : 0;
+        }
+        if (!out->connected && port < fake) {
+            Uint32 t = SDL_GetTicks() + (Uint32)port * 700;
+            out->connected = 1;
+            if (SDL_GetTicks() < fake_from) {
+            } else if (g_auto_play) { /* in a match: move, turn and fire */
+                if (t % 500 < 120) out->buttons |= 0x100;
+                out->stick_y = 60;
+                int phase = (int)(t % 8000);
+                out->stick_x = (int8_t)((phase < 4000 ? phase : 8000 - phase) * 100 / 4000 - 50);
+            } else if (t % 3000 < 150) out->buttons |= 0x100; /* menus: tap A (joins, confirms) */
+        }
+        return;
+    }
     out->connected = 1;
     if (g_pad_lock) {
         SDL_LockMutex(g_pad_lock);
-        PadState a = g_kbd, b = g_ctl;
+        PadState a = g_kbd, b = g_ctl[0];
         SDL_UnlockMutex(g_pad_lock);
         out->buttons = a.buttons | b.buttons;
         out->stick_x = b.stick_x ? b.stick_x : a.stick_x;
@@ -223,8 +288,8 @@ void video_get_pad(int port, PadState *out) {
         Uint32 t = SDL_GetTicks();
         int step = (int)(t / AUTO_KEY_STEP_MS);
         if (step < g_auto_nkeys) {
-            if (t % AUTO_KEY_STEP_MS < 200) {
-                uint16_t k = g_auto_keys[step];
+            uint16_t k = g_auto_keys[step];
+            if (t % AUTO_KEY_STEP_MS < ((k & 0xF) ? 450u : 200u)) { /* menus need a direction held longer */
                 out->buttons |= k;
                 /* directions also move the main stick: menus read either */
                 if (k & 0x8) out->stick_y = 100;
@@ -385,7 +450,9 @@ static void free_frame(GxFrame *f) {
     free(f);
 }
 
+volatile uint32_t g_video_frame_number; /* the frame being built, for logs */
 GxFrame *video_new_frame(uint32_t number) {
+    g_video_frame_number = number;
     GxFrame *f = NULL;
     SDL_AtomicLock(&g_frame_pool_lock);
     if (g_frame_pool_n) f = g_frame_pool[--g_frame_pool_n];
@@ -1069,14 +1136,11 @@ static void render(GxFrame *f) {
     }
 }
 
-/* Open the first connected game controller. Controllers already connected when the game starts
- * don't send an "added" event here (the start screen took those), so look for them directly. */
-static void open_first_controller(void) {
-    for (int i = 0; i < SDL_NumJoysticks() && !g_controller; i++)
-        if (SDL_IsGameController(i)) {
-            g_controller = SDL_GameControllerOpen(i);
-            if (g_controller) printf("[video] controller: %s\n", SDL_GameControllerName(g_controller));
-        }
+/* Open the controllers already connected (they don't send an "added" event here: the start screen took
+ * those), in SDL's order. */
+static void open_controllers(void) {
+    for (int i = 0; i < SDL_NumJoysticks(); i++)
+        if (SDL_IsGameController(i)) add_controller(i);
     fflush(stdout);
 }
 
@@ -1105,7 +1169,7 @@ static int render_thread(void *arg) {
 #endif
     }
 
-    open_first_controller();
+    open_controllers();
     while (!g_quit) {
         SDL_Event e;
         while (SDL_PollEvent(&e)) {
@@ -1115,21 +1179,14 @@ static int render_thread(void *arg) {
                       (e.key.keysym.sym == SDLK_RETURN && (e.key.keysym.mod & KMOD_ALT)))) {
                 g_fullscreen = !g_fullscreen; /* F11 or Alt+Enter: toggle fullscreen */
                 SDL_SetWindowFullscreen(g_window, g_fullscreen ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0);
-            } else if (e.type == SDL_CONTROLLERDEVICEADDED && !g_controller) {
-                g_controller = SDL_GameControllerOpen(e.cdevice.which);
-                if (g_controller) printf("[video] controller: %s\n", SDL_GameControllerName(g_controller));
-            } else if (e.type == SDL_CONTROLLERDEVICEREMOVED && g_controller &&
-                       e.cdevice.which == SDL_JoystickInstanceID(SDL_GameControllerGetJoystick(g_controller))) {
-                SDL_GameControllerClose(g_controller);
-                g_controller = NULL;
-                SDL_LockMutex(g_pad_lock);
-                memset(&g_ctl, 0, sizeof g_ctl);
-                SDL_UnlockMutex(g_pad_lock);
-                open_first_controller(); /* another one may still be connected */
+            } else if (e.type == SDL_CONTROLLERDEVICEADDED) {
+                add_controller(e.cdevice.which);
+            } else if (e.type == SDL_CONTROLLERDEVICEREMOVED) {
+                remove_controller(e.cdevice.which);
             }
         }
         poll_keyboard();
-        poll_controller();
+        for (int i = 0; i < NPADS; i++) poll_controller(i);
         SDL_LockMutex(g_qlock);
         if (!g_pending_frame) SDL_CondWaitTimeout(g_qcond, g_qlock, 16);
         GxFrame *f = g_pending_frame;

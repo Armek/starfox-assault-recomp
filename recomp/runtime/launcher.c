@@ -879,6 +879,69 @@ static void hints(SDL_Renderer *r, const char *const *items, int n) {
     }
 }
 
+/* Controllers panel (right of the cards): every connected controller with the player number it gets in
+ * the game, in the same order the game assigns them (lowest free port, in connection order). */
+#define MAX_PADS 8
+static SDL_GameController *g_pads[MAX_PADS];
+static int g_npads;
+
+static void pads_add(int device_index) {
+    SDL_JoystickID id = SDL_JoystickGetDeviceInstanceID(device_index);
+    for (int i = 0; i < g_npads; i++)
+        if (SDL_JoystickInstanceID(SDL_GameControllerGetJoystick(g_pads[i])) == id) return;
+    if (g_npads == MAX_PADS) return;
+    SDL_GameController *gc = SDL_GameControllerOpen(device_index);
+    if (!gc) return;
+    if (g_npads < 4) SDL_GameControllerSetPlayerIndex(gc, g_npads);
+    g_pads[g_npads++] = gc;
+}
+
+static void pads_remove(SDL_JoystickID id) {
+    for (int i = 0; i < g_npads; i++)
+        if (SDL_JoystickInstanceID(SDL_GameControllerGetJoystick(g_pads[i])) == id) {
+            SDL_GameControllerClose(g_pads[i]);
+            memmove(&g_pads[i], &g_pads[i + 1], (size_t)(g_npads - i - 1) * sizeof g_pads[0]);
+            g_npads--;
+            for (int k = i; k < g_npads && k < 4; k++) SDL_GameControllerSetPlayerIndex(g_pads[k], k);
+            return;
+        }
+}
+
+static void draw_pads(SDL_Renderer *r, float fade) {
+    static const SDL_Color player[4] = {{248, 113, 113, 255}, {96, 160, 255, 255}, {251, 191, 36, 255},
+                                        {52, 211, 153, 255}}; /* the game's player colours */
+    const float x = 656, w = VW - 64 - x;
+    text_ex(r, "CONTROLLERS", x, 222, 12, alpha(C_ACCENT_HI, fade), 2.2f, 1);
+    float y = 252;
+    int shown = g_npads < 4 ? g_npads : 4;
+    for (int i = 0; i < shown; i++, y += 30) {
+        char label[2] = {(char)('1' + i), 0}, name[64];
+        badge(r, label, x, y, alpha(player[i], fade), 1);
+        const char *n = SDL_GameControllerName(g_pads[i]);
+        snprintf(name, sizeof name, "%s", n ? n : "Controller");
+        while (strlen(name) > 3 && text_w(name, 14, 0) > w - 34) { /* shorten long names */
+            size_t l = strlen(name);
+            memcpy(name + l - 4, "...", 4);
+        }
+        text(r, name, x + 32, y - 8, 14, alpha(C_TEXT, fade));
+    }
+    if (!g_npads) {
+        badge(r, "1", x, y, alpha(player[0], fade), 1);
+        text(r, "Keyboard", x + 32, y - 8, 14, alpha(C_TEXT, fade));
+        y += 30;
+    } else if (g_npads > 4) {
+        char more[48];
+        snprintf(more, sizeof more, "+%d more (not used)", g_npads - 4);
+        text(r, more, x + 32, y - 8, 13, alpha(C_FAINT, fade));
+        y += 26;
+    }
+    if (g_npads) {
+        text(r, "Player 1 also has the keyboard.", x, y + 4, 12, alpha(C_FAINT, fade));
+        y += 18;
+    }
+    text(r, "VS mode: up to 4 players.", x, y + 4, 12, alpha(C_FAINT, fade));
+}
+
 int launcher_run(const char *found_disc, int *fullscreen_io, char *disc_out, size_t disc_n) {
     SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
     SDL_SetHint("SDL_JOYSTICK_HIDAPI_STEAMDECK", "1"); /* the Deck's own controls, also when not started from Steam */
@@ -905,9 +968,8 @@ int launcher_run(const char *found_disc, int *fullscreen_io, char *disc_out, siz
     g_round = make_round(r, 256, 0);
     g_glow = make_round(r, 256, 1);
     for (int i = 0; i < (int)(sizeof g_stars / sizeof g_stars[0]); i++) star_reset(&g_stars[i], 0);
-    SDL_GameController *pad = NULL;
-    for (int i = 0; i < SDL_NumJoysticks() && !pad; i++)
-        if (SDL_IsGameController(i)) pad = SDL_GameControllerOpen(i);
+    for (int i = 0; i < SDL_NumJoysticks(); i++) /* every controller can work the start screen */
+        if (SDL_IsGameController(i)) pads_add(i);
 
     const char *script = getenv("SFA_LAUNCHER_SCRIPT"); /* testing: see below */
     if (g_check_updates && !getenv("SFA_NO_UPDATE_CHECK") && (!script || getenv("SFA_UPDATE_TEST"))) updater_check_start();
@@ -966,8 +1028,10 @@ int launcher_run(const char *found_disc, int *fullscreen_io, char *disc_out, siz
                     break;
                 default: break;
                 }
-            } else if (e.type == SDL_CONTROLLERDEVICEADDED && !pad) {
-                pad = SDL_GameControllerOpen(e.cdevice.which);
+            } else if (e.type == SDL_CONTROLLERDEVICEADDED) {
+                pads_add(e.cdevice.which);
+            } else if (e.type == SDL_CONTROLLERDEVICEREMOVED) {
+                pads_remove(e.cdevice.which);
             } else if (e.type == SDL_CONTROLLERBUTTONDOWN) {
                 pad_input = 1;
                 focus_visible = 1;
@@ -1209,6 +1273,7 @@ int launcher_run(const char *found_disc, int *fullscreen_io, char *disc_out, siz
             snprintf(tmp, sizeof tmp, "v%s", updater_version());
             text(r, tmp, VW - 64 - text_w(tmp, 14, 0), 70, 14, alpha(C_FAINT, fade));
             draw_update_banner(r, now);
+            draw_pads(r, fade);
             if (updater_state() == UPD_DONE) { SDL_RenderPresent(r); SDL_Delay(600); updater_restart(); }
 
             for (int i = 0; i < ITEM_COUNT; i++) hov[i] = approach(hov[i], hover == i ? 1.0f : 0.0f, dt, 14);
@@ -1347,7 +1412,7 @@ int launcher_run(const char *found_disc, int *fullscreen_io, char *disc_out, siz
     #undef OPEN_PICKER
     if (g_dialog_thread) SDL_DetachThread(g_dialog_thread); /* quit while the dialog is open */
     save_settings();
-    if (pad) SDL_GameControllerClose(pad);
+    while (g_npads) pads_remove(SDL_JoystickInstanceID(SDL_GameControllerGetJoystick(g_pads[0])));
     for (int i = 0; i < 2; i++) if (g_ftex[i]) SDL_DestroyTexture(g_ftex[i]);
     if (g_round) SDL_DestroyTexture(g_round);
     if (g_glow) SDL_DestroyTexture(g_glow);

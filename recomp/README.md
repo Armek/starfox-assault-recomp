@@ -210,6 +210,13 @@ frame has about 20,000 small draws (fleet, lasers, particles, HUD).
     (52-57 in its busiest stretch), with the guest idle about half the time. At 30 fps the guest is
     idle 68-75% (8-10 ms of work a frame). Earlier figures of 17-23 ms came from runs while the laptop
     was busy with other work. `SFA_FPS_LOG=1` logs rate changes and fallbacks.
+  - **Late frames aren't held for a whole retrace:** the game's frame end (`fn_801759C0`) always waits
+    for the next retrace after swapping buffers, so on the console a frame 1 ms late is shown as a
+    30 fps frame. `VIWaitForRetrace` is HLE'd: from those call sites, when a retrace has already
+    passed since the last swap, the wait is skipped (elsewhere it runs the SDK's loop). Game time is
+    unchanged, since the main loop paces frames by its retrace budget (0x80385B40). With every frame
+    slowed by 4 ms (`SFA_FRAME_SLOW_MS=4`, testing) Mission 2 held 53-59 fps instead of 49-51.
+    `SFA_ELASTIC_VI=0` turns it off; `SFA_NO_FALLBACK=1` (testing) keeps 60 regardless.
   - **Tried without gain** (Mission 2 at 30 fps, alternating runs; the difference was smaller than the
     spread between runs):
     - `restrict` on the generated functions' context pointer, so guest stores through `uint8_t*` no
@@ -300,7 +307,7 @@ untranslated instructions.
 | **Render-to-texture** | An EFB copy to texture is recorded as a marker in the frame (ordered with the clears) and an entry mapping the destination address to a renderer texture. At the marker, the render thread runs a small shader pass that box-filters the rectangle if half-scale is set and converts it into what the requested copy format (R4/I4, R8/I8, RA4/IA4, RA8/IA8, RGB565, RGB5A3, RGBA8, A8, R8, G8, B8, RG8, GB8; YUV intensity when set) decodes to, so nothing waits. Texture lookups at the destination use that texture while guest RAM there is unchanged. With `SFA_EFB_READBACK=1` the copy instead ends a frame *segment* that the renderer draws and reads back, and the guest encodes it into RAM, tiled like textures. Mission 1 uses copies for the 3D comm portraits (69×65 RGBA8) and the Arwing shadow silhouette (160×160 RG8). | `gx.c`, `video.c` |
 | **Lighting** | GX per-vertex lighting for both color channels (color and alpha separately). Normals are decoded (s8/s16/float, including the NBT index form) and transformed by the normal matrix (XF `0x400`). Ambient plus up to 8 lights from XF `0x600`: color, position, direction, spot (angle/distance) or specular attenuation, and the none/sign/clamp diffuse functions, multiplied by the material color from a register or the vertex. | `gx.c` |
 | **Frames** | Each frame's batches are built on the guest threads and handed to a **render thread** that owns the SDL window and an OpenGL 3.3 core context. It draws into a 640×528 EFB framebuffer and scales the XFB-copy rectangle into the window. EFB clears requested by copies are applied in order. | `video.c` |
-| **Input** | Port 1 merges the keyboard and the first SDL game controller (Steam Deck included) into `PADRead`. `--auto-press` taps START and A every 4 seconds for unattended testing. | `video.c`, `hle.c` |
+| **Input** | Up to four SDL game controllers (Steam Deck included), one per port: each takes the lowest free port when it's connected and keeps it until unplugged; its player light shows the number. Port 1 also takes the keyboard. Ports without a controller read as unplugged, so VS mode's 2-4 player split screen works with real controllers. The start screen lists the controllers in that order. `--auto-press` taps START and A every 4 seconds for unattended testing; `SFA_FAKE_PADS=N[:S]` makes ports 2..N act as connected controllers (tapping A in menus from S seconds, moving and firing in a stage) and `SFA_PAD_LOG=1` logs every input change with the frame number. | `video.c`, `hle.c`, `launcher.c` |
 | **Diagnostics** | `--dump-frames` saves every 15th presented frame to `build/GF7E01/frames/*.bmp`. Files are named by frame number and older runs' files aren't removed, so empty the folder before a run you want to compare. `--no-video` runs headless. With `SFA_GX_DEBUG=1`, each new draw configuration, texture upload (with how many source bytes are non-zero), EFB-to-texture copy and ARAM DMA is logged, and decoded textures are saved to `build/GF7E01/textures/`. | `video.c`, `gx.c` |
 
 Keyboard: arrows/WASD = control stick, Enter = START, Space/J = A, K/Backspace = B, L = X, I = Y,

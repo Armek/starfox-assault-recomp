@@ -52,7 +52,9 @@ when present.
 
 Controls
 --------
-Any SDL game controller (the Steam Deck's own controls included), or the keyboard:
+Any SDL game controller (the Steam Deck's own controls included), or the keyboard. Up to four
+controllers for VS mode's split screen: each one is a player in the order you connect them (the
+start screen lists them; a controller's player light shows its number). The keyboard is player 1:
     stick: WASD or arrow keys     C-stick: numpad 8/4/6/2
     A: Space or J    B: K or Backspace    X: L    Y: I    Z: Z
     L: Q             R: E                 START: Enter

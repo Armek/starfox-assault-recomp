@@ -233,6 +233,16 @@ HLE(PADRead) {
         wr8(p + 6, in.trigger_l);
         wr8(p + 7, in.trigger_r);
         wr8(p + 10, (uint8_t)(in.connected ? PAD_ERR_NONE : PAD_ERR_NO_CONTROLLER));
+        static int log = -1; /* SFA_PAD_LOG=1 (testing): each change of a port's buttons or stick */
+        static uint32_t last[4];
+        if (log < 0) log = getenv("SFA_PAD_LOG") != NULL;
+        uint32_t now = (uint32_t)in.buttons << 16 | (uint8_t)in.stick_x << 8 | (uint8_t)in.stick_y;
+        if (log && now != last[port]) {
+            extern volatile uint32_t g_video_frame_number;
+            printf("[pad] frame %u, %.2f s port %d: buttons %04X stick %d,%d%s\n", g_video_frame_number, rt_timebase() / 40500000.0, port + 1, in.buttons,
+                   in.stick_x, in.stick_y, in.connected ? "" : " (none)");
+            last[port] = now;
+        }
     }
     c->r[3] = 0; /* no motor/reset bits */
 }
@@ -398,10 +408,61 @@ void rt_hook_8000ECC8(Ctx *c) {
  * failure, up to 160 s; a new stage starts over at 20 s). SFA_FPS_LOG=1 logs it all. */
 int g_force_60fps = -1; /* set by runtime.c from the launcher setting; the environment wins */
 
+/* VIWaitForRetrace: no waiting a whole retrace after a late frame. The game's frame end (fn_801759C0,
+ * fn_80175CCC) swaps buffers, calls VIFlush, then always waits for the next retrace, and stores the
+ * retrace count at 0x80386A28. On the console a frame that misses its retrace by 1 ms is therefore shown
+ * 15.7 ms later, like a 30 fps frame; on a PC that can only just hold 60 that's most of the drops. When
+ * a retrace has already passed since the last swap (at least 0x803869A0 of them, which the game sets to
+ * 0), that wait is skipped and the frame is shown as soon as it's ready. Game time is unaffected: the
+ * main loop still paces frames by its retrace budget (0x80385B40), so the game's own 30 fps holds, and a
+ * frame that runs long just shows late. Every other caller waits as the SDK does. SFA_ELASTIC_VI=0
+ * turns the skipping off. */
+unsigned long g_vi_early; /* waits skipped, for SFA_FPS_LOG */
+static unsigned long rep_early;
+HLE(VIWaitForRetrace) {
+    static int on = -1;
+    if (on < 0) on = !getenv("SFA_ELASTIC_VI") || atoi(getenv("SFA_ELASTIC_VI")) != 0;
+    uint32_t ret = c->lr;
+    if (on && (ret == 0x80175A74u || ret == 0x80175BACu || ret == 0x80175D50u || ret == 0x80175E78u)) {
+        uint32_t since = rd32(0x80386664u) - rd32(0x80386A28u), min = rd32(0x803869A0u);
+        if (since >= (min ? min : 1) && since < 60) {
+            g_vi_early++;
+            return;
+        }
+    }
+    /* the SDK's code, step by step: its stack frame (lr and r30/r31 saved), the same return addresses
+     * for each call, interrupts off while it sleeps on the retrace queue until the retrace count changes */
+    uint32_t sp = c->r[1];
+    wr32(sp + 4, ret);
+    c->r[1] = sp - 0x10;
+    wr32(c->r[1], sp);
+    wr32(c->r[1] + 0xC, c->r[31]);
+    wr32(c->r[1] + 0x8, c->r[30]);
+    c->lr = 0x80140588u; F_OSDisableInterrupts(c);
+    c->r[30] = rd32(0x80386664u);
+    c->r[31] = c->r[3];
+    do {
+        c->r[3] = 0x8038666Cu;
+        c->lr = 0x80140598u; F_OSSleepThread(c);
+    } while (rd32(0x80386664u) == c->r[30]);
+    c->r[3] = c->r[31];
+    c->lr = 0x801405ACu; F_OSRestoreInterrupts(c);
+    c->r[31] = rd32(c->r[1] + 0xC);
+    c->r[30] = rd32(c->r[1] + 0x8);
+    c->r[1] = sp;
+    c->lr = ret;
+}
+
 void rt_hook_8003AEB0(Ctx *c) {
     (void)c;
     static int log = -1, force;
     static uint32_t last, native = 60; /* the rate the game itself asked for in this stage */
+    static double slow_ms = -1; /* SFA_FRAME_SLOW_MS=<ms> (testing): busy-wait that long each frame, as on a slower PC */
+    if (slow_ms < 0) slow_ms = getenv("SFA_FRAME_SLOW_MS") ? atof(getenv("SFA_FRAME_SLOW_MS")) : 0;
+    if (slow_ms > 0 && g_game_state == 16) {
+        uint64_t until = rt_timebase() + (uint64_t)(slow_ms * 40500.0);
+        while (rt_timebase() < until) {}
+    }
     if (log < 0) {
         log = getenv("SFA_FPS_LOG") != NULL;
         const char *e = getenv("SFA_60FPS");
@@ -431,8 +492,10 @@ void rt_hook_8003AEB0(Ctx *c) {
         if (t - rep_start >= 10ull * 40500000ull) {
             double secs = (double)(t - rep_start) / 40500000.0;
             printf("[fps-rate] 10 s: stage %u state %u: %.1f fps, game clock +%.2f s (%.2fx real time), "
-                   "%u%% of frames at the 60 rate\n", rd8(0x802A2B60u + 0x13C), g_game_state, rep_frames / secs,
-                   clock - rep_clock, (clock - rep_clock) / secs, 100 * rep_rate60 / rep_frames);
+                   "%u%% of frames at the 60 rate, %lu late frames shown at once\n", rd8(0x802A2B60u + 0x13C),
+                   g_game_state, rep_frames / secs, clock - rep_clock, (clock - rep_clock) / secs,
+                   100 * rep_rate60 / rep_frames, g_vi_early - rep_early);
+            rep_early = g_vi_early;
             fflush(stdout);
             rep_start = t;
             rep_clock = clock;
@@ -469,7 +532,9 @@ void rt_hook_8003AEB0(Ctx *c) {
         slow_secs = fps < 54.0 ? slow_secs + 1 : 0;
         window_start = now;
         frames = 0;
-        if (slow_secs >= 2 && native != 60) { /* where the game itself runs at 60 (flight), there's nothing lower to go back to */
+        static int no_fallback = -1; /* SFA_NO_FALLBACK=1 (testing): stay at 60 regardless */
+        if (no_fallback < 0) no_fallback = getenv("SFA_NO_FALLBACK") != NULL;
+        if (slow_secs >= 2 && native != 60 && !no_fallback) { /* where the game itself runs at 60 (flight), there's nothing lower to go back to */
             backed_off = 1;
             retry_at = now + (uint64_t)wait_secs * 40500000ull;
             if (rd32(0x80385AF4u) == 60) wr32(0x80385AF4u, native);
