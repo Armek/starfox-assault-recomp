@@ -335,7 +335,8 @@ static void get_pad(int port, PadState *out) {
 }
 
 /* What PADRead gets for a port. Real input (port 1, which also has the keyboard, and ports with a
- * controller) goes to bots.c as well, which watches for Z on the character screen (adding bots). */
+ * controller) goes through bots.c as well, which watches for Z on the character screen (adding bots)
+ * and takes the input while its player chooses a bot's character. */
 void video_get_pad(int port, PadState *out) {
     get_pad(port, out);
     int real = port == 0;
@@ -344,7 +345,7 @@ void video_get_pad(int port, PadState *out) {
         real = g_ctl[port].connected;
         SDL_UnlockMutex(g_pad_lock);
     }
-    if (real) bots_human_input(port, out->buttons, SDL_GetTicks());
+    if (real) bots_human_input(port, out, SDL_GetTicks());
 }
 
 /* ---- audio output -------------------------------------------------------------------------------- */

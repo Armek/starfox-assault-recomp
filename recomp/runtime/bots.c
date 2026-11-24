@@ -248,22 +248,52 @@ static uint32_t next_rand(BotMind *m) {
 static BotMind g_mind[NPLAYERS];
 
 /* Which ports are bots. On the character-select screen, Z on any controller (or the keyboard) puts a
- * bot in the next free slot: a port with no controller that isn't a bot yet. A bot joins, steps through
- * the characters a random number of times, picks one and gets ready. Bots stay for the next matches;
+ * bot in the next free slot: a port with no controller that isn't a bot yet. A bot joins, takes the
+ * character the person who added it chooses (or a random one; see "Choosing a bot's character" below)
+ * and gets ready. Bots stay for the next matches;
  * backing out of the character screen (to stage select) takes them all out, so the next visit starts
  * with only the bots added then. Bots never press B (on some slot states B backs the whole screen out)
  * and, after picking, only A (the stick would change the handicap). SFA_BOTS=<ports> (testing, e.g. "234") starts with those ports as bots. */
 static int g_bots = -1;                 /* bitmask of bot ports */
-static uint32_t g_join_session[NPLAYERS], g_join_ms[NPLAYERS];
-static int g_steps[NPLAYERS];           /* right-presses before picking: the random character */
-static uint32_t g_human_ms[NPLAYERS];   /* when a real controller last reported on each port */
-static uint16_t g_human_buttons[NPLAYERS];
 static uint32_t g_rand = 0x2545F491u;
 
 static uint32_t bots_rand(void) {
     g_rand ^= g_rand << 13; g_rand ^= g_rand >> 17; g_rand ^= g_rand << 5;
     return g_rand;
 }
+static uint32_t g_join_session[NPLAYERS], g_join_ms[NPLAYERS];
+static int g_steps[NPLAYERS];           /* right-presses before picking: the random character */
+/* Choosing a bot's character. Z adds a bot and hands its character choice to the person who pressed
+ * it: their stick or D-pad left/right step the bot's character, A picks it, Z again picks one at random
+ * (so Z, Z gives a random bot), and 20 s without a choice picks at random too. Meanwhile their own slot
+ * sees none of it. */
+enum { CHOICE_RANDOM, CHOICE_MANUAL, CHOICE_PICKED };
+static int g_choice[NPLAYERS];          /* how this bot's character is chosen */
+static int g_moves[NPLAYERS];           /* steps left (-) or right (+) still to press for it */
+static int g_press_dir[NPLAYERS];
+static uint32_t g_press_until[NPLAYERS], g_move_next[NPLAYERS], g_picked_ms[NPLAYERS];
+static int g_ctrl_bot = -1, g_ctrl_human = -1; /* the bot being chosen for, and by whom */
+static uint32_t g_ctrl_since;
+static int g_prev_dir[NPLAYERS];
+static int g_hold_off[NPLAYERS]; /* choosing just ended: keep the player's input off until all is released */
+
+static void end_choice(int random, uint32_t now_ms) {
+    int b = g_ctrl_bot;
+    if (b < 0) return;
+    if (random) {
+        g_choice[b] = CHOICE_RANDOM;
+        g_steps[b] = (int)(bots_rand() % 6);
+        g_join_ms[b] = now_ms - 900; /* already joined: straight to the random steps */
+    } else {
+        g_choice[b] = CHOICE_PICKED;
+        g_picked_ms[b] = now_ms;
+    }
+    printf("[bots] player %d's character: %s\n", b + 1, random ? "random" : "chosen");
+    fflush(stdout);
+    g_ctrl_bot = g_ctrl_human = -1;
+}
+static uint32_t g_human_ms[NPLAYERS];   /* when a real controller last reported on each port */
+static uint16_t g_human_buttons[NPLAYERS];
 
 static int bot_mask(void) {
     if (g_bots < 0) {
@@ -294,22 +324,45 @@ static void check_backed_out(uint32_t now_ms) {
 
 int bots_active(int port) { return (bot_mask() >> port) & 1; }
 
-/* video.c: what a real controller (or the keyboard) on a port pressed this frame. */
-void bots_human_input(int port, uint16_t buttons, uint32_t now_ms) {
+/* video.c: what a real controller (or the keyboard) on a port pressed this frame. While its player is
+ * choosing a bot's character, the presses go to the bot instead and are cleared here. */
+void bots_human_input(int port, PadState *in, uint32_t now_ms) {
     if (port < 0 || port >= NPLAYERS) return;
+    uint16_t buttons = in->buttons;
     uint16_t pressed = buttons & ~g_human_buttons[port];
     g_human_buttons[port] = buttons;
     g_human_ms[port] = now_ms;
-    if (charsel_open()) {
-        if (pressed & 0x200) g_charsel_last_b = now_ms;
-        if (pressed & 0x1000) g_charsel_last_start = now_ms;
-    } else if (port == 0)
-        check_backed_out(now_ms); /* port 1 always reports, every frame */
-    if (pressed & 0x10) {
-        printf("[bots] Z on port %d (character screen %s)\n", port + 1, charsel_open() ? "open" : "closed");
-        fflush(stdout);
+    int dir = (buttons & 0x2) || in->stick_x > 60 ? 1 : (buttons & 0x1) || in->stick_x < -60 ? -1 : 0;
+    int new_dir = dir != g_prev_dir[port] ? dir : 0;
+    g_prev_dir[port] = dir;
+    if (!charsel_open()) {
+        if (g_ctrl_bot >= 0) end_choice(1, now_ms); /* the screen went: leave it to chance */
+        if (port == 0) check_backed_out(now_ms);    /* port 1 always reports, every frame */
+        return;
     }
-    if (!(pressed & 0x10) || !charsel_open()) return; /* Z, on the character-select screen */
+    if (g_hold_off[port]) { /* the press that ended a choice (or added a bot) is still held */
+        if (!buttons && !dir) g_hold_off[port] = 0;
+        else {
+            in->buttons = 0;
+            in->stick_x = in->stick_y = in->substick_x = in->substick_y = 0;
+            in->trigger_l = in->trigger_r = 0;
+            return;
+        }
+    }
+    if (g_ctrl_bot >= 0 && port == g_ctrl_human) { /* choosing a bot's character */
+        if (new_dir && g_moves[g_ctrl_bot] * new_dir < 8) g_moves[g_ctrl_bot] += new_dir;
+        if (pressed & 0x100) end_choice(0, now_ms);                      /* A: this one */
+        else if (pressed & 0x10) end_choice(1, now_ms);                  /* Z: a random one */
+        else if (now_ms - g_ctrl_since > 20000) end_choice(1, now_ms);   /* nothing chosen */
+        if (g_ctrl_bot < 0) g_hold_off[port] = 1; /* chosen: the rest of this press stays off too */
+        in->buttons = 0; /* none of it reaches the player's own slot */
+        in->stick_x = in->stick_y = in->substick_x = in->substick_y = 0;
+        in->trigger_l = in->trigger_r = 0;
+        return;
+    }
+    if (pressed & 0x200) g_charsel_last_b = now_ms;
+    if (pressed & 0x1000) g_charsel_last_start = now_ms;
+    if (!(pressed & 0x10) || g_ctrl_bot >= 0) return; /* Z adds a bot (one being chosen at a time) */
     g_rand ^= now_ms * 2654435761u;
     int mask = bot_mask();
     for (int p = 1; p < NPLAYERS; p++) {
@@ -317,7 +370,14 @@ void bots_human_input(int port, uint16_t buttons, uint32_t now_ms) {
         if (has_controller || (mask >> p & 1)) continue;
         g_bots |= 1 << p; /* a new bot in the first free slot */
         g_join_session[p] = 0;
-        printf("[bots] player %d is now a computer player\n", p + 1);
+        g_choice[p] = CHOICE_MANUAL;
+        g_moves[p] = 0;
+        g_ctrl_bot = p;
+        g_ctrl_human = port;
+        g_ctrl_since = now_ms;
+        g_hold_off[port] = 1; /* the Z itself doesn't reach the game */
+        in->buttons = 0;
+        printf("[bots] player %d is now a computer player; player %d chooses its character\n", p + 1, port + 1);
         fflush(stdout);
         return;
     }
@@ -335,14 +395,33 @@ int bots_pad(int port, PadState *out, uint32_t now_ms) {
         if (!charsel_open()) return 1;
         if (g_join_session[port] != g_charsel_session) {
             g_join_session[port] = g_charsel_session;
-            g_join_ms[port] = now_ms + (uint32_t)port * 300; /* not all at once */
+            /* after the screen has faded in (an A before that is lost), and not all at once */
+            g_join_ms[port] = now_ms + 1500 + (uint32_t)port * 300;
             g_steps[port] = (int)(bots_rand() % 6);
+            if (g_choice[port] == CHOICE_MANUAL && g_ctrl_bot != port) g_choice[port] = CHOICE_RANDOM;
         }
         if (now_ms < g_join_ms[port]) return 1;
         uint32_t t = now_ms - g_join_ms[port];
+        if (t < 150) { out->buttons |= 0x100; return 1; }      /* join */
+        if (t < 900) return 1;
+        if (g_choice[port] != CHOICE_RANDOM) { /* the character a person is choosing for it */
+            if (now_ms < g_press_until[port]) { /* a step left or right in progress */
+                out->buttons |= g_press_dir[port] > 0 ? 0x2 : 0x1;
+                out->stick_x = (int8_t)(g_press_dir[port] * 100);
+            } else if (g_moves[port] && now_ms >= g_move_next[port]) {
+                g_press_dir[port] = g_moves[port] > 0 ? 1 : -1;
+                g_moves[port] -= g_press_dir[port];
+                g_press_until[port] = now_ms + 150;
+                g_move_next[port] = now_ms + 300;
+                out->buttons |= g_press_dir[port] > 0 ? 0x2 : 0x1;
+                out->stick_x = (int8_t)(g_press_dir[port] * 100);
+            } else if (g_choice[port] == CHOICE_PICKED && !g_moves[port] && now_ms >= g_move_next[port] &&
+                       now_ms - g_picked_ms[port] >= 300 && (now_ms - g_picked_ms[port] - 300) % 1500 < 120)
+                out->buttons |= 0x100; /* pick, handicap, ready */
+            return 1;
+        }
         uint32_t steps_end = 900 + (uint32_t)g_steps[port] * 450;
-        if (t < 150) out->buttons |= 0x100;                   /* join */
-        else if (t >= 900 && t < steps_end) {                  /* next character */
+        if (t < steps_end) {                                   /* next character */
             if ((t - 900) % 450 < 150) { out->buttons |= 0x2; out->stick_x = 100; }
         } else if (t >= steps_end + 300 && (t - steps_end) % 1500 < 120)
             out->buttons |= 0x100; /* pick, handicap, ready (more A once ready does nothing) */
