@@ -75,6 +75,11 @@ entry PSVECNormalize
 # 0x444) and the time-step constants from the target frame rate at 0x80385AF4 (60 or 30). The hook in
 # hle.c logs rate changes (SFA_FPS_LOG=1) and can force 60 (SFA_60FPS=1).
 entry fn_8003AEB0
+# fn_8007FE88(player): the per-player update (VS included); bots.c records each player object by port.
+entry fn_8007FE88
+# m2:fn_6_2BE4: the VS character-select screen's per-frame update (menus module m2); bots.c notes when
+# it runs, so bots press buttons in menus only there (to join and ready up).
+entry m2:fn_6_2BE4
 # VIWaitForRetrace: the game's frame end always waits for the next retrace after swapping buffers;
 # after a frame that ran late, hle.c skips that wait (the SDK's loop otherwise), so a frame 1 ms late
 # isn't held for a whole extra 16.7 ms.

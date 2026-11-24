@@ -239,7 +239,7 @@ static void poll_keyboard(void) {
     SDL_UnlockMutex(g_pad_lock);
 }
 
-void video_get_pad(int port, PadState *out) {
+static void get_pad(int port, PadState *out) {
     memset(out, 0, sizeof *out);
     if (port < 0 || port >= NPADS) return;
     if (port != 0) { /* ports 2-4: their controller, if one is connected */
@@ -258,10 +258,24 @@ void video_get_pad(int port, PadState *out) {
             const char *colon = e ? strchr(e, ':') : NULL;
             fake_from = colon ? (Uint32)(atof(colon + 1) * 1000) : 0;
         }
+        if (!out->connected && bots_pad(port, out, SDL_GetTicks())) return; /* a bot plays this port */
         if (!out->connected && port < fake) {
             Uint32 t = SDL_GetTicks() + (Uint32)port * 700;
             out->connected = 1;
+            static int walk = -1; /* SFA_FAKE_PAD_WALK=1 (testing): in a match, port 2 only walks 3 s forward, 3 s back */
+            if (walk < 0) walk = getenv("SFA_FAKE_PAD_WALK") ? atoi(getenv("SFA_FAKE_PAD_WALK")) : 0;
             if (SDL_GetTicks() < fake_from) {
+            } else if (g_auto_play && walk == 2 && port == 1) { /* controls test: 3 s each */
+                switch ((SDL_GetTicks() / 3000) % 6) {
+                case 0: out->stick_x = 100; break;
+                case 1: out->substick_x = 100; break;
+                case 2: out->stick_y = 100; break;
+                case 3: out->buttons |= 0x20; out->trigger_r = 255; break; /* R */
+                case 4: out->buttons |= 0x40; out->trigger_l = 255; break; /* L */
+                default: out->substick_y = 100; break;
+                }
+            } else if (g_auto_play && walk == 1) {
+                if (port == 1) out->stick_y = (SDL_GetTicks() / 3000) % 2 ? -100 : 100;
             } else if (g_auto_play) { /* in a match: move, turn and fire */
                 if (t % 500 < 120) out->buttons |= 0x100;
                 out->stick_y = 60;
@@ -318,6 +332,19 @@ void video_get_pad(int port, PadState *out) {
         if (t < 150) out->buttons |= 0x1000;
         else if (t >= 2000 && t < 2150) out->buttons |= 0x100;
     }
+}
+
+/* What PADRead gets for a port. Real input (port 1, which also has the keyboard, and ports with a
+ * controller) goes to bots.c as well, which watches for Z on the character screen (adding bots). */
+void video_get_pad(int port, PadState *out) {
+    get_pad(port, out);
+    int real = port == 0;
+    if (port > 0 && port < NPADS && g_pad_lock) {
+        SDL_LockMutex(g_pad_lock);
+        real = g_ctl[port].connected;
+        SDL_UnlockMutex(g_pad_lock);
+    }
+    if (real) bots_human_input(port, out->buttons, SDL_GetTicks());
 }
 
 /* ---- audio output -------------------------------------------------------------------------------- */

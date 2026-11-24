@@ -54,7 +54,10 @@ Controls
 --------
 Any SDL game controller (the Steam Deck's own controls included), or the keyboard. Up to four
 controllers for VS mode's split screen: each one is a player in the order you connect them (the
-start screen lists them; a controller's player light shows its number). The keyboard is player 1:
+start screen lists them; a controller's player light shows its number). Computer players: on VS
+mode's character screen, press Z (R1 / RB on most pads) to put a bot in the next empty slot; it
+picks a random character and gets ready. Bots stay for rematches; backing out of the character
+screen removes them. The keyboard is player 1:
     stick: WASD or arrow keys     C-stick: numpad 8/4/6/2
     A: Space or J    B: K or Backspace    X: L    Y: I    Z: Z
     L: Q             R: E                 START: Enter

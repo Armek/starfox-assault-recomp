@@ -875,6 +875,8 @@ def main():
     mods = load_rels()
     overrides, hook_names = load_hle_list()
     by_name = {n: a for a, _, n, _ in funcs}
+    for m in mods:  # module functions too, named "module:name"
+        by_name.update({n: a for a, _, n, _ in m.funcs})
     missing = hook_names - set(by_name)
     if missing:
         sys.exit(f"hle_overrides.txt hooks unknown functions: {sorted(missing)}")

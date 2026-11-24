@@ -110,6 +110,10 @@ typedef struct {
     int connected;
 } PadState;
 void video_get_pad(int port, PadState *out);
+/* bots.c: computer players in VS matches (SFA_BOTS) */
+int bots_active(int port);
+int bots_pad(int port, PadState *out, uint32_t now_ms);
+void bots_human_input(int port, uint16_t buttons, uint32_t now_ms);
 void video_set_auto_press(int on);
 void video_set_auto_keys(const char *list); /* --auto-keys=a,down,start,w,... */
 void video_set_auto_play(int on); /* with --auto-press: in a stage, fire and move instead of tapping START */

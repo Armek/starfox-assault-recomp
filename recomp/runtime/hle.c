@@ -459,6 +459,37 @@ void rt_hook_8003AEB0(Ctx *c) {
     static uint32_t last, native = 60; /* the rate the game itself asked for in this stage */
     static double slow_ms = -1; /* SFA_FRAME_SLOW_MS=<ms> (testing): busy-wait that long each frame, as on a slower PC */
     if (slow_ms < 0) slow_ms = getenv("SFA_FRAME_SLOW_MS") ? atof(getenv("SFA_FRAME_SLOW_MS")) : 0;
+    static double dump_every = -1; /* SFA_RAM_DUMP=<s> (testing): in a VS match, all of RAM to build/GF7E01/ramdump */
+    if (dump_every < 0) dump_every = getenv("SFA_RAM_DUMP") ? atof(getenv("SFA_RAM_DUMP")) : 0;
+    static int dump_menus = -1; /* SFA_RAM_DUMP_MENUS=1: in menus (state 6) instead of matches */
+    if (dump_menus < 0) dump_menus = getenv("SFA_RAM_DUMP_MENUS") != NULL;
+    if (dump_every > 0 && g_game_state == (dump_menus ? 6u : 22u)) {
+        static uint64_t next_dump;
+        static int n;
+        uint64_t t = rt_timebase();
+        if (!next_dump) { /* SFA_RAM_DUMP_FROM=<s>: not before that many seconds after launch */
+            double from = getenv("SFA_RAM_DUMP_FROM") ? atof(getenv("SFA_RAM_DUMP_FROM")) : 0;
+            next_dump = t + (uint64_t)(3 * 40500000.0);
+            if (next_dump < (uint64_t)(from * 40500000.0)) next_dump = (uint64_t)(from * 40500000.0);
+        }
+        if (t >= next_dump && n < 60) {
+            next_dump = t + (uint64_t)(dump_every * 40500000.0);
+            char path[96];
+            if (!n) {
+#ifdef _WIN32
+                system("if not exist build\\GF7E01\\ramdump mkdir build\\GF7E01\\ramdump");
+#else
+                system("mkdir -p build/GF7E01/ramdump");
+#endif
+            }
+            snprintf(path, sizeof path, "build/GF7E01/ramdump/ram_%02d.bin", n++);
+            FILE *f = fopen(path, "wb");
+            if (f) { fwrite(g_mem, 1, PPC_MEM_SIZE, f); fclose(f); }
+            extern volatile uint32_t g_video_frame_number;
+            printf("[ramdump] %s at %.2f s, frame %u\n", path, t / 40500000.0, g_video_frame_number);
+            fflush(stdout);
+        }
+    }
     if (slow_ms > 0 && (g_game_state == 16 || g_game_state == 22)) {
         uint64_t until = rt_timebase() + (uint64_t)(slow_ms * 40500.0);
         while (rt_timebase() < until) {}

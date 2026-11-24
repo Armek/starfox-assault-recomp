@@ -516,7 +516,7 @@ static void count_init(void) {
 
 void rt_count_report(void) {
     if (!g_counts) return;
-    printf("[count] calls in the last period:");
+    printf("[count] %.1f s: calls in the last period:", rt_timebase() / 40500000.0);
     int any = 0;
     for (uint32_t a = g_count_lo; a < g_count_hi; a += 4) {
         uint32_t n = g_counts[(a - g_count_lo) >> 2];

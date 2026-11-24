@@ -940,6 +940,8 @@ static void draw_pads(SDL_Renderer *r, float fade) {
         y += 18;
     }
     text(r, "VS mode: up to 4 players.", x, y + 4, 12, alpha(C_FAINT, fade));
+    text(r, "Z on the character screen adds", x, y + 22, 12, alpha(C_FAINT, fade));
+    text(r, "a bot; backing out removes them.", x, y + 38, 12, alpha(C_FAINT, fade));
 }
 
 int launcher_run(const char *found_disc, int *fullscreen_io, char *disc_out, size_t disc_n) {
