@@ -60,6 +60,14 @@ __OSReadROM
 # Entry hooks: the recompiled function runs, but calls rt_hook_XXXXXXXX(c) first.
 # fn_8005F470(state, stage, ...) starts a stage (an index into the stage table at 0x80223560): logged.
 entry fn_8005F470
+# fn_8005ECA4(stage): runs a story stage's asset script (model, texture and animation packs to load);
+# with another story pilot, hle.c adds that character's packs once the stage's own are in.
+entry fn_8005ECA4
+# fn_80095750(size, size2): motion pack buffers at stage start; another story pilot gets VS's size.
+entry fn_80095750
+# fn_8001A128: bytes still loading (the stage setup waits for 0); hle.c counts disc reads too while a
+# story stage loads another pilot's packs, and loads them once the stage's own are in.
+fn_8001A128
 # OSExitThread marks the current thread as exiting, so its host thread ends once it switches away.
 entry OSExitThread
 # fn_8001D5B4(stage) sets the current stage: copies its stage-table record into the game info at
@@ -87,3 +95,11 @@ VIWaitForRetrace
 # fn_800FA400: cubic Bezier curve length, summed over 1,000 steps. hle.c does the same float operations natively;
 # when Mission 1's fleet is set up the game measures ~680 curves at once, which made a 25-42 ms frame.
 fn_800FA400
+# fn_80169524(model ID): the model registry search; in Mission 3 with another story pilot, hle.c looks
+# Fox's story models up as that character's.
+entry fn_80169524
+# fn_80077F1C(player): the player draw; with another story pilot, hle.c keeps player 1's head drawn.
+entry fn_80077F1C
+# fn_8016106C(model ID, mode): sets a model's material mode bits; with another story pilot, hle.c keeps
+# player 1's head at mode 1 while it's drawn.
+entry fn_8016106C

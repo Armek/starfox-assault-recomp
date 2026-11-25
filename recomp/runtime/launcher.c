@@ -104,16 +104,20 @@ static uint8_t *yay0(const uint8_t *src, size_t n, uint32_t *out_size) {
     return out;
 }
 
-static int font_init(SDL_Renderer *r) {
+/* The replacement font (recomp/fonts) as an RGBA atlas: white, coverage in alpha, FCOLS glyph cells of
+ * (FCELL + 2 * FPAD) * m pixels a row, m = 3 for the supersampled one (hi), else 1; glyph g is character
+ * g + 32 (Windows-1252). Also fills the advance widths (font_widths). NULL if the font doesn't decode.
+ * The launcher draws with it, and so does the game window's story pilot picker (video.c). */
+uint8_t *font_atlas_rgba(int hi, int *out_w, int *out_h) {
     uint32_t n = 0;
     uint8_t *d = yay0(g_font_western, g_font_western_size, &n);
-    if (!d || n < 0x30) { free(d); return 0; }
+    if (!d || n < 0x30) { free(d); return NULL; }
     uint32_t first = be16(d + 2), cell_w = be16(d + 0x10), cell_h = be16(d + 0x12), cols = be16(d + 0x1A);
     uint32_t sw = be16(d + 0x1E), sh = be16(d + 0x20), wtab = be16(d + 0x22), simg = be32(d + 0x24);
     uint8_t lv[4] = {d[0x2C], d[0x2D], d[0x2E], d[0x2F]};
     if (first != 32 || cell_w != FCELL || cell_h != FCELL || !cols || simg + sw * sh / 4 > n || wtab + FGLYPHS > n) {
         free(d);
-        return 0;
+        return NULL;
     }
     memcpy(g_fwidth, d + wtab, FGLYPHS);
     uint8_t *sheet = calloc((size_t)sw * sh, 1); /* alpha, 0-255 */
@@ -126,8 +130,8 @@ static int font_init(SDL_Renderer *r) {
                         sheet[(ty * 8 + row) * sw + tx * 8 + b * 4 + k] = lv[(t[row * 2 + b] >> (6 - 2 * k)) & 3];
         }
     free(d);
-    for (int s = 0; s < 2; s++) {
-        int k = s ? 3 : 1, cell = (FCELL + 2 * FPAD) * k, aw = FCOLS * cell, ah = ((FGLYPHS + FCOLS - 1) / FCOLS) * cell;
+    {
+        int k = hi ? 3 : 1, cell = (FCELL + 2 * FPAD) * k, aw = FCOLS * cell, ah = ((FGLYPHS + FCOLS - 1) / FCOLS) * cell;
         uint8_t *px = calloc((size_t)aw * ah * 4, 1);
         for (int g = 0; g < FGLYPHS; g++) {
             int sx0 = (int)(g % cols) * FCELL, sy0 = (int)(g / cols) * FCELL;
@@ -155,6 +159,20 @@ static int font_init(SDL_Renderer *r) {
                     p[3] = (uint8_t)(v * 255 + 0.5f);
                 }
         }
+        free(sheet);
+        *out_w = aw;
+        *out_h = ah;
+        return px;
+    }
+}
+
+const uint8_t *font_widths(void) { return g_fwidth; }
+
+static int font_init(SDL_Renderer *r) {
+    for (int s = 0; s < 2; s++) {
+        int aw, ah;
+        uint8_t *px = font_atlas_rgba(s, &aw, &ah);
+        if (!px) return 0;
         g_ftex[s] = SDL_CreateTexture(r, SDL_PIXELFORMAT_RGBA32, SDL_TEXTUREACCESS_STATIC, aw, ah);
         if (g_ftex[s]) {
             SDL_UpdateTexture(g_ftex[s], NULL, px, aw * 4);
@@ -163,7 +181,6 @@ static int font_init(SDL_Renderer *r) {
         }
         free(px);
     }
-    free(sheet);
     return g_ftex[0] && g_ftex[1];
 }
 

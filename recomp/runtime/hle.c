@@ -317,13 +317,111 @@ void rt_hook_8001D5B4(Ctx *c) {
     }
 }
 
-/* Stage start, fn_8005F470(state, stage, a, b): log each stage the game starts; from here on
- * --auto-press plays (fires and moves) instead of tapping START. */
+/* fn_80095750(size, size2): sets up the motion pack loader's buffers at stage start (story stages pass
+ * 0x7D000, VS 0xCD000). With another story pilot the story buffer gets VS's size, so that character's
+ * motion pack (mot_pack_0X_4) fits next to the stage's own. */
+int g_story_body_swap; /* Mission 3: draw Fox's body as this character's (0 = off) */
+static int g_story_char_on; /* the current stage loads another character (set at stage start) */
+void rt_hook_80095750(Ctx *c) {
+    if (g_story_char_on && c->r[3] < 0xCD000u) {
+        printf("[stage] motion buffers %X, %X -> CD000, 96000\n", c->r[3], c->r[4]);
+        c->r[3] = 0xCD000u;
+        if (c->r[4] < 0x96000u) c->r[4] = 0x96000u; /* model slots (fn_80092FB8), as VS sizes it */
+    }
+}
+
+/* Story pilots: the player picks a character before each story mission (video_pick_pilot, an overlay in
+ * the game window) and plays that mission's parts on foot as them. Character IDs: 0 Fox, 1 Falco,
+ * 2 Slippy, 3 Krystal, kept in the game info at +0x143 (0x802A2CA3, copy at +0x2EB), which VS mode's
+ * character screen fills and player objects copy to +0x1FB.
+ * - Another character's VS packs are loaded after the stage's own (fn_8001A128 below), with a larger
+ *   motion buffer (fn_80095750 above).
+ * - Player models: story stages take the player's model IDs from 0x8022BE28 (two per character), VS from
+ *   0x8022BE10; the chosen character's story entry gets its VS IDs (the loaded pack has those).
+ * - Riding on an Arwing's wing (stage table +4 = 2: stages 13, 21-23): the rider is always Fox.
+ * - Mission 3 (stages 9, 10): its player is a Fox-only stage object (class fn_800AC9B8) that misbehaves
+ *   when the game info names another character, so the game keeps Fox there and that object's models
+ *   are looked up as the character's instead (rt_hook_80169524).
+ * SFA_STORY_CHAR=<0-3> (testing) skips the picker and plays every mission as that character;
+ * SFA_NO_PILOT_PICKER=1 skips it too (Fox). */
+static int g_story_char = -1;                 /* this stage's character when not Fox, else -1 */
+static int g_pick_mission = -1, g_pick_char;  /* the mission picked for and its character */
+static int g_pick_choice = -1;                /* the picker's entry (4 = Random), remembered */
+
+static int pick_choice_load(void) {
+    FILE *f = fopen("user/story_pilot.cfg", "r");
+    int v = 0;
+    if (f) { if (fscanf(f, "choice=%d", &v) != 1) v = 0; fclose(f); }
+    return v >= 0 && v <= 4 ? v : 0;
+}
+static void pick_choice_save(int v) {
+    FILE *f = fopen("user/story_pilot.cfg", "w");
+    if (f) { fprintf(f, "choice=%d\n", v); fclose(f); }
+}
+
+/* whether a story mission has a part played on foot (any stage of it whose +4 field is 0) */
+static int mission_on_foot(int mission) {
+    for (uint32_t s = 0; s < 0x20; s++)
+        if (rd8(0x80223560u + s * 0x14) == (uint32_t)mission && rd16(0x80223564u + s * 0x14) == 0) return 1;
+    return 0;
+}
+
+/* Stage start, fn_8005F470(state, stage, a, b): logs each stage the game starts (from here on
+ * --auto-press plays, firing and moving, instead of tapping START) and sets up the story pilot. */
 void rt_hook_8005F470(Ctx *c) {
     video_set_auto_play(1);
     uint32_t stage = c->r[4];
-    printf("[stage] start stage %d (mission %d, part %02X)\n", (int)stage,
-           stage < 0x3B ? rd8(0x80223560u + stage * 0x14) + 1 : -1, stage < 0x3B ? rd8(0x80223561u + stage * 0x14) : 0);
+    uint32_t mission = stage < 0x3B ? rd8(0x80223560u + stage * 0x14) : 0xFF;
+    uint32_t part = stage < 0x3B ? rd8(0x80223561u + stage * 0x14) : 0;
+    printf("[stage] start stage %d (mission %d, part %02X)\n", (int)stage, (int)mission + 1, part);
+
+    static uint32_t table[6];
+    static int saved;
+    if (!saved) { for (int i = 0; i < 6; i++) table[i] = rd32(0x8022BE28u + 4u * (uint32_t)i); saved = 1; }
+    else for (int i = 0; i < 6; i++) wr32(0x8022BE28u + 4u * (uint32_t)i, table[i]); /* an earlier stage's swap */
+    g_story_char = -1;
+    g_story_char_on = 0;
+    g_story_body_swap = 0;
+    int story = stage < 0x20 && mission <= 9 && rd8(0x802A2C9Du) == 0;
+    if (!story) { fflush(stdout); return; }
+
+    int ch = 0;
+    const char *sc = getenv("SFA_STORY_CHAR");
+    if (sc) ch = atoi(sc);
+    else if (!getenv("SFA_NO_PILOT_PICKER")) {
+        if (part == 1 || mission != (uint32_t)g_pick_mission) { /* a mission's first part (also on a retry) */
+            g_pick_char = 0;
+            if (mission_on_foot((int)mission)) {
+                if (g_pick_choice < 0) g_pick_choice = pick_choice_load();
+                g_pick_char = video_pick_pilot((int)mission + 1, &g_pick_choice);
+                pick_choice_save(g_pick_choice);
+                printf("[stage] pilot for mission %d: %d (entry %d)\n", (int)mission + 1, g_pick_char, g_pick_choice);
+            }
+            g_pick_mission = (int)mission;
+        }
+        ch = g_pick_char;
+    }
+    int wing = rd16(0x80223564u + stage * 0x14) == 2, m3 = mission == 2;
+    if (ch < 1 || ch > 3 || wing) {
+        if (ch >= 1 && ch <= 3) printf("[stage] riding an Arwing's wing: player 1 is Fox\n");
+        wr8(0x802A2CA3u, 0);
+        wr8(0x802A2E4Bu, 0);
+        fflush(stdout);
+        return;
+    }
+    g_story_char = ch;
+    g_story_char_on = 1;
+    if (m3) {
+        g_story_body_swap = ch;
+        wr8(0x802A2CA3u, 0);
+        wr8(0x802A2E4Bu, 0);
+        printf("[stage] Mission 3: Fox's body drawn as character %d's\n", ch);
+    } else {
+        printf("[stage] player 1 is character %d\n", ch);
+        wr8(0x802A2CA3u, (uint8_t)ch);
+        wr8(0x802A2E4Bu, (uint8_t)ch);
+        wr32(0x8022BE28u + (uint32_t)ch * 4u, rd32(0x8022BE10u + (uint32_t)ch * 4u));
+    }
     fflush(stdout);
 }
 
@@ -354,6 +452,13 @@ void rt_hook_8000ECC8(Ctx *c) {
     }
     uint32_t st = rd32(c->r[3] + 0x34);
     g_game_state = st;
+    extern int g_story_bundle_restore;
+    if (g_story_bundle_restore && st >= 16) { /* another story pilot's packs are loaded by now */
+        wr8(0x80386148u, (uint8_t)(g_story_bundle_restore - 1));
+        g_story_bundle_restore = 0;
+        extern void story_pack_done(void);
+        story_pack_done();
+    }
     if (st != last) {
         if (log) {
             printf("[state] %d -> %u (stage %u, ctl %08X)\n", (int)last, st, rd8(0x802A2B60u + 0x13C), c->r[3]);
@@ -604,3 +709,194 @@ void rt_hook_8013B2EC(Ctx *c) {
         fflush(stdout);
     }
 }
+
+/* Story stages and other pilots (see rt_hook_8005F470). fn_8005ECA4(stage) runs a story stage's
+ * asset script, which queues the stage's packs into the pack buffer (base 0x80385BDC, size 0x80385BE0,
+ * used 0x80385BF0; fn_80017958 refuses a pack that doesn't fit, error 0x80385BE8 = 0x7E); fn_8001A128,
+ * called right after it, loads the queue. The other character's assets (as VS mode loads them, from the
+ * per-character table at 0x80229120: model packs at +0x40, textures at +0x58, animations at +0x64) are
+ * loaded after the stage's own, at that fn_8001A128 call, since story stages only bring Fox's. */
+static int g_story_char_pending;
+int g_story_bundle_restore; /* 0x80386148's value + 1, to put back once the stage is played */
+static uint8_t g_story_bundle;      /* the stage's value of 0x80386148 */
+static int g_story_model_pack = -1; /* the character's model pack, being loaded from the disc */
+static void log_pack_buffer(const char *when) {
+    printf("[stage] pack buffer %s: base %08X size %X used %X, %d queued, error %d\n", when, rd32(0x80385BDCu),
+           rd32(0x80385BE0u), rd32(0x80385BF0u), (int)rd32(0x80385BECu), (int)rd32(0x80385BE8u));
+}
+static void story_char_queue(Ctx *c);
+static int g_story_char_wanted; /* the stage started loading: add the character's packs once it's done */
+void rt_hook_8005ECA4(Ctx *c) {
+    if (!g_story_char_on) return;
+    log_pack_buffer("before the stage's assets");
+    printf("[stage] other loaders' queues: animations %d, fn_80068420 %d\n", (int)rd32(0x80385C18u),
+           (int)rd32(0x80385DBCu));
+    /* loaded once the stage's own are all in (see fn_8001A128 below): a stage's bundle is a memory image
+     * that expects its packs at the start of the pack buffer, so nothing may go in before them */
+    g_story_char_wanted = 1;
+}
+
+/* Load the character's packs now, as VS mode does: from the disc, with the queue to themselves, waiting
+ * until they're in (pumping the loads frame by frame, so the disc interrupts and load callbacks run). */
+static void story_char_load_now(Ctx *c) {
+    g_story_char_pending = 1;
+    uint8_t bundle = rd8(0x80386148u);
+    wr8(0x80386148u, 0);
+    story_char_queue(c); /* queues with the flag as it is now (0): from the disc */
+    Ctx saved = *c;
+    int frames = 0;
+    for (; frames < 600; frames++) {
+        c->lr = 0x8005ECA4u;
+        F_fn_8001A24C(c); /* the load pump: the stage setup calls it every frame while it loads */
+        *c = saved;
+        c->lr = 0x8005ECA4u;
+        F_fn_8001A128(c);
+        if (c->r[3] == 0 && rd32(0x80385BECu) == 0) break;
+        *c = saved;
+        c->lr = 0x8005ECA4u;
+        F_VIWaitForRetrace(c);
+        *c = saved;
+    }
+    *c = saved;
+    /* the disc requests they used stay "done" (state 3) in the request table (96 slots of 0x44 at
+     * 0x8029C640, state at +0x38); story stages never use it, and bundle-mode load callbacks that see
+     * state 3 in their slot take the data for a disc read, so those slots are emptied again */
+    int cleared = 0;
+    for (uint32_t i = 0; i < 96; i++) {
+        uint32_t slot = 0x8029C640u + i * 0x44u;
+        if ((int16_t)rd16(slot + 0x38) == 3) { wr16(slot + 0x38, 0); cleared++; }
+    }
+    printf("[stage] %d finished disc requests cleared\n", cleared);
+    wr8(0x80386148u, bundle);
+    g_story_model_pack = -1; /* nothing extra to count from here on */
+    extern int g_story_bundle_restore;
+    g_story_bundle_restore = 0;  /* the flag is already back */
+    printf("[stage] character's assets loaded after %d frames\n", frames);
+    log_pack_buffer("with the character's");
+    fflush(stdout);
+}
+static void story_char_queue(Ctx *c) {
+    if (!g_story_char_pending) return;
+    g_story_char_pending = 0;
+    int ch = g_story_char;
+    if (ch < 0 || ch > 3) return;
+    log_pack_buffer("after the stage's assets");
+    int16_t model = (int16_t)rd16(0x80229120u + 0x40 + ch * 2), tex = (int16_t)rd16(0x80229120u + 0x58 + ch * 2);
+    int16_t anim = (int16_t)rd16(0x80229120u + 0x64 + ch * 2);
+    Ctx saved = *c;
+    /* 0x80386148 set (story stages): packs come from the stage's bundle (.fpc), which only has Fox's;
+     * cleared while these are queued, they're read from the disc as in VS mode */
+    uint8_t bundle = rd8(0x80386148u);
+    wr8(0x80386148u, 0);
+    c->r[3] = (uint32_t)(int32_t)model;
+    F_fn_80017958(c);
+    int r_model = (int)c->r[3];
+    *c = saved;
+    int r_tex = 0;
+    { /* the character's motions (mot_pack_0X_4) */
+        c->r[3] = (uint32_t)(int32_t)tex;
+        c->r[4] = 3;
+        F_fn_800954EC(c);
+        r_tex = (int)c->r[3];
+        printf("[stage] texture loader: error %d, queued %d, loaded %d, space used %X of %X\n",
+               (int)rd32(0x80385F44u), (int)rd32(0x80385F74u), (int)rd32(0x80385F4Cu), rd32(0x80385F78u),
+               rd32(0x80385F58u));
+        *c = saved;
+    }
+    c->r[3] = (uint32_t)(int32_t)anim;
+    F_fn_80019344(c);
+    int r_anim = (int)c->r[3];
+    *c = saved;
+    /* the flag goes back now; the load-finished callbacks (below) set it for each pack they handle */
+    wr8(0x80386148u, bundle);
+    g_story_bundle = bundle;
+    g_story_model_pack = model;
+    extern int g_story_bundle_restore;
+    g_story_bundle_restore = bundle + 1;
+    printf("[stage] queued character %d's assets: model pack %d (%d), textures %d (%d), animations %d (%d)\n", ch,
+           model, r_model, tex, r_tex, anim, r_anim);
+    log_pack_buffer("with the character's");
+    fflush(stdout);
+}
+
+void story_pack_done(void) { g_story_model_pack = -1; }
+
+/* fn_8001A128() -> bytes still to load; the stage setup waits until it's 0. In bundle mode (0x80386148,
+ * story stages) it asks only the bundle system (fn_800C5468), otherwise it adds up the disc requests (96
+ * slots of 0x44 at 0x8029C640: state at +0x38, 2 reading, 1 queued; size +0x14, done +0x18). Replaced
+ * here to count both while another pilot's packs are coming from the disc in a story stage, so the
+ * stage waits for them too; otherwise it does exactly what it did. Those packs are loaded once the
+ * stage's own are all in. */
+HLE(fn_8001A128) {
+    story_char_queue(c);
+    int bundle = (int8_t)rd8(0x80386148u) != 0;
+    uint32_t sum = 0;
+    if (!bundle || g_story_model_pack >= 0)
+        for (uint32_t i = 0; i < 96; i++) {
+            uint32_t s = 0x8029C640u + i * 0x44u;
+            int16_t st = (int16_t)rd16(s + 0x38);
+            if (st == 2) sum += rd32(s + 0x14) - rd32(s + 0x18);
+            else if (st == 1) sum += rd32(s + 0x14);
+        }
+    if (bundle) {
+        uint32_t lr = c->lr;
+        c->lr = 0x8001A144u;
+        F_fn_800C5468(c);
+        c->lr = lr;
+        sum += c->r[3];
+    }
+    if (g_story_char_wanted && bundle && sum == 0 && rd32(0x80385BECu) == 0) {
+        g_story_char_wanted = 0; /* the stage's own packs are all in: now the character's */
+        log_pack_buffer("after the stage's");
+        Ctx saved = *c;
+        story_char_load_now(c);
+        *c = saved;
+        sum = 0;
+    }
+    c->r[3] = sum;
+}
+
+/* fn_80169524(model ID): the model registry search (101 hash buckets at 0x802FA458, each a search tree of
+ * nodes {key, lower, higher, model}; 0x802FA5EC is the end marker). Mission 3's player (see
+ * rt_hook_8005F470) draws Fox's story models; with another pilot they're looked up as that character's VS
+ * ones: each character has four story models (tables 0x8022BE58 and 0x8022BE28, two IDs per character)
+ * and four VS ones (0x8022BE40 and 0x8022BE10), and Fox's story model k becomes the character's VS model
+ * k when that one is loaded. */
+static int model_registered(uint32_t id) {
+    uint32_t n = rd32(0x802FA458u + (id % 101u) * 4u);
+    for (int steps = 0; n && n != 0x802FA5ECu && steps < 4096; steps++) {
+        if (rd32(n) == id) return 1;
+        n = id > rd32(n) ? rd32(n + 4) : rd32(n + 8);
+    }
+    return 0;
+}
+void rt_hook_80169524(Ctx *c) {
+    if (g_story_body_swap <= 0 || g_game_state < 12) return;
+    static const uint32_t story_t[2] = {0x8022BE58u, 0x8022BE28u}, vs_t[2] = {0x8022BE40u, 0x8022BE10u};
+    uint32_t id = c->r[3] & 0xFFFF;
+    for (int t = 0; t < 2; t++)
+        for (uint32_t k = 0; k < 2; k++)
+            if (id == rd16(story_t[t] + k * 2u)) {
+                uint32_t to = rd16(vs_t[t] + (uint32_t)g_story_body_swap * 4u + k * 2u);
+                if (model_registered(to)) c->r[3] = to;
+                return;
+            }
+}
+
+/* fn_80077F1C(player): the player draw. In story stages it draws player 1's second model (Fox's head
+ * layer: his story body has a head of its own) through the head object at +0x104, only while that
+ * object's fade (+0x1AC) is above 0.1 (it drops while aiming), with that fade in its alpha. Another story
+ * pilot's second model is the whole head, so it's always drawn at full fade. */
+void rt_hook_80077F1C(Ctx *c) {
+    uint32_t p = c->r[3], head = rd32(p + 0x104);
+    if (g_story_char > 0 && g_story_body_swap == 0 && rd8(p + 0x1FA) == 0 && head) wr32(head + 0x1AC, 0x3F800000u);
+}
+
+/* fn_8016106C(model ID, mode): sets the low bits of each of the model's materials (the cull mode, it seems).
+ * Around player 1's head draw in story stages (calls at 0x800782BC and 0x80078304) it's 3 for the draw and
+ * 1 after, for Fox's head layer; another story pilot's VS head shows its inside that way (the face from
+ * behind), so it keeps mode 1. */
+void rt_hook_8016106C(Ctx *c) {
+    if (g_story_char > 0 && g_story_body_swap == 0 && c->lr == 0x800782C0u) c->r[4] = 1;
+}
+

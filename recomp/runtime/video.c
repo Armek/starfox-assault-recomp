@@ -402,6 +402,7 @@ void video_audio_push(const int16_t *pcm, int frames) {
  * sound card drift apart slightly, so instead of dropping or repeating samples (audible clicks) the
  * read rate is nudged by up to 0.5% toward the target fill, with linear interpolation. After running
  * dry it fades out and waits until the target is buffered again before resuming. */
+static int g_audio_muted; /* SFA_MUTE=1 (testing): the audio device plays silence */
 static void audio_callback(void *user, Uint8 *stream, int len) {
     (void)user;
     int16_t *out = (int16_t *)stream;
@@ -442,6 +443,7 @@ static void audio_callback(void *user, Uint8 *stream, int len) {
         }
     }
     SDL_AtomicUnlock(&g_ring_lock);
+    if (g_audio_muted) memset(stream, 0, (size_t)len); /* SFA_MUTE: everything as usual, but silent */
 }
 
 /* ---- frame queue --------------------------------------------------------------------------------- */
@@ -450,6 +452,7 @@ static SDL_cond *g_qcond;
 static GxFrame *g_pending_frame;
 static volatile int g_quit;
 static int g_dump;
+static int g_last_rect[4] = {0, 0, 640, 480}; /* the last frame's XFB copy rectangle, to show it again */
 
 int video_quit_requested(void) { return g_quit; }
 
@@ -1095,6 +1098,7 @@ static void render(GxFrame *f) {
     SDL_GL_GetDrawableSize(g_window, &ww, &wh);
     int sx = f->copy_rect[0], sy = f->copy_rect[1], sw = f->copy_rect[2], sh = f->copy_rect[3];
     if (!sw || !sh) { sx = 0; sy = 0; sw = 640; sh = 480; }
+    g_last_rect[0] = sx; g_last_rect[1] = sy; g_last_rect[2] = sw; g_last_rect[3] = sh;
     int gy0 = EFB_HEIGHT - (sy + sh), gy1 = EFB_HEIGHT - sy;
     glBindFramebuffer(GL_READ_FRAMEBUFFER, g_efb_fbo);
     glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
@@ -1166,6 +1170,243 @@ static void render(GxFrame *f) {
 
 /* Open the controllers already connected (they don't send an "added" event here: the start screen took
  * those), in SDL's order. */
+/* ---- story pilot picker ----------------------------------------------------------------------------
+ * Before a story mission the game thread asks which character to play (video_pick_pilot) and waits; the
+ * render thread meanwhile keeps showing the last frame, dimmed, with the choices drawn over it in the
+ * launcher's font (launcher.c). Left/right (D-pad, stick or arrow keys) moves, A or START (Space, Enter)
+ * confirms. */
+uint8_t *font_atlas_rgba(int hi, int *w, int *h);
+const uint8_t *font_widths(void);
+#define UI_FCELL 24
+#define UI_FPAD 2
+#define UI_FCOLS 16
+#define GL_SRC_ALPHA 0x0302
+#define GL_ONE_MINUS_SRC_ALPHA 0x0303
+
+static const char *const k_pilots[5] = {"Fox", "Falco", "Slippy", "Krystal", "Random"};
+static volatile int g_pick_active, g_pick_sel, g_pick_mission;
+static char g_pick_note[64]; /* under the choices once confirmed (which pilot Random gave) */
+
+static GLuint g_ui_prog, g_ui_vao, g_ui_vbo, g_ui_font;
+static GLint g_ui_u_screen;
+static int g_ui_font_w, g_ui_font_h, g_ui_ready; /* 0 not set up, 1 ready, -1 no font */
+typedef struct { float x, y, u, v, r, g, b, a; } UiVert;
+static UiVert *g_ui_rects, *g_ui_text;
+static int g_ui_nrects, g_ui_ntext, g_ui_cap_rects, g_ui_cap_text;
+
+static const char *k_ui_vs =
+    "#version 330 core\n"
+    "layout(location = 0) in vec2 p; layout(location = 1) in vec2 uv; layout(location = 2) in vec4 c;\n"
+    "uniform vec2 u_screen; out vec2 v_uv; out vec4 v_c;\n"
+    "void main() { v_uv = uv; v_c = c; gl_Position = vec4(p.x / u_screen.x * 2.0 - 1.0, 1.0 - p.y / u_screen.y * 2.0, 0.0, 1.0); }\n";
+static const char *k_ui_fs =
+    "#version 330 core\n"
+    "in vec2 v_uv; in vec4 v_c; uniform sampler2D u_tex; out vec4 o;\n"
+    "void main() { o = v_c * texture(u_tex, v_uv); }\n";
+
+static void ui_setup(void) {
+    if (g_ui_ready) return;
+    int w, h;
+    uint8_t *px = font_atlas_rgba(1, &w, &h);
+    if (!px) { g_ui_ready = -1; return; }
+    g_ui_font_w = w;
+    g_ui_font_h = h;
+    glGenTextures(1, &g_ui_font);
+    glBindTexture(GL_TEXTURE_2D, g_ui_font);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, px);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    free(px);
+    g_ui_prog = glCreateProgram();
+    glAttachShader(g_ui_prog, compile(GL_VERTEX_SHADER, k_ui_vs));
+    glAttachShader(g_ui_prog, compile(GL_FRAGMENT_SHADER, k_ui_fs));
+    glLinkProgram(g_ui_prog);
+    glUseProgram(g_ui_prog);
+    glUniform1i(glGetUniformLocation(g_ui_prog, "u_tex"), 0);
+    g_ui_u_screen = glGetUniformLocation(g_ui_prog, "u_screen");
+    glGenVertexArrays(1, &g_ui_vao);
+    glBindVertexArray(g_ui_vao);
+    glGenBuffers(1, &g_ui_vbo);
+    glBindBuffer(GL_ARRAY_BUFFER, g_ui_vbo);
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(0, 2, GL_FLOAT, 0, sizeof(UiVert), (void *)offsetof(UiVert, x));
+    glEnableVertexAttribArray(1);
+    glVertexAttribPointer(1, 2, GL_FLOAT, 0, sizeof(UiVert), (void *)offsetof(UiVert, u));
+    glEnableVertexAttribArray(2);
+    glVertexAttribPointer(2, 4, GL_FLOAT, 0, sizeof(UiVert), (void *)offsetof(UiVert, r));
+    glBindVertexArray(g_vao); /* the game's draws use their own */
+    glBindBuffer(GL_ARRAY_BUFFER, g_vbo);
+    g_ui_ready = 1;
+}
+
+static void ui_quad(int text, float x, float y, float w, float h, float u0, float v0, float u1, float v1,
+                    const float c[4]) {
+    UiVert **list = text ? &g_ui_text : &g_ui_rects;
+    int *n = text ? &g_ui_ntext : &g_ui_nrects, *cap = text ? &g_ui_cap_text : &g_ui_cap_rects;
+    if (*n + 6 > *cap) {
+        *cap = *cap ? *cap * 2 : 600;
+        *list = realloc(*list, sizeof **list * (size_t)*cap);
+    }
+    UiVert q[4] = {{x, y, u0, v0, c[0], c[1], c[2], c[3]}, {x + w, y, u1, v0, c[0], c[1], c[2], c[3]},
+                   {x, y + h, u0, v1, c[0], c[1], c[2], c[3]}, {x + w, y + h, u1, v1, c[0], c[1], c[2], c[3]}};
+    UiVert *o = *list + *n;
+    o[0] = q[0]; o[1] = q[1]; o[2] = q[2]; o[3] = q[1]; o[4] = q[3]; o[5] = q[2];
+    *n += 6;
+}
+
+static void ui_rect(float x, float y, float w, float h, const float c[4]) { ui_quad(0, x, y, w, h, 0, 0, 1, 1, c); }
+
+static float ui_text_w(const char *s, float size) {
+    const uint8_t *fw = font_widths();
+    float w = 0, k = size / UI_FCELL;
+    for (; *s; s++) {
+        int ch = (unsigned char)*s;
+        w += fw[(ch < 32 ? '?' : ch) - 32] * k;
+    }
+    return w;
+}
+
+/* text with its top-left at (x, y), size pixels tall; bold draws twice, a little apart */
+static void ui_text(const char *s, float x, float y, float size, const float c[4], int bold) {
+    const uint8_t *fw = font_widths();
+    float k = size / UI_FCELL, cell = (UI_FCELL + 2 * UI_FPAD) * 3.0f;
+    for (; *s; s++) {
+        int ch = (unsigned char)*s, g = (ch < 32 ? '?' : ch) - 32;
+        float u0 = (g % UI_FCOLS) * cell / g_ui_font_w, v0 = (g / UI_FCOLS) * cell / g_ui_font_h;
+        float u1 = u0 + cell / g_ui_font_w, v1 = v0 + cell / g_ui_font_h, sz = (UI_FCELL + 2 * UI_FPAD) * k;
+        if (ch != ' ') {
+            ui_quad(1, x - UI_FPAD * k, y - UI_FPAD * k, sz, sz, u0, v0, u1, v1, c);
+            if (bold) ui_quad(1, x - UI_FPAD * k + size * 0.035f, y - UI_FPAD * k, sz, sz, u0, v0, u1, v1, c);
+        }
+        x += fw[g] * k;
+    }
+}
+
+static void ui_text_centered(const char *s, float cx, float y, float size, const float c[4], int bold) {
+    ui_text(s, cx - ui_text_w(s, size) / 2, y, size, c, bold);
+}
+
+/* the picker over the frame already in the default framebuffer (ww x wh pixels) */
+static void draw_picker(int ww, int wh) {
+    ui_setup();
+    if (g_ui_ready != 1) return;
+    g_ui_nrects = g_ui_ntext = 0;
+    float s = wh / 720.0f, cx = ww / 2.0f;
+    if (ww / 1280.0f < s) s = ww / 1280.0f;
+    static const float dim[4] = {0, 0, 0, 0.6f}, panel[4] = {0.055f, 0.08f, 0.15f, 0.94f},
+                       card[4] = {0.11f, 0.15f, 0.26f, 1}, accent[4] = {0.25f, 0.47f, 1.0f, 1},
+                       edge[4] = {0.45f, 0.65f, 1.0f, 1}, white[4] = {0.94f, 0.96f, 1, 1},
+                       muted[4] = {0.62f, 0.68f, 0.82f, 1}, faint[4] = {0.45f, 0.5f, 0.62f, 1};
+    ui_rect(0, 0, (float)ww, (float)wh, dim);
+    float pw = 1000 * s, ph = 330 * s, px = cx - pw / 2, py = wh / 2.0f - ph / 2;
+    ui_rect(px, py, pw, ph, panel);
+    ui_rect(px, py, pw, 4 * s, accent);
+    char title[48];
+    snprintf(title, sizeof title, "MISSION %d", g_pick_mission);
+    ui_text_centered(title, cx, py + 26 * s, 18 * s, muted, 0);
+    ui_text_centered("Choose your pilot", cx, py + 52 * s, 40 * s, white, 1);
+    float bw = 168 * s, bh = 96 * s, gap = 18 * s, bx = cx - (5 * bw + 4 * gap) / 2, by = py + 124 * s;
+    for (int i = 0; i < 5; i++) {
+        float x = bx + i * (bw + gap);
+        int on = i == g_pick_sel;
+        if (on) ui_rect(x - 3 * s, by - 3 * s, bw + 6 * s, bh + 6 * s, edge);
+        ui_rect(x, by, bw, bh, on ? accent : card);
+        ui_text_centered(k_pilots[i], x + bw / 2, by + bh / 2 - 15 * s, 30 * s, on ? white : muted, on);
+    }
+    if (g_pick_note[0]) ui_text_centered(g_pick_note, cx, by + bh + 34 * s, 24 * s, white, 1);
+    else ui_text_centered("Left / Right  choose        A / START  confirm", cx, by + bh + 38 * s, 18 * s, faint, 0);
+    ui_text_centered("For the parts on foot. Arwing flights and most cutscenes stay as Fox.", cx, py + ph - 34 * s, 15 * s, faint, 0);
+
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    glViewport(0, 0, ww, wh);
+    glDisable(GL_DEPTH_TEST);
+    glDisable(GL_CULL_FACE);
+    glDisable(GL_SCISSOR_TEST);
+    glColorMask(1, 1, 1, 1);
+    glEnable(GL_BLEND);
+    glBlendEquation(GL_FUNC_ADD);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glUseProgram(g_ui_prog);
+    glUniform2f(g_ui_u_screen, (float)ww, (float)wh);
+    glBindVertexArray(g_ui_vao);
+    glBindBuffer(GL_ARRAY_BUFFER, g_ui_vbo);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, g_white);
+    glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(sizeof(UiVert) * (size_t)g_ui_nrects), g_ui_rects, GL_STREAM_DRAW);
+    glDrawArrays(GL_TRIANGLES, 0, g_ui_nrects);
+    glBindTexture(GL_TEXTURE_2D, g_ui_font);
+    glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(sizeof(UiVert) * (size_t)g_ui_ntext), g_ui_text, GL_STREAM_DRAW);
+    glDrawArrays(GL_TRIANGLES, 0, g_ui_ntext);
+    glDisable(GL_BLEND);
+    glBindVertexArray(g_vao); /* back to the game's */
+    glBindBuffer(GL_ARRAY_BUFFER, g_vbo);
+}
+
+/* While the game waits on the picker no frames come: show the last one again with the picker over it. */
+static void present_picker(void) {
+    int ww, wh;
+    SDL_GL_GetDrawableSize(g_window, &ww, &wh);
+    int sx = g_last_rect[0], sy = g_last_rect[1], sw = g_last_rect[2], sh = g_last_rect[3];
+    int gy0 = EFB_HEIGHT - (sy + sh), gy1 = EFB_HEIGHT - sy;
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, g_efb_fbo);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
+    glColorMask(1, 1, 1, 1);
+    glViewport(0, 0, ww, wh);
+    glClearColor(0, 0, 0, 1);
+    glClear(GL_COLOR_BUFFER_BIT);
+    double scale = (double)ww / sw < (double)wh / sh ? (double)ww / sw : (double)wh / sh;
+    int dw = (int)(sw * scale), dh = (int)(sh * scale), dx = (ww - dw) / 2, dy = (wh - dh) / 2;
+    glBlitFramebuffer(sx, gy0, sx + sw, gy1, dx, dy, dx + dw, dy + dh, GL_COLOR_BUFFER_BIT, GL_LINEAR);
+    draw_picker(ww, wh);
+    if (g_dump) { /* --dump-frames: the picker too, now and then */
+        static Uint32 last;
+        if (SDL_GetTicks() - last > 500) {
+            last = SDL_GetTicks();
+            uint8_t *pix = malloc((size_t)ww * wh * 4);
+            glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+            glReadPixels(0, 0, ww, wh, GL_RGBA, GL_UNSIGNED_BYTE, pix); /* bottom-up rows, as write_bmp takes */
+            write_bmp("build/GF7E01/frames/picker.bmp", pix, ww, wh);
+            free(pix);
+        }
+    }
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    SDL_GL_SwapWindow(g_window);
+}
+
+/* Called by the game thread before a story mission (hle.c): shows the picker until the player confirms
+ * and returns the character (0 Fox, 1 Falco, 2 Slippy, 3 Krystal). *choice is the highlighted entry on
+ * entry (4 = Random) and the confirmed one on return. */
+int video_pick_pilot(int mission, int *choice) {
+    g_pick_mission = mission;
+    g_pick_sel = *choice >= 0 && *choice < 5 ? *choice : 0;
+    g_pick_note[0] = 0;
+    g_pick_active = 1;
+    Uint32 start = SDL_GetTicks();
+    int last_dir = 0, released = 0;
+    while (!g_quit) {
+        PadState p;
+        get_pad(0, &p);
+        int dir = (p.buttons & 0x1) || p.stick_x < -60 ? -1 : (p.buttons & 0x2) || p.stick_x > 60 ? 1 : 0;
+        if (dir && dir != last_dir) g_pick_sel = (g_pick_sel + dir + 5) % 5;
+        last_dir = dir;
+        int confirm = (p.buttons & 0x1100) != 0; /* A or START */
+        if (!confirm) released = 1; /* a press still held from the menus doesn't count */
+        else if (released && SDL_GetTicks() - start > 400) break;
+        SDL_Delay(16);
+    }
+    int sel = g_pick_sel, ch = sel;
+    if (sel == 4) {
+        ch = (int)(SDL_GetPerformanceCounter() % 4);
+        snprintf(g_pick_note, sizeof g_pick_note, "Random pick: %s", k_pilots[ch]);
+        SDL_Delay(1200);
+    }
+    g_pick_active = 0;
+    *choice = sel;
+    return ch;
+}
+
 static void open_controllers(void) {
     for (int i = 0; i < SDL_NumJoysticks(); i++)
         if (SDL_IsGameController(i)) add_controller(i);
@@ -1221,6 +1462,7 @@ static int render_thread(void *arg) {
         g_pending_frame = NULL;
         SDL_CondBroadcast(g_done_cond); /* a waiting copy segment may queue now */
         SDL_UnlockMutex(g_qlock);
+        if (!f && g_pick_active) present_picker();
         if (f) {
             uint64_t t0 = g_prof_render ? rt_timebase() : 0;
             render(f);
@@ -1238,6 +1480,8 @@ void video_start(int dump_frames) {
     SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
     SDL_SetHint("SDL_JOYSTICK_HIDAPI_STEAMDECK", "1"); /* the Deck's own controls, also when not started from Steam */
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS | SDL_INIT_GAMECONTROLLER) != 0) rt_fatal("SDL_Init: %s", SDL_GetError());
+    g_audio_muted = getenv("SFA_MUTE") != NULL;
+    if (g_audio_muted) printf("[audio] muted (SFA_MUTE)\n");
     if (SDL_InitSubSystem(SDL_INIT_AUDIO) == 0) {
         SDL_AudioSpec want = {0}, have;
         want.freq = 32000;
