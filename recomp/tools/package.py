@@ -36,6 +36,12 @@ Setup
      Frame rate   Original (on-foot missions and cutscenes run at 30 fps, as on the GameCube) or
                   60 fps everywhere (experimental; where your PC can't hold 60, the
                   game goes back to its own rate for a while, so it never runs in slow motion)
+     Aspect ratio 4:3, or 16:9 to see more to the sides (the HUD and menus are stretched)
+     Resolution   how many times the GameCube's resolution the game is drawn at (1x-4x), or
+                  Auto to match your screen
+     Anti-aliasing  smooths jagged edges (Off, 2x, 4x, 8x; higher costs more GPU time)
+     Textures     Off, or 2x / 4x: every texture is upscaled with xBR as it loads, for smoother
+                  edges in the artwork (no new detail; a texture pack's files are used as they are)
      Play        start the game (START on a controller)
    Your choices are remembered in user/launcher.cfg. To skip the start screen, run with --play
    or name the disc image on the command line.
@@ -50,6 +56,16 @@ Droid Sans by the Dolphin project, under the Apache License 2.0 (see font-licens
 your own console's boot ROM at user/GF7E01/ipl.bin, or font files in user/fonts/, are used instead
 when present.
 
+HD texture packs
+----------------
+Put a texture pack's PNG files in user/GF7E01/textures/ (any subfolders). Packs made for Dolphin
+(its Load/Textures/GF7E01 folder) work as they are: files are matched by their tex1_... names.
+To make your own, start the game with SFA_DUMP_TEXTURES=1 set (on the Deck in Steam's launch
+options: SFA_DUMP_TEXTURES=1 %command%), or add the line dump_textures=1 to user/launcher.cfg.
+Every texture the game shows is then saved to user/GF7E01/dump/textures/. Edit or upscale a file,
+keep its name, and put it in user/GF7E01/textures/. Save PNGs without interlacing. Replacements
+can be any size; the same shape as the original (2x, 4x...) looks right.
+
 Controls
 --------
 Any SDL game controller (the Steam Deck's own controls included), or the keyboard. Up to four
@@ -58,6 +74,8 @@ start screen lists them; a controller's player light shows its number). Computer
 mode's character screen, press Z (R1 / RB on most pads) to put a bot in the next empty slot, then
 choose its character with left/right and press A (or press Z again for a random one); the bot then
 gets ready by itself. Bots stay for rematches; backing out of the character screen removes them.
+A pad SDL doesn't recognise gets the usual generic layout; if its buttons come out wrong, put a
+gamecontrollerdb.txt (the community list of controller layouts) in the user folder.
 The keyboard is player 1:
     stick: WASD or arrow keys     C-stick: numpad 8/4/6/2
     A: Space or J    B: K or Backspace    X: L    Y: I    Z: Z

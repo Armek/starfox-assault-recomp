@@ -122,6 +122,11 @@ void video_start(int dump_frames);
 /* Story pilot picker (video.c): waits for the player's choice; returns the character (0-3), *choice = the
  * highlighted entry in (4 = Random) and the confirmed one out. */
 int video_pick_pilot(int mission, int *choice);
+extern int g_widescreen;
+extern int g_tex_upscale; /* automatic texture upscaling: 0/1 off, 2 or 4 (xBR, texscale.c) */ /* 16:9: wider 3D views, shown 4/3 as wide (gx.c, video.c) */
+void video_set_msaa(int samples); /* anti-aliasing: 0 off, 2, 4 or 8 samples; before video_start */
+void video_set_res_scale(int s); /* internal resolution: 1-6 times, 0 from the window; before video_start */
+void video_toast(const char *msg); /* a notice at the top of the window for a few seconds */
 void video_submit(GxFrame *frame);  /* takes ownership */
 GxFrame *video_new_frame(uint32_t number); /* empty frame, reusing a finished one's arrays */
 int video_quit_requested(void);

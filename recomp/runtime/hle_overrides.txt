@@ -103,3 +103,15 @@ entry fn_80077F1C
 # fn_8016106C(model ID, mode): sets a model's material mode bits; with another story pilot, hle.c keeps
 # player 1's head at mode 1 while it's drawn.
 entry fn_8016106C
+# GXInitTexObj(obj, image, ...): SFA_TRACE_TEX=<hex image address> (debugging) prints who sets up that texture.
+entry GXInitTexObj
+# fn_8015F068: sine of a binary angle. The camera setup fn_800182F0 calls it (return 0x80018408) right
+# after storing the view's field of view and shape; in widescreen hle.c widens them there, so the game's
+# projection and its object culling both cover the whole 16:9 picture.
+entry fn_8015F068
+# fn_801803D0: builds the graphics library's 3D projection (angle, shape, near, far), which the game draws
+# with. In widescreen hle.c widens the gameplay and cutscene cameras' projections there, so the level and its
+# objects are drawn (and kept) across the whole 16:9 picture.
+entry fn_801803D0
+# fn_80180598: the same with a lens shift, for some cutscene shots; widened the same way.
+entry fn_80180598

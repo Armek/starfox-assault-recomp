@@ -16,6 +16,7 @@
 #include "funcs.h"
 #include "runtime.h"
 #include "gx.h"
+#include "texpack.h"
 
 /* ---- state ------------------------------------------------------------------------------------- */
 static uint32_t cp[256];
@@ -201,6 +202,112 @@ static uint32_t gpu_copy_for(uint32_t addr) {
     return 0;
 }
 
+/* ---- automatic texture upscaling, off the GX thread -------------------------------------------- */
+/* A texture is uploaded at its own size at once; worker threads upscale a copy (texscale.c, xBR) and
+ * the bigger version is uploaded with a later frame, so loading many textures never stalls a frame.
+ * g_tex_gen[id] counts uploads of each texture id: a result for an older upload is dropped. */
+typedef struct UpJob {
+    struct UpJob *next;
+    uint32_t id, gen, w, h;
+    int factor;
+    uint8_t *rgba;
+} UpJob;
+static SDL_mutex *g_up_lock;
+static SDL_cond *g_up_cond;
+static UpJob *g_up_todo, **g_up_todo_tail = &g_up_todo, *g_up_done;
+static uint32_t *g_tex_gen, g_tex_gen_cap; /* GX thread only */
+
+static int upscale_worker(void *arg) {
+    (void)arg;
+    for (;;) {
+        SDL_LockMutex(g_up_lock);
+        while (!g_up_todo) SDL_CondWait(g_up_cond, g_up_lock);
+        UpJob *j = g_up_todo;
+        g_up_todo = j->next;
+        if (!g_up_todo) g_up_todo_tail = &g_up_todo;
+        SDL_UnlockMutex(g_up_lock);
+        uint32_t ow, oh;
+        uint8_t *big = texscale(j->rgba, j->w, j->h, j->factor, &ow, &oh);
+        free(j->rgba);
+        j->rgba = big;
+        j->w = ow; j->h = oh;
+        SDL_LockMutex(g_up_lock);
+        j->next = g_up_done;
+        g_up_done = j;
+        SDL_UnlockMutex(g_up_lock);
+    }
+    return 0;
+}
+
+/* A texture was (re)uploaded: with upscaling on, queue a bigger version of `rgba` (NULL: nothing to
+ * upscale, as for a texture pack's file). */
+static void upscale_queue(uint32_t id, const uint8_t *rgba, uint32_t w, uint32_t h) {
+    if (id >= g_tex_gen_cap) {
+        uint32_t n = g_tex_gen_cap ? g_tex_gen_cap : 1024;
+        while (n <= id) n *= 2;
+        g_tex_gen = realloc(g_tex_gen, sizeof *g_tex_gen * n);
+        memset(g_tex_gen + g_tex_gen_cap, 0, sizeof *g_tex_gen * (n - g_tex_gen_cap));
+        g_tex_gen_cap = n;
+    }
+    uint32_t gen = ++g_tex_gen[id];
+    /* not tiny textures (often ramps and lookup tables); smaller factors for big ones, so none passes
+     * 2048x2048 worth of pixels */
+    int f = g_tex_upscale;
+    while (f > 1 && (uint64_t)w * h * f * f > 2048u * 2048u) f /= 2;
+    if (!rgba || f < 2 || w < 8 || h < 8) return;
+    if (!g_up_lock) {
+        g_up_lock = SDL_CreateMutex();
+        g_up_cond = SDL_CreateCond();
+        int n = SDL_GetCPUCount() > 4 ? 3 : 2;
+        for (int i = 0; i < n; i++) SDL_CreateThread(upscale_worker, "tex-upscale", NULL);
+    }
+    UpJob *j = malloc(sizeof *j);
+    j->rgba = malloc((size_t)w * h * 4);
+    if (!j->rgba) { free(j); return; }
+    memcpy(j->rgba, rgba, (size_t)w * h * 4);
+    j->id = id; j->gen = gen; j->w = w; j->h = h; j->factor = f; j->next = NULL;
+    SDL_LockMutex(g_up_lock);
+    *g_up_todo_tail = j;
+    g_up_todo_tail = &j->next;
+    SDL_CondSignal(g_up_cond);
+    SDL_UnlockMutex(g_up_lock);
+}
+
+/* Finished upscales go out with frame f (still current ones only), about 4 MB of them per frame so the
+ * renderer's uploads stay short; the rest wait for the next frames. */
+static void upscale_collect(GxFrame *f) {
+    if (!g_up_lock) return;
+    SDL_LockMutex(g_up_lock);
+    UpJob *j = g_up_done;
+    g_up_done = NULL;
+    SDL_UnlockMutex(g_up_lock);
+    size_t budget = 4u << 20;
+    while (j) {
+        UpJob *next = j->next;
+        int current = j->rgba && j->id < g_tex_gen_cap && g_tex_gen[j->id] == j->gen;
+        size_t bytes = (size_t)j->w * j->h * 4;
+        if (current && bytes > budget && budget != (4u << 20)) { /* later: back on the done list */
+            SDL_LockMutex(g_up_lock);
+            UpJob *last = j;
+            while (last->next) last = last->next;
+            last->next = g_up_done;
+            g_up_done = j;
+            SDL_UnlockMutex(g_up_lock);
+            break;
+        }
+        if (current) {
+            budget = bytes > budget ? 0 : budget - bytes;
+            GROW(f->uploads, f->nuploads, f->cap_uploads, 64);
+            GxTextureUpload *u = &f->uploads[f->nuploads++];
+            u->id = j->id; u->width = j->w; u->height = j->h; u->rgba = j->rgba;
+        } else {
+            free(j->rgba);
+        }
+        free(j);
+        j = next;
+    }
+}
+
 /* Texture map n -> GxTexture id (decoding and queueing an upload if new or changed). */
 static uint32_t texture_for_map(int n) {
     uint32_t base_image0 = n < 4 ? 0x88 + n : 0xA8 + (n - 4);
@@ -227,6 +334,7 @@ static uint32_t texture_for_map(int n) {
                 }
                 printf("\n");
             }
+            fflush(stdout);
         }
     }
     if (g_dbg) {
@@ -277,7 +385,29 @@ static uint32_t texture_for_map(int n) {
     GxTextureUpload *u = &f->uploads[f->nuploads++];
     u->id = e->id; u->width = w; u->height = h;
     uint64_t td = ticks();
-    u->rgba = decode_texture(addr, fmt, w, h, pal, tlut_fmt);
+    u->rgba = NULL;
+    texpack_init();
+    if (texpack_active() && (addr & 0x01FFFFFF) + size <= PPC_MEM_SIZE) {
+        /* HD texture packs: look the texture up by its Dolphin name (texpack.c) */
+        uint32_t mode0 = bp[n < 4 ? 0x80 + n : 0xA0 + (n - 4)], mode1 = bp[n < 4 ? 0x84 + n : 0xA4 + (n - 4)];
+        int mip = ((mode0 >> 5) & 3) && ((mode1 >> 8) & 0xFF);
+        int ci = fmt == 8 || fmt == 9 || fmt == 10;
+        size_t pal_bytes = sizeof tmem_tlut - (size_t)(pal - tmem_tlut);
+        char name[128];
+        texpack_name(name, sizeof name, w, h, mip, fmt, ppc_ram(addr), size, ci ? pal : NULL, pal_bytes);
+        uint32_t rw, rh;
+        uint8_t *rep = texpack_find(name, &rw, &rh);
+        if (texpack_dumping()) {
+            uint8_t *orig = decode_texture(addr, fmt, w, h, pal, tlut_fmt);
+            texpack_dump(name, orig, w, h);
+            if (rep) free(orig);
+            else u->rgba = orig;
+        }
+        if (rep) { u->rgba = rep; u->width = rw; u->height = rh; }
+    }
+    int from_pack = u->rgba != NULL;
+    if (!u->rgba) u->rgba = decode_texture(addr, fmt, w, h, pal, tlut_fmt);
+    upscale_queue(e->id, from_pack ? NULL : u->rgba, w, h);
     g_t_decode += ticks() - td;
     g_t_ndecode++;
     g_t_decode_px += (uint64_t)w * h;
@@ -289,8 +419,8 @@ static uint32_t texture_for_map(int n) {
         char path[256];
         snprintf(path, sizeof path, "build/GF7E01/textures/tex_%04u_%08X_f%u_%ux%u.bmp", e->id, addr, fmt, w, h);
         FILE *fp = fopen(path, "wb");
-        if (fp) { /* 32-bit BMP, top-down */
-            uint32_t sz = w * h * 4, v;
+        if (fp) { /* 32-bit BMP, top-down (of what is uploaded: a texture pack's may be bigger) */
+            uint32_t w = u->width, h = u->height, sz = w * h * 4, v;
             uint8_t hdr[54] = {'B', 'M'};
             v = 54 + sz; memcpy(hdr + 2, &v, 4);
             v = 54; memcpy(hdr + 10, &v, 4);
@@ -347,7 +477,9 @@ static void current_state(GxState *s) {
         uint32_t mode0 = bp[map < 4 ? 0x80 + map : 0xA0 + (map - 4)];
         s->wrap_s[map] = mode0 & 3;
         s->wrap_t[map] = (mode0 >> 2) & 3;
-        s->linear[map] = (mode0 >> 4) & 1;
+        /* bit 0 magnify linear, bit 1 minify linear, bit 2 mipmapped (a mip filter and a max LOD > 0) */
+        uint32_t minf = (mode0 >> 5) & 7, mode1 = bp[map < 4 ? 0x84 + map : 0xA4 + (map - 4)];
+        s->linear[map] = (uint8_t)(((mode0 >> 4) & 1) | (minf >= 4) << 1 | ((minf & 3) && ((mode1 >> 8) & 0xFF)) << 2);
     }
     uint32_t bm = bp[0x41];
     s->blend_enable = bm & 1;
@@ -576,6 +708,9 @@ typedef struct {
     float mat[4], amb[4];
 } XfChannel;
 
+int g_widescreen;
+int g_tex_upscale; /* automatic texture upscaling: 1 (off), 2 or 4 times */
+
 typedef struct {
     float p[6];          /* projection */
     int ortho;
@@ -593,6 +728,14 @@ static void xf_setup(XfSetup *s, const RawVertex *first) {
     s->ortho = xf[0x1026] & 1;
     s->sx = xff(0x101A); s->sy = xff(0x101B); s->sz = xff(0x101C);
     s->ox = xff(0x101D) - 342; s->oy = xff(0x101E) - 342; s->oz = xff(0x101F);
+    /* widescreen: a perspective view over the whole screen sees 4/3 as far sideways (the picture is
+     * shown 4/3 as wide). Views into part of the screen (render-to-texture, split screen) keep theirs. */
+    if (g_widescreen && !s->ortho && s->sx * 2 >= EFB_WIDTH - 8) {
+        /* ...unless its projection is already 4/3 wider than the viewport (the gameplay and cutscene cameras,
+         * widened at their source: rt_hook_801803D0 in hle.c) */
+        float vp = fabsf(s->sx / (s->sy != 0 ? s->sy : 1)), pr = fabsf(s->p[2] / (s->p[0] != 0 ? s->p[0] : 1));
+        if (pr < vp * 1.16f) { s->p[0] *= 0.75f; s->p[1] *= 0.75f; }
+    }
     /* channel controls: 0 MatSrc, 1 LightFunc, 2-5 lights 0-3, 6 AmbSrc, 7-8 DiffuseAtten,
      * 9 AttnEnable, 10 AttnSelect (1 = spot), 11-14 lights 4-7 */
     s->any_light = 0;
@@ -1416,6 +1559,7 @@ static void efb_copy(uint32_t v) {
                        v0->c0[0], v0->c0[1], v0->c0[2], v0->c0[3], v0->x / v0->w, v0->y / v0->w, v0->w, v0->uv[0][0], v0->uv[0][1]);
             }
         }
+        upscale_collect(f);
         g_frame = NULL;
         g_frame_number++;
         g_state_valid = 0; /* re-check textures each frame */

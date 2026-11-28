@@ -484,7 +484,20 @@ static int check_disc(const char *path, char *msg, size_t n) {
 static char g_disc[1024];
 static int g_fullscreen;
 static int g_fps60; /* frame rate: 0 the game's own, 1 60 fps */
+static int g_wide;  /* aspect ratio: 0 4:3, 1 16:9 (widescreen) */
+static int g_aa;    /* anti-aliasing: 0 off, or MSAA 2, 4, 8 samples */
+static const int k_aa_value[4] = {0, 2, 4, 8};
+static int aa_index(int v) { for (int i = 0; i < 4; i++) if (k_aa_value[i] == v) return i; return 0; }
+static int g_up;    /* automatic texture upscaling: 0 off, 2 or 4 times */
+static const int k_up_value[3] = {0, 2, 4};
+static int up_index(int v) { for (int i = 0; i < 3; i++) if (k_up_value[i] == v) return i; return 0; }
+static int g_res;   /* internal resolution: 1-4 times the console's, 0 Auto (from the screen) */
+/* the resolution switch's five positions, left to right */
+static const int k_res_value[5] = {1, 2, 3, 4, 0};
+static int res_index(int v) { for (int i = 0; i < 5; i++) if (k_res_value[i] == v) return i; return 4; }
 static int g_check_updates = 1; /* look for a newer release on GitHub when the start screen opens */
+static char g_net_addr[256];    /* Online: the last address joined */
+static int g_net_players = 2;   /* Online: players when hosting */
 
 static void load_settings(void) {
     FILE *f = fopen("user/launcher.cfg", "r");
@@ -495,7 +508,13 @@ static void load_settings(void) {
         if (!strncmp(line, "disc=", 5)) snprintf(g_disc, sizeof g_disc, "%s", line + 5);
         else if (!strncmp(line, "fullscreen=", 11)) g_fullscreen = atoi(line + 11) != 0;
         else if (!strncmp(line, "fps60=", 6)) g_fps60 = atoi(line + 6) != 0;
+        else if (!strncmp(line, "widescreen=", 11)) g_wide = atoi(line + 11) != 0;
+        else if (!strncmp(line, "tex_upscale=", 12)) g_up = k_up_value[up_index(atoi(line + 12))];
+        else if (!strncmp(line, "msaa=", 5)) g_aa = k_aa_value[aa_index(atoi(line + 5))];
+        else if (!strncmp(line, "res=", 4)) { g_res = atoi(line + 4); if (g_res < 0 || g_res > 4) g_res = 0; }
         else if (!strncmp(line, "check_updates=", 14)) g_check_updates = atoi(line + 14) != 0;
+        else if (!strncmp(line, "net_addr=", 9)) snprintf(g_net_addr, sizeof g_net_addr, "%s", line + 9);
+        else if (!strncmp(line, "net_players=", 12)) { g_net_players = atoi(line + 12); if (g_net_players < 2 || g_net_players > 4) g_net_players = 2; }
     }
     fclose(f);
 }
@@ -504,8 +523,8 @@ static void save_settings(void) {
     MKDIR("user");
     FILE *f = fopen("user/launcher.cfg", "w");
     if (!f) return;
-    fprintf(f, "disc=%s\nfullscreen=%d\nfps60=%d\ncheck_updates=%d\n", g_disc, g_fullscreen, g_fps60,
-            g_check_updates);
+    fprintf(f, "disc=%s\nfullscreen=%d\nfps60=%d\nwidescreen=%d\nres=%d\nmsaa=%d\ntex_upscale=%d\ncheck_updates=%d\nnet_addr=%s\nnet_players=%d\n",
+            g_disc, g_fullscreen, g_fps60, g_wide, g_res, g_aa, g_up, g_check_updates, g_net_addr, g_net_players);
     fclose(f);
 }
 
@@ -513,6 +532,30 @@ static void save_settings(void) {
 int launcher_fps60(void) {
     load_settings();
     return g_fps60;
+}
+
+/* The saved texture upscaling: 0 off, 2 or 4 times. */
+int launcher_tex_upscale(void) {
+    load_settings();
+    return g_up;
+}
+
+/* The saved anti-aliasing: MSAA samples, 0 off. */
+int launcher_msaa(void) {
+    load_settings();
+    return g_aa;
+}
+
+/* The saved aspect ratio: 1 widescreen (16:9). */
+int launcher_widescreen(void) {
+    load_settings();
+    return g_wide;
+}
+
+/* The saved internal resolution: 1-4 times, 0 Auto. */
+int launcher_res_scale(void) {
+    load_settings();
+    return g_res;
 }
 
 /* ---- built-in file browser ------------------------------------------------------------------------ */
@@ -805,8 +848,10 @@ static int in_game_mode(void) {
 /* ---- the screen -------------------------------------------------------------------------------- */
 #define VW 960
 #define VH 600
-enum { SCREEN_MAIN, SCREEN_BROWSE };
-enum { ITEM_DISC, ITEM_DISPLAY, ITEM_FPS, ITEM_PLAY, ITEM_QUIT, ITEM_COUNT };
+enum { SCREEN_MAIN, SCREEN_BROWSE, SCREEN_NET };
+/* The Online button (LAN netplay) is hidden for now; the page and netplay.c stay. */
+#define SHOW_ONLINE 0
+enum { ITEM_DISC, ITEM_DISPLAY, ITEM_FPS, ITEM_WIDE, ITEM_RES, ITEM_AA, ITEM_UP, ITEM_PLAY, ITEM_ONLINE, ITEM_QUIT, ITEM_COUNT };
 #define BROWSE_ROWS 9
 #define ROW_H 40.0f
 
@@ -861,23 +906,40 @@ static void draw_update_banner(SDL_Renderer *r, Uint32 now) {
 }
 
 /* Main-screen layout (logical 960x600). */
-typedef struct { SDL_FRect disc_card, browse, display_card, seg, fps_card, fps_seg, play, quit; } Layout;
+typedef struct { SDL_FRect disc_card, browse, display_card, seg, fps_card, fps_seg, wide_card, wide_seg, res_card, res_seg, aa_card, aa_seg, up_card, up_seg, play, online, quit; } Layout;
 static Layout main_layout(void) {
     Layout L;
-    L.disc_card = (SDL_FRect){64, 214, 560, 104};
-    L.browse = (SDL_FRect){64 + 560 - 22 - 124, 214 + 32, 124, 40};
-    L.display_card = (SDL_FRect){64, 330, 560, 60};
-    L.seg = (SDL_FRect){64 + 560 - 12 - 250, 330 + 10, 250, 40};
-    L.fps_card = (SDL_FRect){64, 400, 560, 60};
-    L.fps_seg = (SDL_FRect){64 + 560 - 12 - 250, 400 + 10, 250, 40};
-    L.play = (SDL_FRect){64, 476, 424, 60};
-    L.quit = (SDL_FRect){64 + 436, 476, 124, 60};
+    L.disc_card = (SDL_FRect){64, 190, 560, 76};
+    L.browse = (SDL_FRect){64 + 560 - 22 - 124, 190 + 18, 124, 40};
+    SDL_FRect *cards[6] = {&L.display_card, &L.fps_card, &L.wide_card, &L.res_card, &L.aa_card, &L.up_card};
+    SDL_FRect *segs[6] = {&L.seg, &L.fps_seg, &L.wide_seg, &L.res_seg, &L.aa_seg, &L.up_seg};
+    for (int i = 0; i < 6; i++) { /* the settings rows */
+        float y = 272 + i * 39.0f;
+        *cards[i] = (SDL_FRect){64, y, 560, 35};
+        *segs[i] = (SDL_FRect){64 + 560 - 5 - 250, y + 3, 250, 29};
+    }
+    L.play = (SDL_FRect){64, 512, SHOW_ONLINE ? 300 : 424, 46};
+    L.online = (SDL_FRect){64 + 312, 512, 112, 46};
+    L.quit = (SDL_FRect){64 + 436, 512, 124, 46};
     return L;
 }
 static SDL_FRect item_rect(const Layout *L, int item) {
     return item == ITEM_DISC ? L->browse : item == ITEM_DISPLAY ? L->seg : item == ITEM_FPS ? L->fps_seg
-         : item == ITEM_PLAY ? L->play : L->quit;
+         : item == ITEM_WIDE ? L->wide_seg : item == ITEM_RES ? L->res_seg : item == ITEM_AA ? L->aa_seg : item == ITEM_UP ? L->up_seg : item == ITEM_PLAY ? L->play : item == ITEM_ONLINE ? L->online : L->quit;
 }
+
+/* the Online page (logical 960x600) */
+static SDL_FRect net_host_card(void) { return (SDL_FRect){64, 170, 560, 116}; }
+static SDL_FRect net_players_seg(void) { return (SDL_FRect){176, 212, 210, 40}; }
+static SDL_FRect net_host_btn(void) { return (SDL_FRect){64 + 560 - 22 - 124, 170 + 22, 124, 44}; }
+static SDL_FRect net_join_card(void) { return (SDL_FRect){64, 298, 560, 104}; }
+static SDL_FRect net_addr_field(void) { return (SDL_FRect){88, 344, 330, 40}; }
+static SDL_FRect net_join_btn(void) { return (SDL_FRect){64 + 560 - 22 - 124, 298 + 46, 124, 40}; }
+int netplay_host_start(int players);
+int netplay_join_start(const char *addr);
+int netplay_status(char *msg, size_t n);
+void netplay_cancel(void);
+int netplay_local_addresses(char *out, size_t n);
 
 static SDL_FRect browse_list(void) { return (SDL_FRect){64, 164, VW - 128, BROWSE_ROWS * ROW_H + 16}; }
 static SDL_FRect browse_back(void) { return (SDL_FRect){64, 44, 92, 34}; }
@@ -886,7 +948,7 @@ static float approach(float v, float target, float dt, float speed) { return v +
 
 static void hints(SDL_Renderer *r, const char *const *items, int n) {
     /* items: pairs of (badge, label); a badge starting with '#' is a key cap, else a round button */
-    float x = 64, cy = 566;
+    float x = 64, cy = 574;
     for (int i = 0; i + 1 < n; i += 2) {
         const char *b = items[i];
         int round = b[0] != '#';
@@ -967,6 +1029,7 @@ int launcher_run(const char *found_disc, int *fullscreen_io, char *disc_out, siz
     SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
     SDL_SetHint("SDL_JOYSTICK_HIDAPI_STEAMDECK", "1"); /* the Deck's own controls, also when not started from Steam */
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS | SDL_INIT_GAMECONTROLLER) != 0) return -1;
+    input_load_mappings();
     load_settings();
     if (*fullscreen_io) g_fullscreen = 1;
     char msg[256] = "", tmp[1200];
@@ -997,6 +1060,9 @@ int launcher_run(const char *found_disc, int *fullscreen_io, char *disc_out, siz
     int screen = SCREEN_MAIN, sel = disc_ok ? ITEM_PLAY : ITEM_DISC, bsel = 0, scroll = 0, result = 0;
     int stick_held = 0, msg_ok = disc_ok, dialog_open = 0, pad_input = 0, focus_visible = 0, hover = -1, bhover = -1;
     float hov[ITEM_COUNT] = {0}, seg_pos = g_fullscreen ? 1.0f : 0.0f, fps_pos = g_fps60 ? 1.0f : 0.0f, fade = 0;
+    float res_pos = (float)res_index(g_res), wide_pos = g_wide ? 1.0f : 0.0f, aa_pos = (float)aa_index(g_aa), up_pos = (float)up_index(g_up);
+    int net_sel = 0, net_busy = 0, net_hover = -1; /* Online page: row 0 host, 1 join */
+    char my_addr[200] = "";
     Uint32 last = SDL_GetTicks();
     Layout L = main_layout();
 
@@ -1020,7 +1086,8 @@ int launcher_run(const char *found_disc, int *fullscreen_io, char *disc_out, siz
         } while (0)
 
     for (int running = 1; running;) {
-        int move = 0, side = 0, act = 0, back = 0, play = 0, clicked = -1, wheel = 0, seg_click = -1, fps_click = -1, update = 0;
+        int move = 0, side = 0, act = 0, back = 0, play = 0, clicked = -1, wheel = 0, seg_click = -1, fps_click = -1, res_click = -1, wide_click = -1, aa_click = -1, up_click = -1, update = 0;
+        int bksp = 0, net_click = -1, players_click = -1;
         SDL_Event e;
         while (SDL_PollEvent(&e)) {
             if (e.type == SDL_QUIT) { running = 0; result = 0; }
@@ -1041,14 +1108,26 @@ int launcher_run(const char *found_disc, int *fullscreen_io, char *disc_out, siz
                         SDL_SetWindowFullscreen(win, g_fullscreen ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0);
                     } else act = 1;
                     break;
-                case SDLK_ESCAPE: case SDLK_BACKSPACE: back = 1; break;
-                case SDLK_u: update = 1; break;
+                case SDLK_ESCAPE: back = 1; break;
+                case SDLK_BACKSPACE: if (screen == SCREEN_NET) bksp = 1; else back = 1; break;
+                case SDLK_v: /* Ctrl+V pastes an address */
+                    if (screen == SCREEN_NET && (e.key.keysym.mod & KMOD_CTRL) && SDL_HasClipboardText()) {
+                        char *cb = SDL_GetClipboardText();
+                        for (const char *q = cb; q && *q && strlen(g_net_addr) < 60; q++)
+                            if ((*q >= '0' && *q <= '9') || (*q >= 'a' && *q <= 'z') || (*q >= 'A' && *q <= 'Z') || *q == '.' || *q == ':' || *q == '-')
+                                { size_t L_ = strlen(g_net_addr); g_net_addr[L_] = *q; g_net_addr[L_ + 1] = 0; }
+                        SDL_free(cb);
+                    }
+                    break;
+                case SDLK_u: if (screen != SCREEN_NET) update = 1; break;
                 case SDLK_F11:
                     g_fullscreen = !g_fullscreen;
                     SDL_SetWindowFullscreen(win, g_fullscreen ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0);
                     break;
                 default: break;
                 }
+            } else if (e.type == SDL_JOYDEVICEADDED) {
+                input_generic_mapping(e.jdevice.which);
             } else if (e.type == SDL_CONTROLLERDEVICEADDED) {
                 pads_add(e.cdevice.which);
             } else if (e.type == SDL_CONTROLLERDEVICEREMOVED) {
@@ -1101,7 +1180,12 @@ int launcher_run(const char *found_disc, int *fullscreen_io, char *disc_out, siz
                     if (inside(L.disc_card, mx, my)) hit = ITEM_DISC;
                     else if (inside(L.display_card, mx, my)) hit = ITEM_DISPLAY;
                     else if (inside(L.fps_card, mx, my)) hit = ITEM_FPS;
+                    else if (inside(L.wide_card, mx, my)) hit = ITEM_WIDE;
+                    else if (inside(L.res_card, mx, my)) hit = ITEM_RES;
+                    else if (inside(L.aa_card, mx, my)) hit = ITEM_AA;
+                    else if (inside(L.up_card, mx, my)) hit = ITEM_UP;
                     else if (inside(L.play, mx, my)) hit = ITEM_PLAY;
+                    else if (SHOW_ONLINE && inside(L.online, mx, my)) hit = ITEM_ONLINE;
                     else if (inside(L.quit, mx, my)) hit = ITEM_QUIT;
                     hover = hit;
                     if (hit >= 0) sel = hit;
@@ -1109,6 +1193,32 @@ int launcher_run(const char *found_disc, int *fullscreen_io, char *disc_out, siz
                         seg_click = inside(L.seg, mx, my) ? (mx >= L.seg.x + L.seg.w / 2) : !g_fullscreen;
                     if (hit == ITEM_FPS && e.type == SDL_MOUSEBUTTONDOWN)
                         fps_click = inside(L.fps_seg, mx, my) ? (mx >= L.fps_seg.x + L.fps_seg.w / 2) : !g_fps60;
+                    if (hit == ITEM_WIDE && e.type == SDL_MOUSEBUTTONDOWN)
+                        wide_click = inside(L.wide_seg, mx, my) ? (mx >= L.wide_seg.x + L.wide_seg.w / 2) : !g_wide;
+                    if (hit == ITEM_AA && e.type == SDL_MOUSEBUTTONDOWN)
+                        aa_click = inside(L.aa_seg, mx, my) ? (int)((mx - L.aa_seg.x) * 4 / L.aa_seg.w) : (aa_index(g_aa) + 1) % 4;
+                    if (hit == ITEM_UP && e.type == SDL_MOUSEBUTTONDOWN)
+                        up_click = inside(L.up_seg, mx, my) ? (int)((mx - L.up_seg.x) * 3 / L.up_seg.w) : (up_index(g_up) + 1) % 3;
+                    if (hit == ITEM_RES && e.type == SDL_MOUSEBUTTONDOWN)
+                        res_click = inside(L.res_seg, mx, my) ? (int)((mx - L.res_seg.x) * 5 / L.res_seg.w)
+                                                               : (res_index(g_res) + 1) % 5;
+                } else if (screen == SCREEN_NET) {
+                    net_hover = -1;
+                    if (inside(browse_back(), mx, my)) hit = -2;
+                    else if (inside(net_host_btn(), mx, my)) net_hover = 0;
+                    else if (inside(net_players_seg(), mx, my)) net_hover = 2;
+                    else if (inside(net_join_btn(), mx, my)) net_hover = 1;
+                    else if (inside(net_addr_field(), mx, my)) net_hover = 3;
+                    else if (inside(net_host_card(), mx, my)) net_hover = 4;
+                    else if (inside(net_join_card(), mx, my)) net_hover = 5;
+                    if (net_hover >= 0 && !net_busy) net_sel = (net_hover == 1 || net_hover == 3 || net_hover == 5);
+                    if (e.type == SDL_MOUSEBUTTONDOWN && e.button.button == SDL_BUTTON_LEFT) {
+                        net_click = net_hover;
+                        if (net_hover == 2) {
+                            SDL_FRect sg = net_players_seg();
+                            players_click = 2 + (int)((mx - sg.x) * 3 / sg.w);
+                        }
+                    }
                 } else {
                     SDL_FRect list = browse_list();
                     bhover = -1;
@@ -1126,6 +1236,16 @@ int launcher_run(const char *found_disc, int *fullscreen_io, char *disc_out, siz
                     else if (hit >= 0) clicked = hit;
                 }
                 if (e.type == SDL_MOUSEBUTTONDOWN && e.button.button == SDL_BUTTON_RIGHT) back = 1;
+            } else if (e.type == SDL_TEXTINPUT && screen == SCREEN_NET && !net_busy) {
+                /* the address being typed (letters too: a host name works) */
+                if (!(SDL_GetModState() & KMOD_CTRL))
+                    for (const char *q = e.text.text; *q && strlen(g_net_addr) < 60; q++)
+                        if ((*q >= '0' && *q <= '9') || (*q >= 'a' && *q <= 'z') || (*q >= 'A' && *q <= 'Z') || *q == '.' || *q == ':' || *q == '-') {
+                            size_t L_ = strlen(g_net_addr);
+                            g_net_addr[L_] = *q;
+                            g_net_addr[L_ + 1] = 0;
+                            net_sel = 1;
+                        }
             } else if (e.type == SDL_MOUSEWHEEL) {
                 wheel = -e.wheel.y * 3;
             }
@@ -1182,17 +1302,22 @@ int launcher_run(const char *found_disc, int *fullscreen_io, char *disc_out, siz
         }
 
         if (screen == SCREEN_MAIN && !dialog_open) {
-            if (clicked >= 0) { sel = clicked; act = (clicked != ITEM_DISPLAY || seg_click < 0) && (clicked != ITEM_FPS || fps_click < 0); }
+            if (clicked >= 0) { sel = clicked; act = (clicked != ITEM_DISPLAY || seg_click < 0) && (clicked != ITEM_FPS || fps_click < 0) && (clicked != ITEM_RES || res_click < 0) && (clicked != ITEM_WIDE || wide_click < 0) && (clicked != ITEM_AA || aa_click < 0) && (clicked != ITEM_UP || up_click < 0); }
+            if (up_click >= 0 && up_click < 3 && k_up_value[up_click] != g_up) { g_up = k_up_value[up_click]; save_settings(); }
+            if (aa_click >= 0 && aa_click < 4 && k_aa_value[aa_click] != g_aa) { g_aa = k_aa_value[aa_click]; save_settings(); }
+            if (wide_click >= 0 && wide_click != g_wide) { g_wide = wide_click; save_settings(); }
+            if (res_click >= 0 && res_click < 5 && k_res_value[res_click] != g_res) { g_res = k_res_value[res_click]; save_settings(); }
             if (fps_click >= 0 && fps_click != g_fps60) { g_fps60 = fps_click; save_settings(); }
             if (seg_click >= 0 && seg_click != g_fullscreen) {
                 g_fullscreen = seg_click;
                 SDL_SetWindowFullscreen(win, g_fullscreen ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0);
                 save_settings();
             }
-            if (move) { /* rows: disc, display, frame rate, then play | quit */
-                int row = sel == ITEM_DISC ? 0 : sel == ITEM_DISPLAY ? 1 : sel == ITEM_FPS ? 2 : 3;
-                row = (row + (move > 0 ? 1 : 3)) % 4;
-                sel = row == 0 ? ITEM_DISC : row == 1 ? ITEM_DISPLAY : row == 2 ? ITEM_FPS : ITEM_PLAY;
+            if (move) { /* rows: disc, display, frame rate, resolution, then play | quit */
+                static const int rows[8] = {ITEM_DISC, ITEM_DISPLAY, ITEM_FPS, ITEM_WIDE, ITEM_RES, ITEM_AA, ITEM_UP, ITEM_PLAY};
+                int row = 7;
+                for (int i = 0; i < 7; i++) if (rows[i] == sel) row = i;
+                sel = rows[(row + (move > 0 ? 1 : 7)) % 8];
             }
             if (side) {
                 if (sel == ITEM_DISPLAY && (side > 0) != g_fullscreen) {
@@ -1202,7 +1327,24 @@ int launcher_run(const char *found_disc, int *fullscreen_io, char *disc_out, siz
                 } else if (sel == ITEM_FPS && (side > 0) != g_fps60) {
                     g_fps60 = side > 0;
                     save_settings();
-                } else if (sel == ITEM_PLAY || sel == ITEM_QUIT) sel = side > 0 ? ITEM_QUIT : ITEM_PLAY;
+                } else if (sel == ITEM_WIDE && (side > 0) != g_wide) {
+                    g_wide = side > 0;
+                    save_settings();
+                } else if (sel == ITEM_UP) {
+                    int i = up_index(g_up) + (side > 0 ? 1 : -1);
+                    if (i >= 0 && i < 3) { g_up = k_up_value[i]; save_settings(); }
+                } else if (sel == ITEM_AA) {
+                    int i = aa_index(g_aa) + (side > 0 ? 1 : -1);
+                    if (i >= 0 && i < 4) { g_aa = k_aa_value[i]; save_settings(); }
+                } else if (sel == ITEM_RES) {
+                    int i = res_index(g_res) + (side > 0 ? 1 : -1);
+                    if (i >= 0 && i < 5) { g_res = k_res_value[i]; save_settings(); }
+                } else if (sel == ITEM_PLAY || sel == ITEM_ONLINE || sel == ITEM_QUIT) {
+                    sel += side > 0 ? 1 : -1;
+                    if (!SHOW_ONLINE && sel == ITEM_ONLINE) sel += side > 0 ? 1 : -1;
+                    if (sel < ITEM_PLAY) sel = ITEM_PLAY;
+                    if (sel > ITEM_QUIT) sel = ITEM_QUIT;
+                }
             }
             if (back) sel = ITEM_QUIT;
             if (update) updater_install_start(); /* only does something when an update is offered */
@@ -1225,8 +1367,56 @@ int launcher_run(const char *found_disc, int *fullscreen_io, char *disc_out, siz
                     g_fps60 = !g_fps60;
                     save_settings();
                     break;
+                case ITEM_WIDE:
+                    g_wide = !g_wide;
+                    save_settings();
+                    break;
+                case ITEM_UP:
+                    g_up = k_up_value[(up_index(g_up) + 1) % 3];
+                    save_settings();
+                    break;
+                case ITEM_AA:
+                    g_aa = k_aa_value[(aa_index(g_aa) + 1) % 4];
+                    save_settings();
+                    break;
+                case ITEM_RES:
+                    g_res = k_res_value[(res_index(g_res) + 1) % 5];
+                    save_settings();
+                    break;
+                case ITEM_ONLINE:
+                    if (!disc_ok) { snprintf(msg, sizeof msg, "Choose your disc image first"); msg_ok = 0; sel = ITEM_DISC; break; }
+                    screen = SCREEN_NET;
+                    net_sel = g_net_addr[0] ? 1 : 0;
+                    if (!my_addr[0] && !netplay_local_addresses(my_addr, sizeof my_addr)) snprintf(my_addr, sizeof my_addr, "(not on a network)");
+                    SDL_StartTextInput();
+                    break;
                 case ITEM_QUIT: result = 0; running = 0; break;
                 }
+            }
+        } else if (screen == SCREEN_NET) {
+            char nmsg[200];
+            int ns = netplay_status(nmsg, sizeof nmsg);
+            if (net_busy) {
+                if (ns == 2) { result = 1; running = 0; } /* connected: the game starts */
+                else if (ns != 1) net_busy = 0;            /* failed or cancelled: the message stays */
+                if (back || act || net_click >= 0) { netplay_cancel(); net_busy = 0; }
+            } else {
+                if (move) net_sel = !net_sel;
+                if (players_click >= 2) { g_net_players = players_click > 4 ? 4 : players_click; save_settings(); net_sel = 0; }
+                else if (side && net_sel == 0) {
+                    g_net_players += side;
+                    if (g_net_players < 2) g_net_players = 2;
+                    if (g_net_players > 4) g_net_players = 4;
+                    save_settings();
+                }
+                if (bksp && g_net_addr[0]) g_net_addr[strlen(g_net_addr) - 1] = 0;
+                if (net_click == 0) { net_sel = 0; act = 1; }
+                if (net_click == 1) { net_sel = 1; act = 1; }
+                if (act || play) {
+                    if (net_sel == 0) { netplay_host_start(g_net_players); net_busy = 1; }
+                    else if (g_net_addr[0]) { save_settings(); netplay_join_start(g_net_addr); net_busy = 1; }
+                }
+                if (back) { screen = SCREEN_MAIN; sel = ITEM_ONLINE; SDL_StopTextInput(); }
             }
         } else if (screen == SCREEN_BROWSE) {
             if (clicked >= 0) { bsel = clicked; act = 1; }
@@ -1300,6 +1490,10 @@ int launcher_run(const char *found_disc, int *fullscreen_io, char *disc_out, siz
             for (int i = 0; i < ITEM_COUNT; i++) hov[i] = approach(hov[i], hover == i ? 1.0f : 0.0f, dt, 14);
             seg_pos = approach(seg_pos, g_fullscreen ? 1.0f : 0.0f, dt, 16);
             fps_pos = approach(fps_pos, g_fps60 ? 1.0f : 0.0f, dt, 16);
+            wide_pos = approach(wide_pos, g_wide ? 1.0f : 0.0f, dt, 16);
+            aa_pos = approach(aa_pos, (float)aa_index(g_aa), dt, 16);
+            up_pos = approach(up_pos, (float)up_index(g_up), dt, 16);
+            res_pos = approach(res_pos, (float)res_index(g_res), dt, 16);
 
             /* focus ring (keyboard and controller): drawn just before the selected control, which
              * covers all but its edge; it breathes a little */
@@ -1308,37 +1502,69 @@ int launcher_run(const char *found_disc, int *fullscreen_io, char *disc_out, siz
 
             /* game disc card */
             rrect(r, L.disc_card, 16, mix(C_CARD, C_CARD_HI, hov[ITEM_DISC]));
-            icon_disc(r, L.disc_card.x + 50, L.disc_card.y + 52, 26, disc_ok ? C_ACCENT : C_FAINT, C_CARD);
+            icon_disc(r, L.disc_card.x + 50, L.disc_card.y + 38, 24, disc_ok ? C_ACCENT : C_FAINT, C_CARD);
             float tx = L.disc_card.x + 96, tw = L.browse.x - tx - 16;
-            text(r, "Game disc", tx, L.disc_card.y + 18, 14, C_MUTED);
+            text(r, "Game disc", tx, L.disc_card.y + 9, 14, C_MUTED);
             if (g_disc[0]) ellipsize(tmp, sizeof tmp, base_name(g_disc), 20, tw, 0);
             else snprintf(tmp, sizeof tmp, "No disc selected");
-            text(r, tmp, tx, L.disc_card.y + 38, 20, g_disc[0] ? C_TEXT : C_MUTED);
+            text(r, tmp, tx, L.disc_card.y + 26, 20, g_disc[0] ? C_TEXT : C_MUTED);
             SDL_Color sc = msg_ok ? C_GREEN : C_RED;
-            circle(r, tx + 4, L.disc_card.y + 79, 4, sc);
+            circle(r, tx + 4, L.disc_card.y + 62, 4, sc);
             ellipsize(tmp, sizeof tmp, msg, 14, tw - 14, 0);
-            text(r, tmp, tx + 14, L.disc_card.y + 70, 14, sc);
+            text(r, tmp, tx + 14, L.disc_card.y + 53, 14, sc);
             FOCUS(ITEM_DISC, 12);
             rrect(r, L.browse, 12, mix(C_TRACK, (SDL_Color){34, 48, 84, 255}, hov[ITEM_DISC]));
             text_vc(r, "Browse" ELLIPSIS, L.browse.x + (L.browse.w - text_w("Browse" ELLIPSIS, 16, 0)) / 2, L.browse.y,
                     L.browse.h, 16, C_TEXT, 0);
 
             /* display and frame-rate cards, each with a sliding switch */
-            for (int row = 0; row < 2; row++) {
-                int item = row ? ITEM_FPS : ITEM_DISPLAY;
-                SDL_FRect card = row ? L.fps_card : L.display_card, seg = row ? L.fps_seg : L.seg;
-                float pos = row ? fps_pos : seg_pos;
-                rrect(r, card, 16, mix(C_CARD, C_CARD_HI, hov[item]));
-                text_vc(r, row ? "Frame rate" : "Display", card.x + 24, card.y, card.h, 18, C_TEXT, 0);
-                if (row) text_vc(r, "Experimental", card.x + 132, card.y, card.h, 13, C_FAINT, 0);
+            for (int row = 0; row < 3; row++) {
+                int item = row == 2 ? ITEM_WIDE : row ? ITEM_FPS : ITEM_DISPLAY;
+                SDL_FRect card = row == 2 ? L.wide_card : row ? L.fps_card : L.display_card;
+                SDL_FRect seg = row == 2 ? L.wide_seg : row ? L.fps_seg : L.seg;
+                float pos = row == 2 ? wide_pos : row ? fps_pos : seg_pos;
+                rrect(r, card, 12, mix(C_CARD, C_CARD_HI, hov[item]));
+                text_vc(r, row == 2 ? "Aspect ratio" : row ? "Frame rate" : "Display", card.x + 24, card.y, card.h, 17, C_TEXT, 0);
+                if (row == 1) text_vc(r, "Experimental", card.x + 132, card.y, card.h, 13, C_FAINT, 0);
+                if (row == 2) text_vc(r, "16:9 widens the view", card.x + 140, card.y, card.h, 13, C_FAINT, 0);
                 FOCUS(item, 12);
-                rrect(r, seg, 12, C_TRACK);
+                rrect(r, seg, 10, C_TRACK);
                 SDL_FRect knob = {seg.x + 4 + pos * (seg.w / 2 - 4), seg.y + 4, seg.w / 2 - 4, seg.h - 8};
-                rrect(r, knob, 9, C_ACCENT);
-                const char *opt[2] = {row ? "Original" : "Window", row ? "60 fps" : "Fullscreen"};
+                rrect(r, knob, 7, C_ACCENT);
+                const char *opt[2] = {row == 2 ? "4:3" : row ? "Original" : "Window", row == 2 ? "16:9" : row ? "60 fps" : "Fullscreen"};
                 for (int k = 0; k < 2; k++) {
                     float cx = seg.x + seg.w / 4 + k * seg.w / 2, w = text_w(opt[k], 15, 0);
                     float on = k ? pos : 1 - pos;
+                    text_vc(r, opt[k], cx - w / 2, seg.y, seg.h, 15, mix(C_MUTED, C_TEXT, on), on > 0.5f);
+                }
+            }
+
+            /* internal resolution and anti-aliasing: multi-position switches */
+            for (int row = 0; row < 3; row++) {
+                static const char *const res_opt[5] = {"1x", "2x", "3x", "4x", "Auto"};
+                static const char *const aa_opt[4] = {"Off", "2x", "4x", "8x"};
+                static const char *const up_opt[3] = {"Off", "2x", "4x"};
+                int item = row == 2 ? ITEM_UP : row ? ITEM_AA : ITEM_RES, n = row == 2 ? 3 : row ? 4 : 5;
+                const char *const *opt = row == 2 ? up_opt : row ? aa_opt : res_opt;
+                SDL_FRect card = row == 2 ? L.up_card : row ? L.aa_card : L.res_card;
+                SDL_FRect seg = row == 2 ? L.up_seg : row ? L.aa_seg : L.res_seg;
+                float pos = row == 2 ? up_pos : row ? aa_pos : res_pos;
+                rrect(r, card, 12, mix(C_CARD, C_CARD_HI, hov[item]));
+                text_vc(r, row == 2 ? "Textures" : row ? "Anti-aliasing" : "Resolution", card.x + 24, card.y, card.h, 17, C_TEXT, 0);
+                if (row == 2) snprintf(tmp, sizeof tmp, "%s", g_up ? "Upscaled (xBR)" : "Original");
+                else if (row) snprintf(tmp, sizeof tmp, "%s", g_aa ? "Smooths edges (MSAA)" : "Jagged edges");
+                else if (g_res) snprintf(tmp, sizeof tmp, "%dx%d", (g_wide ? 2560 : 1920) * g_res / 3, 480 * g_res);
+                else snprintf(tmp, sizeof tmp, "Fits the screen");
+                text_vc(r, tmp, card.x + (row == 2 ? 114 : row ? 140 : 132), card.y, card.h, 13, C_FAINT, 0);
+                FOCUS(item, 10);
+                rrect(r, seg, 10, C_TRACK);
+                float cw = seg.w / n;
+                SDL_FRect knob = {seg.x + 4 + pos * ((seg.w - 8) / n), seg.y + 4, (seg.w - 8) / n, seg.h - 8};
+                rrect(r, knob, 7, C_ACCENT);
+                for (int k = 0; k < n; k++) {
+                    float cx = seg.x + cw / 2 + k * cw, w = text_w(opt[k], 15, 0);
+                    float d = pos - k, on = d < 0 ? 1 + d : 1 - d;
+                    if (on < 0) on = 0;
                     text_vc(r, opt[k], cx - w / 2, seg.y, seg.h, 15, mix(C_MUTED, C_TEXT, on), on > 0.5f);
                 }
             }
@@ -1353,6 +1579,11 @@ int launcher_run(const char *found_disc, int *fullscreen_io, char *disc_out, siz
             text_ex(r, "Play", L.play.x + (L.play.w - pw) / 2, L.play.y + L.play.h / 2 - 26 * 0.56f, 26,
                     disc_ok ? C_TEXT : C_FAINT, 0.4f, 1);
             if (disc_ok) badge(r, "START", L.play.x + L.play.w - 74, L.play.y + L.play.h / 2, (SDL_Color){200, 222, 255, 200}, 0);
+            if (SHOW_ONLINE) {
+                FOCUS(ITEM_ONLINE, 16);
+                rrect(r, L.online, 16, mix(C_CARD, C_CARD_HI, hov[ITEM_ONLINE]));
+                text_vc(r, "Online", L.online.x + (L.online.w - text_w("Online", 18, 0)) / 2, L.online.y, L.online.h, 18, C_TEXT, 0);
+            }
             FOCUS(ITEM_QUIT, 16);
             rrect(r, L.quit, 16, mix(C_CARD, C_CARD_HI, hov[ITEM_QUIT]));
             text_vc(r, "Quit", L.quit.x + (L.quit.w - text_w("Quit", 18, 0)) / 2, L.quit.y, L.quit.h, 18, C_MUTED, 0);
@@ -1360,6 +1591,66 @@ int launcher_run(const char *found_disc, int *fullscreen_io, char *disc_out, siz
             static const char *const h[] = {"A", "Select", "B", "Back", "#START", "Play", "#F11", "Fullscreen", "Y", "Update"};
             hints(r, h, updater_state() == UPD_AVAILABLE || updater_state() == UPD_FAILED ? 10 : 8);
             #undef FOCUS
+        } else if (screen == SCREEN_NET) {
+            SDL_FRect bk = browse_back();
+            rrect(r, bk, 12, C_CARD);
+            text_vc(r, LARROW " Back", bk.x + 16, bk.y, bk.h, 15, C_TEXT, 0);
+            text_ex(r, "Play over the network", 64, 92, 30, C_TEXT, -0.2f, 1);
+            text(r, "Everyone plays from their own copy of the game, on the same local network.", 64, 134, 15, C_MUTED);
+            char nmsg[200];
+            int ns = netplay_status(nmsg, sizeof nmsg);
+            float ring_k = 3.0f + 0.8f * sinf((float)now / 260.0f);
+            /* host */
+            SDL_FRect hc = net_host_card(), seg = net_players_seg(), hb = net_host_btn();
+            rrect(r, hc, 16, net_sel == 0 && !net_busy ? C_CARD_HI : C_CARD);
+            text_ex(r, "Host a game", 88, 184, 18, C_TEXT, 0, 1);
+            text_vc(r, "Players", 88, seg.y, seg.h, 15, C_MUTED, 0);
+            rrect(r, seg, 12, C_TRACK);
+            for (int k = 0; k < 3; k++) {
+                SDL_FRect part = {seg.x + 4 + k * (seg.w - 8) / 3, seg.y + 4, (seg.w - 8) / 3, seg.h - 8};
+                if (g_net_players == k + 2) rrect(r, part, 9, C_ACCENT);
+                char num[4];
+                snprintf(num, sizeof num, "%d", k + 2);
+                text_vc(r, num, part.x + (part.w - text_w(num, 16, 0)) / 2, part.y, part.h, 16, g_net_players == k + 2 ? C_TEXT : C_MUTED, 0);
+            }
+            if (net_sel == 0 && focus_visible && !net_busy) rrect(r, grow(hb, ring_k), 12 + ring_k, alpha(C_RING, 0.95f));
+            rrect(r, hb, 12, net_hover == 0 ? C_ACCENT_HI : C_ACCENT);
+            text_vc(r, "Host", hb.x + (hb.w - text_w("Host", 17, 0)) / 2, hb.y, hb.h, 17, C_TEXT, 1);
+            char addr_line[260];
+            snprintf(addr_line, sizeof addr_line, "Your address: %s", my_addr);
+            ellipsize(tmp, sizeof tmp, addr_line, 14, hc.w - 48, 0);
+            text(r, tmp, 88, 260, 14, C_MUTED);
+            /* join */
+            SDL_FRect jc = net_join_card(), af = net_addr_field(), jb = net_join_btn();
+            rrect(r, jc, 16, net_sel == 1 && !net_busy ? C_CARD_HI : C_CARD);
+            text_ex(r, "Join a game", 88, 312, 18, C_TEXT, 0, 1);
+            rrect(r, af, 10, C_TRACK);
+            if (g_net_addr[0]) {
+                ellipsize(tmp, sizeof tmp, g_net_addr, 17, af.w - 28, 0);
+                float tw = text_w(tmp, 17, 0);
+                text_vc(r, tmp, af.x + 12, af.y, af.h, 17, C_TEXT, 0);
+                if (net_sel == 1 && !net_busy && (now / 500) % 2) rrect(r, (SDL_FRect){af.x + 14 + tw, af.y + 10, 2, af.h - 20}, 1, C_TEXT);
+            } else {
+                text_vc(r, "Type the host's address", af.x + 12, af.y, af.h, 16, C_FAINT, 0);
+            }
+            if (net_sel == 1 && focus_visible && !net_busy) rrect(r, grow(jb, ring_k), 12 + ring_k, alpha(C_RING, 0.95f));
+            rrect(r, jb, 12, g_net_addr[0] ? (net_hover == 1 ? C_ACCENT_HI : C_ACCENT) : C_TRACK);
+            text_vc(r, "Join", jb.x + (jb.w - text_w("Join", 17, 0)) / 2, jb.y, jb.h, 17, g_net_addr[0] ? C_TEXT : C_FAINT, 1);
+            /* status */
+            if (nmsg[0] && (net_busy || ns != 0)) {
+                SDL_Color sc = ns == -1 ? C_RED : ns == 2 ? C_GREEN : C_MUTED;
+                char line[260];
+                snprintf(line, sizeof line, "%s%s", nmsg, net_busy ? (now / 400 % 4 == 0 ? "" : now / 400 % 4 == 1 ? "." : now / 400 % 4 == 2 ? ".." : "...") : "");
+                circle(r, 68, 427, 4, sc);
+                ellipsize(tmp, sizeof tmp, line, 15, VW - 140, 0);
+                text(r, tmp, 78, 418, 15, sc);
+            }
+            text(r, "Everyone needs this same version. The host's save and frame rate are used.", 64, 452, 14, C_FAINT);
+            text(r, "On Steam Deck, Steam + X opens the keyboard. The host may need to allow the game in its firewall.", 64, 474, 14, C_FAINT);
+            static const char *const hb_[] = {"A", "Host / Join", "B", "Back", "#Left/Right", "Players"};
+            static const char *const hc_[] = {"A", "Cancel", "B", "Cancel"};
+            if (net_busy) hints(r, hc_, 4);
+            else hints(r, hb_, 6);
         } else {
             /* the built-in browser */
             SDL_FRect bk = browse_back();
@@ -1434,6 +1725,7 @@ int launcher_run(const char *found_disc, int *fullscreen_io, char *disc_out, siz
     if (g_dialog_thread) SDL_DetachThread(g_dialog_thread); /* quit while the dialog is open */
     save_settings();
     while (g_npads) pads_remove(SDL_JoystickInstanceID(SDL_GameControllerGetJoystick(g_pads[0])));
+    SDL_QuitSubSystem(SDL_INIT_GAMECONTROLLER); /* the game starts it again on its input thread (video.c) */
     for (int i = 0; i < 2; i++) if (g_ftex[i]) SDL_DestroyTexture(g_ftex[i]);
     if (g_round) SDL_DestroyTexture(g_round);
     if (g_glow) SDL_DestroyTexture(g_glow);

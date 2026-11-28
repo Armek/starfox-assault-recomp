@@ -88,6 +88,33 @@ static THREAD_LOCAL HThread *t_self;
 
 int g_safepoint_budget = 4096;
 
+/* ---- deterministic time (netplay) ------------------------------------------------------------------
+ * Normally the guest's time base (mftb, OSGetTime), the decrementer, the retrace and the audio DMA follow
+ * the host's clock, so the same input can play out a little differently from run to run. With g_det set
+ * (netplay, or SFA_DETERMINISTIC=1) the guest gets a virtual time base instead, g_vtime: it advances by a
+ * fixed amount per loop back-edge the guest executes (counted through the safepoint budget) and, when no
+ * guest thread is runnable, jumps to the next timed event (retrace, decrementer, audio DMA). Every
+ * interrupt then lands at the same point of the guest's execution in every run. The host only paces it:
+ * at safepoints it sleeps while g_vtime is ahead of the real clock. */
+int g_det;
+uint64_t g_vtime;
+#define DET_TICKS_PER_BACKEDGE 3u /* time base ticks (1/40.5 MHz) per loop iteration: about 36 CPU cycles */
+static int g_budget_start = 4096;
+static void set_budget(int v) {
+    if (g_det) {
+        int done = g_budget_start - g_safepoint_budget; /* back-edges since the budget was last set */
+        if (done > 0) g_vtime += (uint64_t)done * DET_TICKS_PER_BACKEDGE;
+    }
+    g_safepoint_budget = v;
+    g_budget_start = v;
+}
+/* the virtual time base now: what's banked plus the back-edges since (the guest reads it in tight loops,
+ * e.g. AIInit timing the audio sample counter, so it has to move between safepoints too) */
+uint64_t rt_vtime_now(void) {
+    int done = g_budget_start - g_safepoint_budget;
+    return g_vtime + (done > 0 ? (uint64_t)done * DET_TICKS_PER_BACKEDGE : 0);
+}
+
 Ctx *rt_current_ctx(void) { return t_self ? t_self->c : NULL; }
 
 static void save_to_guest(Ctx *c, uint32_t ctx) {
@@ -564,7 +591,7 @@ static double now_s(void) {
 #endif
 }
 
-void rt_raise_interrupt(int n) { g_pending |= 1u << n; g_safepoint_budget = 0; }
+void rt_raise_interrupt(int n) { g_pending |= 1u << n; set_budget(0); }
 
 /* ---- decrementer: OSAlarm's time source ---------------------------------------------------------
  * DEC counts down at the timebase rate; the exception fires when it passes zero. */
@@ -575,7 +602,7 @@ void rt_set_dec(Ctx *c, uint32_t value) {
     (void)c;
     g_dec_deadline = rt_timebase() + (uint64_t)(int64_t)(int32_t)value;
     g_dec_armed = 1;
-    if ((int32_t)value <= 0) g_safepoint_budget = 0;
+    if ((int32_t)value <= 0) set_budget(0);
 }
 
 uint32_t rt_get_dec(Ctx *c) {
@@ -618,11 +645,31 @@ static void exception(Ctx *c, uint32_t fn, int code, int is_interrupt) {
     *c = saved_regs[depth];
 }
 
+#define DET_VI_TICKS (40500000ull * 1001ull / 60000ull) /* one retrace at 59.94 Hz */
+static uint64_t g_det_next_vi;
+static void det_pace(void) { /* keep g_vtime from running ahead of the real clock */
+    static double ref_host;
+    static uint64_t ref_v;
+    double h = now_s();
+    if (ref_host == 0) { ref_host = h; ref_v = g_vtime; return; }
+    double target = ref_host + (double)(g_vtime - ref_v) / 40500000.0;
+    if (target - h > 0.002) rt_sleep_us((unsigned)((target - h) * 1e6));
+    else if (h - target > 0.25) { ref_host = h; ref_v = g_vtime; } /* far behind (a slow stretch): don't rush */
+}
+
 void rt_safepoint(Ctx *c) {
-    g_safepoint_budget = 4096;
+    set_budget(4096);
     if (video_quit_requested()) { printf("[recomp] window closed\n"); exit(0); }
     double t = now_s();
-    if (t >= g_next_vi) {
+    if (g_det) {
+        if (!g_det_next_vi) g_det_next_vi = g_vtime + DET_VI_TICKS;
+        if (g_vtime >= g_det_next_vi) {
+            g_det_next_vi += DET_VI_TICKS;
+            rt_vi_retrace();
+            g_pending |= 1u << 24;
+        }
+        det_pace();
+    } else if (t >= g_next_vi) {
         if (g_next_vi == 0) g_next_vi = t;
         g_next_vi += VI_PERIOD;
         if (g_next_vi < t) g_next_vi = t + VI_PERIOD; /* fell behind: don't burst */
@@ -640,6 +687,14 @@ void rt_safepoint(Ctx *c) {
         g_pending = 0;
         for (int n = 0; n < 32; n++)
             if (p & (1u << n)) exception(c, rd32(OS_HANDLER_TABLE + n * 4), n, 1);
+    } else if (rd32(OS_CURRENT_THREAD) == 0 && g_det) {
+        /* idle: virtual time jumps to the next timed event (pacing sleeps until it's due) */
+        uint64_t next = g_det_next_vi;
+        if (g_dec_armed && g_dec_deadline < next) next = g_dec_deadline;
+        uint64_t ai = rt_ai_next_deadline();
+        if (ai && ai < next) next = ai;
+        if (next > g_vtime) g_vtime = next;
+        set_budget(0);
     } else if (rd32(OS_CURRENT_THREAD) == 0) {
         /* The scheduler is idling (no runnable thread): sleep until the next retrace. */
         double wait_s = g_next_vi - now_s();
@@ -653,7 +708,7 @@ void rt_safepoint(Ctx *c) {
             if (ai_s < wait_s) wait_s = ai_s;
         }
         if (wait_s > 0.0005) rt_sleep_us((unsigned)(wait_s * 1e6));
-        g_safepoint_budget = 0;
+        set_budget(0);
     }
 }
 

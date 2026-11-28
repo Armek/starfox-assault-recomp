@@ -574,6 +574,9 @@ void rt_hle_unimplemented(Ctx *c, uint32_t addr, const char *name) {
 /* Gekko timebase: bus clock / 4 = 40.5 MHz, from a high-resolution monotonic host clock.
  * (The SDK times hardware events with it, e.g. __AI_SRC_INIT measures 1/48000 s.) */
 uint64_t rt_timebase(void) {
+    extern int g_det;
+    extern uint64_t rt_vtime_now(void);
+    if (g_det) return rt_vtime_now(); /* deterministic time (netplay, threads.c) */
 #ifdef _WIN32
     static LARGE_INTEGER freq, start;
     LARGE_INTEGER t;
@@ -1173,6 +1176,19 @@ int main(int argc, char **argv) {
         }
     }
     if (!testing && !run_selftest) g_force_60fps = launcher_fps60(); /* the saved choice, with or without the start screen */
+    if (!testing && !run_selftest) video_set_res_scale(launcher_res_scale()); /* SFA_RES_SCALE wins (video.c) */
+    if (!testing && !run_selftest) g_widescreen = launcher_widescreen();
+    if (!testing && !run_selftest) video_set_msaa(launcher_msaa()); /* SFA_MSAA wins (video.c) */
+    if (getenv("SFA_WIDESCREEN")) g_widescreen = atoi(getenv("SFA_WIDESCREEN")) != 0;
+    if (!testing && !run_selftest) g_tex_upscale = launcher_tex_upscale();
+    if (getenv("SFA_TEX_UPSCALE")) g_tex_upscale = atoi(getenv("SFA_TEX_UPSCALE"));
+    if (g_tex_upscale != 2 && g_tex_upscale != 4) g_tex_upscale = 1;
+    if (g_tex_upscale > 1) printf("[video] textures upscaled %dx (xBR)\n", g_tex_upscale);
+    { extern int g_det; if (getenv("SFA_DETERMINISTIC")) g_det = 1; } /* deterministic time (threads.c) */
+    { /* netplay (netplay.c): connect before the game boots */
+        extern int netplay_init(void);
+        if (netplay_init() < 0) { fprintf(stderr, "[netplay] couldn't start the network game\n"); return 1; }
+    }
     if (!run_selftest) crash_handling_init();
     rt_mem_init();
     g_lc = calloc(1, PPC_LC_SIZE);

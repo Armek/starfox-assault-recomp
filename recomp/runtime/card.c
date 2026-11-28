@@ -75,12 +75,14 @@ static void load_gci(const char *path) {
     fclose(f);
 }
 
+const char *g_card_dir_override; /* netplay: a joining player plays on the host's save, copied here */
 static void card_init(void) {
     if (g_inited) return;
     g_inited = 1;
     mkdir_p("user");
     mkdir_p("user/GF7E01");
-    snprintf(g_dir, sizeof g_dir, "user/GF7E01/card_a");
+    if (g_card_dir_override) snprintf(g_dir, sizeof g_dir, "%s", g_card_dir_override);
+    else snprintf(g_dir, sizeof g_dir, "user/GF7E01/card_a");
     mkdir_p(g_dir);
 #ifdef _WIN32
     WIN32_FIND_DATAA fd;

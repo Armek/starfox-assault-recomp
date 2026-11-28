@@ -34,7 +34,7 @@ typedef ptrdiff_t GLsizeiptr, GLintptr;
     X(void, glDepthMask, GLboolean) X(void, glColorMask, GLboolean, GLboolean, GLboolean, GLboolean) \
     X(void, glBlendFunc, GLenum, GLenum) X(void, glBlendEquation, GLenum) X(void, glCullFace, GLenum) \
     X(void, glScissor, GLint, GLint, GLsizei, GLsizei) X(void, glDrawArrays, GLenum, GLint, GLsizei) \
-    X(void, glGenTextures, GLsizei, GLuint *) X(void, glBindTexture, GLenum, GLuint) \
+    X(void, glGenTextures, GLsizei, GLuint *) X(void, glDeleteTextures, GLsizei, const GLuint *) X(void, glBindTexture, GLenum, GLuint) \
     X(void, glTexImage2D, GLenum, GLint, GLint, GLsizei, GLsizei, GLint, GLenum, GLenum, const void *) \
     X(void, glTexParameteri, GLenum, GLenum, GLint) X(void, glPixelStorei, GLenum, GLint) \
     X(void, glReadPixels, GLint, GLint, GLsizei, GLsizei, GLenum, GLenum, void *) \
@@ -48,19 +48,26 @@ typedef ptrdiff_t GLsizeiptr, GLintptr;
     X(void, glUniform4fv, GLint, GLsizei, const GLfloat *) X(void, glUniform2f, GLint, GLfloat, GLfloat) \
     X(void, glBindBuffer, GLenum, GLuint) X(void, glBufferData, GLenum, GLsizeiptr, const void *, GLenum) \
     X(void, glGenVertexArrays, GLsizei, GLuint *) X(void, glBindVertexArray, GLuint) \
-    X(void, glEnableVertexAttribArray, GLuint) \
+    X(void, glEnableVertexAttribArray, GLuint) X(void, glGetIntegerv, GLenum, GLint *) \
     X(void, glVertexAttribPointer, GLuint, GLint, GLenum, GLboolean, GLsizei, const void *) \
     X(void, glGenFramebuffers, GLsizei, GLuint *) X(void, glBindFramebuffer, GLenum, GLuint) \
     X(void, glFramebufferTexture2D, GLenum, GLenum, GLenum, GLuint, GLint) \
     X(void, glGenRenderbuffers, GLsizei, GLuint *) X(void, glBindRenderbuffer, GLenum, GLuint) \
     X(void, glRenderbufferStorage, GLenum, GLenum, GLsizei, GLsizei) \
     X(void, glFramebufferRenderbuffer, GLenum, GLenum, GLenum, GLuint) \
-    X(void, glBlitFramebuffer, GLint, GLint, GLint, GLint, GLint, GLint, GLint, GLint, GLbitfield, GLenum)
+    X(void, glBlitFramebuffer, GLint, GLint, GLint, GLint, GLint, GLint, GLint, GLint, GLbitfield, GLenum) \
+    X(void, glGenerateMipmap, GLenum) X(GLenum, glGetError, void) X(void, glRenderbufferStorageMultisample, GLenum, GLsizei, GLenum, GLsizei, GLsizei)
 #define GL_DECLARE(ret, name, ...) static ret(GLAPI *name)(__VA_ARGS__);
 GL_FUNCS(GL_DECLARE)
 #define GL_LOAD(ret, name, ...) \
     if (!(*(void **)&name = SDL_GL_GetProcAddress(#name))) rt_fatal("OpenGL function %s missing", #name);
 
+#define GL_MAX_TEXTURE_SIZE 0x0D33
+#define GL_MAX_SAMPLES 0x8D57
+#define GL_TEXTURE_MAX_ANISOTROPY 0x84FE
+#define GL_MAX_TEXTURE_MAX_ANISOTROPY 0x84FF
+#define GL_NEAREST_MIPMAP_LINEAR 0x2702
+#define GL_LINEAR_MIPMAP_LINEAR 0x2703
 #define GL_COLOR_BUFFER_BIT 0x4000
 #define GL_DEPTH_BUFFER_BIT 0x0100
 #define GL_TRIANGLES 0x0004
@@ -181,6 +188,36 @@ static void poll_controller(int slot) {
     SDL_LockMutex(g_pad_lock);
     g_ctl[slot] = p;
     SDL_UnlockMutex(g_pad_lock);
+}
+
+void input_load_mappings(void) {
+    static int done;
+    if (done) return;
+    done = 1;
+    int n = SDL_GameControllerAddMappingsFromFile("user/gamecontrollerdb.txt");
+    if (n > 0) printf("[video] %d controller layouts from user/gamecontrollerdb.txt\n", n);
+}
+
+/* Most controllers SDL knows (Xbox, PlayStation, Switch, the Deck, 8BitDo and hundreds more); a plain
+ * USB joystick it doesn't gets the usual layout of such pads (buttons 0-3 face, 4-7 shoulders and
+ * triggers, 8/9 select/start, axes 0-3 the sticks, hat 0 the D-pad), so it still plays. SDL then
+ * reports it as a game controller (SDL_CONTROLLERDEVICEADDED). */
+void input_generic_mapping(int device_index) {
+    if (SDL_IsGameController(device_index)) return;
+    char guid[64], name[64], map[400];
+    SDL_JoystickGetGUIDString(SDL_JoystickGetDeviceGUID(device_index), guid, sizeof guid);
+    const char *n = SDL_JoystickNameForIndex(device_index);
+    snprintf(name, sizeof name, "%s", n && *n ? n : "Joystick");
+    for (char *p = name; *p; p++) if (*p == ',') *p = ' ';
+    snprintf(map, sizeof map,
+             "%s,%s,a:b0,b:b1,x:b2,y:b3,leftshoulder:b4,rightshoulder:b5,lefttrigger:b6,righttrigger:b7,"
+             "back:b8,start:b9,leftstick:b10,rightstick:b11,leftx:a0,lefty:a1,rightx:a2,righty:a3,"
+             "dpup:h0.1,dpright:h0.2,dpdown:h0.4,dpleft:h0.8",
+             guid, name);
+    if (SDL_GameControllerAddMapping(map) >= 0) {
+        printf("[video] controller without a known layout, using the usual one: %s\n", name);
+        fflush(stdout);
+    }
 }
 
 /* A controller was connected: give it the lowest free port. */
@@ -452,6 +489,22 @@ static SDL_cond *g_qcond;
 static GxFrame *g_pending_frame;
 static volatile int g_quit;
 static int g_dump;
+/* Internal resolution: the EFB is drawn at g_rs times its real size (1 = the console's 640x528).
+ * Guest-visible sizes stay the same; only the GL framebuffer, scissor, EFB copy textures and
+ * presenting are scaled. 0 asked = from the window height at startup. */
+static int g_rs = 1, g_rs_asked = -1;
+/* Widescreen (g_widescreen, gx.c): the EFB is also 4/3 as wide, so the wider picture gets its own pixels.
+ * Horizontal scale = g_xn / 3 (g_rs * 3, or g_rs * 4 in widescreen); SX maps EFB x to GL x. */
+static int g_xn = 3;
+#define SX(v) ((int)(((long)(v) * g_xn) / 3))
+#define EFB_W SX(EFB_WIDTH)
+#define EFB_H (EFB_HEIGHT * g_rs)
+void video_set_res_scale(int s) { g_rs_asked = s; }
+/* Anti-aliasing: with g_msaa samples the game draws into a multisampled EFB (g_draw_fbo), resolved into
+ * the plain one (g_efb_fbo) before every EFB copy, readback and present. Textures the game mipmaps get
+ * GL-made mipmaps and up to g_aniso x anisotropic filtering. */
+static int g_msaa, g_msaa_asked = -1, g_aniso;
+void video_set_msaa(int n) { g_msaa_asked = n; }
 static int g_last_rect[4] = {0, 0, 640, 480}; /* the last frame's XFB copy rectangle, to show it again */
 
 int video_quit_requested(void) { return g_quit; }
@@ -550,6 +603,8 @@ void video_set_window(int fullscreen, int w, int h) {
     if (w > 0 && h > 0) { g_window_w = w; g_window_h = h; }
 }
 static GLuint g_vao, g_vbo, g_efb_fbo, g_efb_color, g_efb_depth, g_white;
+static GLuint g_draw_fbo, g_ms_color, g_ms_depth; /* the multisampled EFB (g_draw_fbo = g_efb_fbo without MSAA) */
+static uint8_t *g_texture_mip; /* GxTexture id -> has GL mipmaps */
 static GLuint *g_textures; /* GxTexture id -> GL name */
 static uint32_t *g_texture_dims; /* GxTexture id -> width << 16 | height */
 static GLuint g_copy_prog, g_copy_fbo;
@@ -570,13 +625,13 @@ static const char *k_copy_fs =
     "#version 330 core\n"
     "uniform sampler2D u_efb;\n"
     "uniform vec2 u_src;\n"
-    "uniform int u_mode, u_half, u_intensity;\n"
+    "uniform int u_mode, u_half, u_intensity, u_scale, u_xn, u_top;\n"
     "out vec4 o;\n"
-    "vec4 px(int x, int y) { return texelFetch(u_efb, ivec2(x, 527 - y), 0); }\n"
+    "vec4 px(int x, int y) { return texelFetch(u_efb, ivec2(x, u_top - y), 0); }\n"
     "float q(float v, float bits) { float n = exp2(bits) - 1.0; return floor(floor(v * 255.0 + 0.5) / exp2(8.0 - bits)) / n; }\n"
     "void main() {\n"
     "    ivec2 p = ivec2(gl_FragCoord.xy);\n"
-    "    int sx = int(u_src.x), sy = int(u_src.y);\n"
+    "    int sx = int(u_src.x) * u_xn / 3, sy = int(u_src.y) * u_scale;\n"
     "    vec4 c;\n"
     "    if (u_half != 0) {\n"
     "        int x = sx + p.x * 2, y = sy + p.y * 2;\n"
@@ -853,6 +908,31 @@ static TevProgram *tev_program_build(const GxTevConfig *cfg, int for_game) {
 
 static void gl_setup(void) {
     GL_FUNCS(GL_LOAD)
+    int ww, wh;
+    SDL_GL_GetDrawableSize(g_window, &ww, &wh);
+    if (getenv("SFA_RES_SCALE")) g_rs_asked = atoi(getenv("SFA_RES_SCALE"));
+    if (g_rs_asked < 0) g_rs_asked = 1; /* tests: the console's own size unless asked */
+    g_rs = g_rs_asked > 0 ? g_rs_asked : (wh + 479) / 480; /* 0: enough for the window's height */
+    GLint max_tex = 0;
+    glGetIntegerv(GL_MAX_TEXTURE_SIZE, &max_tex);
+    if (g_rs > 6) g_rs = 6;
+    if (g_rs < 1) g_rs = 1;
+    for (;;) {
+        g_xn = g_rs * (g_widescreen ? 4 : 3);
+        if (g_rs == 1 || !max_tex || EFB_W <= max_tex) break;
+        g_rs--;
+    }
+    printf("[video] internal resolution %dx (%dx%d)%s\n", g_rs, EFB_W, EFB_H, g_widescreen ? ", widescreen" : "");
+    if (getenv("SFA_MSAA")) g_msaa_asked = atoi(getenv("SFA_MSAA"));
+    GLint max_samples = 0, max_aniso = 0;
+    glGetIntegerv(GL_MAX_SAMPLES, &max_samples);
+    g_msaa = g_msaa_asked > 1 ? g_msaa_asked : 0;
+    if (g_msaa > max_samples) g_msaa = max_samples > 1 ? max_samples : 0;
+    glGetIntegerv(GL_MAX_TEXTURE_MAX_ANISOTROPY, &max_aniso);
+    while (glGetError()) {} /* no anisotropic filtering: the query fails */
+    g_aniso = getenv("SFA_ANISO") ? atoi(getenv("SFA_ANISO")) : 16;
+    if (g_aniso > max_aniso) g_aniso = max_aniso;
+    printf("[video] anti-aliasing %s%s, anisotropic filtering %dx\n", g_msaa ? "MSAA " : "off", g_msaa ? (g_msaa == 2 ? "2x" : g_msaa == 4 ? "4x" : "8x") : "", g_aniso > 1 ? g_aniso : 1);
     g_vs_shader = compile(GL_VERTEX_SHADER, k_vs);
 
     glGenVertexArrays(1, &g_vao);
@@ -879,16 +959,29 @@ static void gl_setup(void) {
     /* the EFB */
     glGenTextures(1, &g_efb_color);
     glBindTexture(GL_TEXTURE_2D, g_efb_color);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, EFB_WIDTH, EFB_HEIGHT, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, EFB_W, EFB_H, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     glGenRenderbuffers(1, &g_efb_depth);
     glBindRenderbuffer(GL_RENDERBUFFER, g_efb_depth);
-    glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH_COMPONENT24, EFB_WIDTH, EFB_HEIGHT);
+    glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH_COMPONENT24, EFB_W, EFB_H);
     glGenFramebuffers(1, &g_efb_fbo);
     glBindFramebuffer(GL_FRAMEBUFFER, g_efb_fbo);
     glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, g_efb_color, 0);
     glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, g_efb_depth);
+    g_draw_fbo = g_efb_fbo;
+    if (g_msaa) {
+        glGenRenderbuffers(1, &g_ms_color);
+        glBindRenderbuffer(GL_RENDERBUFFER, g_ms_color);
+        glRenderbufferStorageMultisample(GL_RENDERBUFFER, g_msaa, GL_RGBA8, EFB_W, EFB_H);
+        glGenRenderbuffers(1, &g_ms_depth);
+        glBindRenderbuffer(GL_RENDERBUFFER, g_ms_depth);
+        glRenderbufferStorageMultisample(GL_RENDERBUFFER, g_msaa, GL_DEPTH_COMPONENT24, EFB_W, EFB_H);
+        glGenFramebuffers(1, &g_draw_fbo);
+        glBindFramebuffer(GL_FRAMEBUFFER, g_draw_fbo);
+        glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, g_ms_color);
+        glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, g_ms_depth);
+    }
     glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
     glPixelStorei(GL_PACK_ALIGNMENT, 1);
 
@@ -903,8 +996,11 @@ static void gl_setup(void) {
     g_copy_u_mode = glGetUniformLocation(g_copy_prog, "u_mode");
     g_copy_u_half = glGetUniformLocation(g_copy_prog, "u_half");
     g_copy_u_intensity = glGetUniformLocation(g_copy_prog, "u_intensity");
+    glUniform1i(glGetUniformLocation(g_copy_prog, "u_scale"), g_rs);
+    glUniform1i(glGetUniformLocation(g_copy_prog, "u_xn"), g_xn);
+    glUniform1i(glGetUniformLocation(g_copy_prog, "u_top"), EFB_H - 1);
     glGenFramebuffers(1, &g_copy_fbo);
-    glBindFramebuffer(GL_FRAMEBUFFER, g_efb_fbo);
+    glBindFramebuffer(GL_FRAMEBUFFER, g_draw_fbo);
 }
 
 /* GL texture for GxTexture id, (re)allocated at w x h; returns its name. */
@@ -914,13 +1010,22 @@ static GLuint texture_slot(uint32_t id, uint32_t w, uint32_t h, const void *rgba
         while (n <= id) n *= 2;
         g_textures = realloc(g_textures, sizeof *g_textures * n);
         g_texture_dims = realloc(g_texture_dims, sizeof *g_texture_dims * n);
+        g_texture_mip = realloc(g_texture_mip, n);
+        memset(g_texture_mip + g_ntextures, 0, n - g_ntextures);
         memset(g_textures + g_ntextures, 0, sizeof *g_textures * (n - g_ntextures));
         memset(g_texture_dims + g_ntextures, 0, sizeof *g_texture_dims * (n - g_ntextures));
         g_ntextures = n;
     }
+    uint32_t dims = w << 16 | h;
+    if (g_textures[id] && g_texture_dims[id] && g_texture_dims[id] != dims) {
+        /* a new size (an upscaled version arriving): a fresh texture, so the driver needn't wait for
+         * draws still using the old one */
+        glDeleteTextures(1, &g_textures[id]);
+        g_textures[id] = 0;
+        g_texture_dims[id] = 0;
+    }
     if (!g_textures[id]) glGenTextures(1, &g_textures[id]);
     glBindTexture(GL_TEXTURE_2D, g_textures[id]);
-    uint32_t dims = w << 16 | h;
     if (rgba || g_texture_dims[id] != dims) {
         glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, (GLsizei)w, (GLsizei)h, 0, GL_RGBA, GL_UNSIGNED_BYTE, rgba);
         g_texture_dims[id] = dims;
@@ -929,14 +1034,32 @@ static GLuint texture_slot(uint32_t id, uint32_t w, uint32_t h, const void *rgba
 }
 
 static Uint32 g_last_upload_ms; /* time render() spent uploading textures, last frame */
-static void upload(GxTextureUpload *u) { texture_slot(u->id, u->width, u->height, u->rgba); }
+static void upload(GxTextureUpload *u) {
+    texture_slot(u->id, u->width, u->height, u->rgba);
+    glGenerateMipmap(GL_TEXTURE_2D); /* used only when the game asks for mipmapping (gx.c linear bit 2) */
+    if (g_aniso > 1) glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_ANISOTROPY, g_aniso);
+    g_texture_mip[u->id] = 1;
+}
+
+/* MSAA: the multisampled EFB -> the plain one (whose texture copies and presenting read) */
+static void efb_resolve(void) {
+    if (g_draw_fbo == g_efb_fbo) return;
+    glDisable(GL_SCISSOR_TEST);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, g_draw_fbo);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, g_efb_fbo);
+    glBlitFramebuffer(0, 0, EFB_W, EFB_H, 0, 0, EFB_W, EFB_H, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+    glBindFramebuffer(GL_FRAMEBUFFER, g_draw_fbo);
+}
 
 /* Run an EFB copy to texture on the GPU. The caller restores the EFB framebuffer and state. */
 static void efb_copy_pass(const GxEfbCopy *c) {
-    GLuint tex = texture_slot(c->id, c->out_w, c->out_h, NULL);
+    efb_resolve();
+    /* the copy texture is g_rs times bigger too: the guest samples it with normalized coordinates */
+    GLuint tex = texture_slot(c->id, SX(c->out_w), c->out_h * g_rs, NULL);
+    g_texture_mip[c->id] = 0;
     glBindFramebuffer(GL_FRAMEBUFFER, g_copy_fbo);
     glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tex, 0);
-    glViewport(0, 0, c->out_w, c->out_h);
+    glViewport(0, 0, SX(c->out_w), c->out_h * g_rs);
     glDisable(GL_SCISSOR_TEST);
     glDisable(GL_DEPTH_TEST);
     glDisable(GL_BLEND);
@@ -950,15 +1073,15 @@ static void efb_copy_pass(const GxEfbCopy *c) {
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, g_efb_color);
     glDrawArrays(GL_TRIANGLES, 0, 3);
-    glBindFramebuffer(GL_FRAMEBUFFER, g_efb_fbo);
-    glViewport(0, 0, EFB_WIDTH, EFB_HEIGHT);
+    glBindFramebuffer(GL_FRAMEBUFFER, g_draw_fbo);
+    glViewport(0, 0, EFB_W, EFB_H);
     glEnable(GL_SCISSOR_TEST);
 }
 
 static void apply_state(const GxState *s) {
     /* EFB y grows downwards; the GL framebuffer's y grows upwards. */
-    glScissor(s->scissor[0], EFB_HEIGHT - 1 - s->scissor[3], s->scissor[2] - s->scissor[0] + 1,
-              s->scissor[3] - s->scissor[1] + 1);
+    glScissor(SX(s->scissor[0]), (EFB_HEIGHT - 1 - s->scissor[3]) * g_rs,
+              SX(s->scissor[2] + 1) - SX(s->scissor[0]), (s->scissor[3] - s->scissor[1] + 1) * g_rs);
     if (s->z_enable) {
         glEnable(GL_DEPTH_TEST);
         glDepthFunc(k_depth_func[s->z_func & 7]);
@@ -999,8 +1122,10 @@ static void apply_state(const GxState *s) {
             glBindTexture(GL_TEXTURE_2D, g_textures[id]);
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, wrap[s->wrap_s[m] & 3]);
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, wrap[s->wrap_t[m] & 3]);
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, s->linear[m] ? GL_LINEAR : GL_NEAREST);
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, s->linear[m] ? GL_LINEAR : GL_NEAREST);
+            int f = s->linear[m], mip = (f & 4) && g_texture_mip[id];
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER,
+                            mip ? (f & 2 ? GL_LINEAR_MIPMAP_LINEAR : GL_NEAREST_MIPMAP_LINEAR) : (f & 2 ? GL_LINEAR : GL_NEAREST));
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, f & 1 ? GL_LINEAR : GL_NEAREST);
         } else {
             glBindTexture(GL_TEXTURE_2D, g_white);
         }
@@ -1034,13 +1159,15 @@ static void write_bmp(const char *path, const uint8_t *rgba, int w, int h) {
     fclose(f);
 }
 
+static void draw_toast(int ww, int wh);
+static void ui_flush(int ww, int wh);
 static void render(GxFrame *f) {
     uint32_t render_start = SDL_GetTicks();
     Uint32 up0 = SDL_GetTicks();
     for (uint32_t i = 0; i < f->nuploads; i++) upload(&f->uploads[i]);
     g_last_upload_ms = SDL_GetTicks() - up0;
-    glBindFramebuffer(GL_FRAMEBUFFER, g_efb_fbo);
-    glViewport(0, 0, EFB_WIDTH, EFB_HEIGHT);
+    glBindFramebuffer(GL_FRAMEBUFFER, g_draw_fbo);
+    glViewport(0, 0, EFB_W, EFB_H);
     glBindVertexArray(g_vao);
     glBindBuffer(GL_ARRAY_BUFFER, g_vbo);
     glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(sizeof(GxVertex) * f->nverts), f->verts, GL_STREAM_DRAW);
@@ -1073,18 +1200,25 @@ static void render(GxFrame *f) {
         glDrawArrays(mode, (GLint)bt->first, (GLsizei)bt->count);
     }
     glDisable(GL_SCISSOR_TEST);
+    efb_resolve();
 
     if (f->copy) { /* EFB copy to texture: read the rectangle back for the guest, don't present */
         GxCopyRequest *r = f->copy;
         static uint8_t *tmp;
         static size_t tmp_size;
-        size_t bytes = (size_t)r->w * r->h * 4;
+        size_t bytes = (size_t)(SX(r->w) + 2) * r->h * 4 * g_rs;
         if (bytes > tmp_size) { tmp = realloc(tmp, bytes); tmp_size = bytes; }
         glBindFramebuffer(GL_READ_FRAMEBUFFER, g_efb_fbo);
-        glReadPixels((GLint)r->x, (GLint)(EFB_HEIGHT - (r->y + r->h)), (GLsizei)r->w, (GLsizei)r->h, GL_RGBA,
+        uint32_t rw = (uint32_t)(SX(r->x + r->w) - SX(r->x)), rh = r->h * g_rs;
+        glReadPixels((GLint)SX(r->x), (GLint)((EFB_HEIGHT - (r->y + r->h)) * g_rs), (GLsizei)rw, (GLsizei)rh, GL_RGBA,
                      GL_UNSIGNED_BYTE, tmp);
-        for (uint32_t y = 0; y < r->h; y++) /* GL rows are bottom-up */
-            memcpy(r->rgba + (size_t)y * r->w * 4, tmp + (size_t)(r->h - 1 - y) * r->w * 4, (size_t)r->w * 4);
+        for (uint32_t y = 0; y < r->h; y++) { /* GL rows are bottom-up */
+            const uint8_t *row = tmp + (size_t)(rh - 1 - y * g_rs) * rw * 4;
+            if (g_xn == 3) memcpy(r->rgba + (size_t)y * r->w * 4, row, (size_t)r->w * 4);
+            else
+                for (uint32_t x = 0; x < r->w; x++)
+                    memcpy(r->rgba + ((size_t)y * r->w + x) * 4, row + (size_t)(SX(r->x + x) - SX(r->x)) * 4, 4);
+        }
         glBindFramebuffer(GL_FRAMEBUFFER, 0);
         SDL_LockMutex(g_qlock);
         r->done = 1;
@@ -1099,26 +1233,28 @@ static void render(GxFrame *f) {
     int sx = f->copy_rect[0], sy = f->copy_rect[1], sw = f->copy_rect[2], sh = f->copy_rect[3];
     if (!sw || !sh) { sx = 0; sy = 0; sw = 640; sh = 480; }
     g_last_rect[0] = sx; g_last_rect[1] = sy; g_last_rect[2] = sw; g_last_rect[3] = sh;
-    int gy0 = EFB_HEIGHT - (sy + sh), gy1 = EFB_HEIGHT - sy;
+    int gy0 = (EFB_HEIGHT - (sy + sh)) * g_rs, gy1 = (EFB_HEIGHT - sy) * g_rs;
     glBindFramebuffer(GL_READ_FRAMEBUFFER, g_efb_fbo);
     glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
     glColorMask(1, 1, 1, 1);
     glViewport(0, 0, ww, wh);
     glClearColor(0, 0, 0, 1);
     glClear(GL_COLOR_BUFFER_BIT);
-    double scale = (double)ww / sw < (double)wh / sh ? (double)ww / sw : (double)wh / sh;
-    int dw = (int)(sw * scale), dh = (int)(sh * scale), dx = (ww - dw) / 2, dy = (wh - dh) / 2;
-    glBlitFramebuffer(sx, gy0, sx + sw, gy1, dx, dy, dx + dw, dy + dh, GL_COLOR_BUFFER_BIT, GL_LINEAR);
+    double aw = g_widescreen ? sw * 4.0 / 3.0 : sw; /* the picture's shape: 4/3 wider in widescreen */
+    double scale = ww / aw < (double)wh / sh ? ww / aw : (double)wh / sh;
+    int dw = (int)(aw * scale), dh = (int)(sh * scale), dx = (ww - dw) / 2, dy = (wh - dh) / 2;
+    glBlitFramebuffer(SX(sx), gy0, SX(sx + sw), gy1, dx, dy, dx + dw, dy + dh, GL_COLOR_BUFFER_BIT, GL_LINEAR);
 
+    draw_toast(ww, wh);
     if (g_dump) {
         static uint8_t *pix;
         static int n;
-        if (!pix) pix = malloc((size_t)640 * 528 * 4);
+        if (!pix) pix = malloc((size_t)EFB_W * EFB_H * 4);
         glBindFramebuffer(GL_READ_FRAMEBUFFER, g_efb_fbo);
-        glReadPixels(sx, gy0, sw, sh, GL_RGBA, GL_UNSIGNED_BYTE, pix);
+        glReadPixels(SX(sx), gy0, SX(sx + sw) - SX(sx), sh * g_rs, GL_RGBA, GL_UNSIGNED_BYTE, pix);
         char path[256];
         snprintf(path, sizeof path, "build/GF7E01/frames/frame_%05u.bmp", f->number);
-        if (n++ % 15 == 0) write_bmp(path, pix, sw, sh); /* every 15th frame */
+        if (n++ % 15 == 0) write_bmp(path, pix, SX(sx + sw) - SX(sx), sh * g_rs); /* every 15th frame */
     }
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
     SDL_GL_SwapWindow(g_window);
@@ -1318,7 +1454,11 @@ static void draw_picker(int ww, int wh) {
     if (g_pick_note[0]) ui_text_centered(g_pick_note, cx, by + bh + 34 * s, 24 * s, white, 1);
     else ui_text_centered("Left / Right  choose        A / START  confirm", cx, by + bh + 38 * s, 18 * s, faint, 0);
     ui_text_centered("For the parts on foot. Arwing flights and most cutscenes stay as Fox.", cx, py + ph - 34 * s, 15 * s, faint, 0);
+    ui_flush(ww, wh);
+}
 
+/* draws what ui_rect / ui_text collected over the default framebuffer, then puts the game's GL state back */
+static void ui_flush(int ww, int wh) {
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
     glViewport(0, 0, ww, wh);
     glDisable(GL_DEPTH_TEST);
@@ -1344,21 +1484,43 @@ static void draw_picker(int ww, int wh) {
     glBindBuffer(GL_ARRAY_BUFFER, g_vbo);
 }
 
+/* A notice at the top of the window for a few seconds (netplay: a player left, the games drifted apart). */
+static char g_toast[160];
+static volatile Uint32 g_toast_until;
+void video_toast(const char *msg) {
+    snprintf(g_toast, sizeof g_toast, "%s", msg);
+    g_toast_until = SDL_GetTicks() + 6000;
+}
+static void draw_toast(int ww, int wh) {
+    if (!g_toast_until || SDL_GetTicks() > g_toast_until) return;
+    ui_setup();
+    if (g_ui_ready != 1) return;
+    g_ui_nrects = g_ui_ntext = 0;
+    float s = wh / 720.0f, size = 22 * s, w = ui_text_w(g_toast, size) + 40 * s, h = size + 22 * s;
+    static const float bg[4] = {0.04f, 0.06f, 0.12f, 0.88f}, bar[4] = {0.95f, 0.55f, 0.2f, 1}, fg[4] = {0.95f, 0.96f, 1, 1};
+    float x = (ww - w) / 2, y = 24 * s;
+    ui_rect(x, y, w, h, bg);
+    ui_rect(x, y, 5 * s, h, bar);
+    ui_text(g_toast, x + 22 * s, y + 11 * s, size, fg, 0);
+    ui_flush(ww, wh);
+}
+
 /* While the game waits on the picker no frames come: show the last one again with the picker over it. */
 static void present_picker(void) {
     int ww, wh;
     SDL_GL_GetDrawableSize(g_window, &ww, &wh);
     int sx = g_last_rect[0], sy = g_last_rect[1], sw = g_last_rect[2], sh = g_last_rect[3];
-    int gy0 = EFB_HEIGHT - (sy + sh), gy1 = EFB_HEIGHT - sy;
+    int gy0 = (EFB_HEIGHT - (sy + sh)) * g_rs, gy1 = (EFB_HEIGHT - sy) * g_rs;
     glBindFramebuffer(GL_READ_FRAMEBUFFER, g_efb_fbo);
     glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
     glColorMask(1, 1, 1, 1);
     glViewport(0, 0, ww, wh);
     glClearColor(0, 0, 0, 1);
     glClear(GL_COLOR_BUFFER_BIT);
-    double scale = (double)ww / sw < (double)wh / sh ? (double)ww / sw : (double)wh / sh;
-    int dw = (int)(sw * scale), dh = (int)(sh * scale), dx = (ww - dw) / 2, dy = (wh - dh) / 2;
-    glBlitFramebuffer(sx, gy0, sx + sw, gy1, dx, dy, dx + dw, dy + dh, GL_COLOR_BUFFER_BIT, GL_LINEAR);
+    double aw = g_widescreen ? sw * 4.0 / 3.0 : sw; /* the picture's shape: 4/3 wider in widescreen */
+    double scale = ww / aw < (double)wh / sh ? ww / aw : (double)wh / sh;
+    int dw = (int)(aw * scale), dh = (int)(sh * scale), dx = (ww - dw) / 2, dy = (wh - dh) / 2;
+    glBlitFramebuffer(SX(sx), gy0, SX(sx + sw), gy1, dx, dy, dx + dw, dy + dh, GL_COLOR_BUFFER_BIT, GL_LINEAR);
     draw_picker(ww, wh);
     if (g_dump) { /* --dump-frames: the picker too, now and then */
         static Uint32 last;
@@ -1408,8 +1570,11 @@ int video_pick_pilot(int mission, int *choice) {
 }
 
 static void open_controllers(void) {
-    for (int i = 0; i < SDL_NumJoysticks(); i++)
+    input_load_mappings();
+    for (int i = 0; i < SDL_NumJoysticks(); i++) {
+        input_generic_mapping(i);
         if (SDL_IsGameController(i)) add_controller(i);
+    }
     fflush(stdout);
 }
 
@@ -1438,6 +1603,10 @@ static int render_thread(void *arg) {
 #endif
     }
 
+    /* Controllers start on this thread, which reads the events: on Windows, Xbox controllers' input
+     * (raw input) arrives as messages for a window of the thread that started the subsystem, so started
+     * on the game's main thread (which never reads messages) they'd connect but never press anything. */
+    if (SDL_InitSubSystem(SDL_INIT_GAMECONTROLLER) != 0) printf("[video] no controllers: %s\n", SDL_GetError());
     open_controllers();
     while (!g_quit) {
         SDL_Event e;
@@ -1448,6 +1617,8 @@ static int render_thread(void *arg) {
                       (e.key.keysym.sym == SDLK_RETURN && (e.key.keysym.mod & KMOD_ALT)))) {
                 g_fullscreen = !g_fullscreen; /* F11 or Alt+Enter: toggle fullscreen */
                 SDL_SetWindowFullscreen(g_window, g_fullscreen ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0);
+            } else if (e.type == SDL_JOYDEVICEADDED) {
+                input_generic_mapping(e.jdevice.which);
             } else if (e.type == SDL_CONTROLLERDEVICEADDED) {
                 add_controller(e.cdevice.which);
             } else if (e.type == SDL_CONTROLLERDEVICEREMOVED) {
@@ -1479,7 +1650,7 @@ void video_start(int dump_frames) {
     g_prof_render = getenv("SFA_PROFILE") != NULL;
     SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
     SDL_SetHint("SDL_JOYSTICK_HIDAPI_STEAMDECK", "1"); /* the Deck's own controls, also when not started from Steam */
-    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS | SDL_INIT_GAMECONTROLLER) != 0) rt_fatal("SDL_Init: %s", SDL_GetError());
+    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS) != 0) rt_fatal("SDL_Init: %s", SDL_GetError()); /* controllers: render_thread */
     g_audio_muted = getenv("SFA_MUTE") != NULL;
     if (g_audio_muted) printf("[audio] muted (SFA_MUTE)\n");
     if (SDL_InitSubSystem(SDL_INIT_AUDIO) == 0) {

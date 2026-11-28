@@ -50,6 +50,14 @@ extern int g_start_stage;
  * disc_out and *fullscreen set), 0 to quit, -1 if it couldn't open a window. */
 int launcher_run(const char *found, int *fullscreen, char *disc_out, size_t disc_n);
 int launcher_fps60(void); /* the start screen's saved frame-rate choice */
+int launcher_tex_upscale(void); /* the saved texture upscaling: 0 off, 2 or 4 */
+/* Controller layouts (video.c): user/gamecontrollerdb.txt, if there, after the game controller subsystem
+ * starts; a joystick SDL has no layout for gets a common one when it's connected (SDL_JOYDEVICEADDED). */
+void input_load_mappings(void);
+void input_generic_mapping(int device_index);
+int launcher_msaa(void); /* the saved anti-aliasing: MSAA samples, 0 off */
+int launcher_widescreen(void); /* the saved aspect: 0 4:3, 1 16:9 */
+int launcher_res_scale(void); /* the saved internal resolution: 1-4 times, 0 Auto */
 extern int g_force_60fps; /* hle.c: 60 fps option from the launcher (SFA_60FPS overrides) */
 
 #endif

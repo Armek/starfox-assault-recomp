@@ -28,7 +28,7 @@ add_custom_command(OUTPUT "${FONTS_C}"
   DEPENDS fonts/font_western.bin fonts/font_japanese.bin tools/embed_fonts.cmake
   COMMENT "Embedding the system fonts")
 
-add_executable(sfa "${FONTS_C}" runtime/runtime.c runtime/hle.c runtime/threads.c runtime/dvd.c runtime/gx.c runtime/video.c runtime/card.c runtime/ax.c runtime/launcher.c runtime/updater.c runtime/bots.c ${GENERATED_SOURCES})
+add_executable(sfa "${FONTS_C}" runtime/runtime.c runtime/hle.c runtime/threads.c runtime/dvd.c runtime/gx.c runtime/video.c runtime/card.c runtime/ax.c runtime/launcher.c runtime/updater.c runtime/bots.c runtime/netplay.c runtime/texpack.c runtime/texscale.c ${GENERATED_SOURCES})
 # The release version (recomp/VERSION, bumped for each release): shown on the start screen and compared
 # with GitHub's releases by the updater.
 file(STRINGS "${CMAKE_CURRENT_SOURCE_DIR}/VERSION" SFA_VERSION LIMIT_COUNT 1)
@@ -64,7 +64,7 @@ endif()
 find_package(SDL2 REQUIRED CONFIG)
 target_link_libraries(sfa PRIVATE SDL2::SDL2)
 if(WIN32)
-  target_link_libraries(sfa PRIVATE winmm comdlg32 ole32 dbghelp)  # timeBeginPeriod (1 ms sleeps); the Open dialog
+  target_link_libraries(sfa PRIVATE winmm comdlg32 ole32 dbghelp ws2_32)  # timeBeginPeriod (1 ms sleeps); the Open dialog
 endif()
 if(WIN32)
   add_custom_command(TARGET sfa POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different

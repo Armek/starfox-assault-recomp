@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
 #include "funcs.h"
 #include "runtime.h"
 #include "gx.h"
@@ -218,6 +219,9 @@ HLE(GXDrawDone) {
  * host (keyboard and game controllers, see video.c). */
 #define PAD_ERR_NONE 0
 #define PAD_ERR_NO_CONTROLLER (-1)
+static void netplay_test_pads(uint32_t status);
+static void netplay_test_after(void);
+extern uint32_t g_game_state;
 HLE(PADRead) {
     uint32_t status = c->r[3];
     for (int port = 0; port < 4; port++) {
@@ -244,7 +248,75 @@ HLE(PADRead) {
             last[port] = now;
         }
     }
+    netplay_test_pads(status);
+    { extern void netplay_pads(uint32_t status); netplay_pads(status); } /* netplay.c: the players' inputs */
+    netplay_test_after();
     c->r[3] = 0; /* no motor/reset bits */
+}
+
+/* Determinism testing for netplay (two games kept in step by exchanging inputs only).
+ * SFA_INPUT_RECORD=<file>: every PADRead's four PADStatus records (48 bytes) in call order;
+ * SFA_INPUT_REPLAY=<file>: the same, fed back in place of the live input (live input once it ends).
+ * SFA_RAM_HASH=<file>: at every SFA_RAM_HASH_EVERY'th PADRead (default 1), from call
+ * SFA_RAM_HASH_FROM on, the call number, the game state and a 64-bit hash of each 1 MB of main RAM
+ * (24 per line), so two runs with the same input can be compared call by call. */
+static void netplay_test_pads(uint32_t status) {
+    static int init;
+    static FILE *rec, *rep;
+    if (!init) {
+        init = 1;
+        const char *e;
+        if ((e = getenv("SFA_INPUT_RECORD"))) rec = fopen(e, "wb");
+        if ((e = getenv("SFA_INPUT_REPLAY"))) rep = fopen(e, "rb");
+    }
+    uint8_t *p = ppc_ram(status);
+    if (rep) {
+        uint8_t buf[48];
+        if (fread(buf, 1, 48, rep) == 48) memcpy(p, buf, 48);
+        else { fclose(rep); rep = NULL; }
+    }
+    if (rec) fwrite(p, 1, 48, rec);
+}
+
+/* the second half, after netplay has put the players' inputs in: hashes and dumps (see above) */
+static void netplay_test_after(void) {
+    static int init;
+    static FILE *hash;
+    static uint32_t calls, every = 1, from;
+    if (!init) {
+        init = 1;
+        const char *e;
+        if ((e = getenv("SFA_RAM_HASH"))) hash = fopen(e, "w");
+        if ((e = getenv("SFA_RAM_HASH_EVERY")) && atoi(e) > 0) every = (uint32_t)atoi(e);
+        if ((e = getenv("SFA_RAM_HASH_FROM"))) from = (uint32_t)atoi(e);
+    }
+    if (hash && calls >= from && (calls - from) % every == 0) {
+        fprintf(hash, "%u %u", calls, g_game_state);
+        for (uint32_t b = 0; b < PPC_MEM_SIZE; b += 0x100000u) {
+            const uint64_t *w = (const uint64_t *)(g_mem + b);
+            uint64_t h = 1469598103934665603ull;
+            for (uint32_t i = 0; i < 0x100000u / 8; i++) h = (h ^ w[i]) * 1099511628211ull;
+            fprintf(hash, " %016llx", (unsigned long long)h);
+        }
+        fprintf(hash, "\n");
+    }
+    static char dump_at[256] = {1}; /* SFA_RAM_DUMP_AT=<prefix>:<call>,<call>,...: main RAM to <prefix>_<call>.bin */
+    if (dump_at[0] == 1) { const char *e = getenv("SFA_RAM_DUMP_AT"); snprintf(dump_at, sizeof dump_at, "%s", e ? e : ""); }
+    if (dump_at[0]) {
+        char *colon = strrchr(dump_at, ':');
+        for (const char *q = colon ? colon + 1 : ""; *q; ) {
+            if ((uint32_t)strtoul(q, NULL, 10) == calls) {
+                char path[300];
+                snprintf(path, sizeof path, "%.*s_%u.bin", (int)(colon - dump_at), dump_at, calls);
+                FILE *f = fopen(path, "wb");
+                if (f) { fwrite(g_mem, 1, PPC_MEM_SIZE, f); fclose(f); }
+            }
+            const char *comma = strchr(q, ',');
+            if (!comma) break;
+            q = comma + 1;
+        }
+    }
+    calls++;
 }
 
 /* BOOL __OSReadROM(void *buffer, s32 length, s32 offset): read the boot ROM (IPL) over EXI.
@@ -344,6 +416,7 @@ void rt_hook_80095750(Ctx *c) {
  *   are looked up as the character's instead (rt_hook_80169524).
  * SFA_STORY_CHAR=<0-3> (testing) skips the picker and plays every mission as that character;
  * SFA_NO_PILOT_PICKER=1 skips it too (Fox). */
+extern int g_netplay;
 static int g_story_char = -1;                 /* this stage's character when not Fox, else -1 */
 static int g_pick_mission = -1, g_pick_char;  /* the mission picked for and its character */
 static int g_pick_choice = -1;                /* the picker's entry (4 = Random), remembered */
@@ -388,7 +461,7 @@ void rt_hook_8005F470(Ctx *c) {
     int ch = 0;
     const char *sc = getenv("SFA_STORY_CHAR");
     if (sc) ch = atoi(sc);
-    else if (!getenv("SFA_NO_PILOT_PICKER")) {
+    else if (!getenv("SFA_NO_PILOT_PICKER") && !g_netplay) { /* (netplay: the picker would wait on one player alone) */
         if (part == 1 || mission != (uint32_t)g_pick_mission) { /* a mission's first part (also on a retry) */
             g_pick_char = 0;
             if (mission_on_foot((int)mission)) {
@@ -871,6 +944,26 @@ static int model_registered(uint32_t id) {
     return 0;
 }
 void rt_hook_80169524(Ctx *c) {
+    static uint32_t trace_id = 1; /* SFA_TRACE_ID=<hex> (debugging): the guest call stack of each lookup of that ID */
+    if (trace_id == 1) trace_id = getenv("SFA_TRACE_ID") ? (uint32_t)strtoul(getenv("SFA_TRACE_ID"), NULL, 16) : 0;
+    if (trace_id && c->r[3] == trace_id) {
+        static uint32_t seen[64];
+        static int nseen;
+        uint32_t key = c->lr, sp = c->r[1];
+        char line[600];
+        int n = snprintf(line, sizeof line, "[trace] lookup %08X: %s", trace_id, rt_func_containing(c->lr));
+        for (int k = 0; k < 10 && sp && ppc_is_ram(sp); k++) {
+            uint32_t next = rd32(sp);
+            if (!ppc_is_ram(next) || next <= sp) break;
+            uint32_t ra = rd32(next + 4);
+            key = key * 31 + ra;
+            if (n < (int)sizeof line - 80) n += snprintf(line + n, sizeof line - (size_t)n, " < %s (%08X)", rt_func_containing(ra), ra);
+            sp = next;
+        }
+        int known = 0;
+        for (int i = 0; i < nseen; i++) known |= seen[i] == key;
+        if (!known && nseen < 64) { seen[nseen++] = key; printf("%s\n", line); fflush(stdout); }
+    }
     if (g_story_body_swap <= 0 || g_game_state < 12) return;
     static const uint32_t story_t[2] = {0x8022BE58u, 0x8022BE28u}, vs_t[2] = {0x8022BE40u, 0x8022BE10u};
     uint32_t id = c->r[3] & 0xFFFF;
@@ -900,3 +993,84 @@ void rt_hook_8016106C(Ctx *c) {
     if (g_story_char > 0 && g_story_body_swap == 0 && c->lr == 0x800782C0u) c->r[4] = 1;
 }
 
+
+/* GXInitTexObj(obj, image, w, h, format, ...): SFA_TRACE_TEX=<hex image address> (debugging): the guest
+ * call stack of each distinct place that sets up a texture object for that image */
+void rt_hook_80159B4C(Ctx *c) {
+    static uint32_t want = 1;
+    if (want == 1) want = getenv("SFA_TRACE_TEX") ? (uint32_t)strtoul(getenv("SFA_TRACE_TEX"), NULL, 16) : 0;
+    if (!want || c->r[4] != want) return;
+    static uint32_t seen[64];
+    static int nseen;
+    uint32_t key = c->lr, sp = c->r[1];
+    char line[700];
+    int n = snprintf(line, sizeof line, "[trace] texture %08X set up: %s (%08X)", want, rt_func_containing(c->lr), c->lr);
+    for (int k = 0; k < 12 && sp && ppc_is_ram(sp); k++) {
+        uint32_t next = rd32(sp);
+        if (!ppc_is_ram(next) || next <= sp) break;
+        uint32_t ra = rd32(next + 4);
+        key = key * 31 + ra;
+        if (n < (int)sizeof line - 80) n += snprintf(line + n, sizeof line - (size_t)n, " < %s (%08X)", rt_func_containing(ra), ra);
+        sp = next;
+    }
+    for (int i = 0; i < nseen; i++) if (seen[i] == key) return;
+    if (nseen < 64) seen[nseen++] = key;
+    printf("%s\n", line);
+    fflush(stdout);
+}
+
+/* Widescreen camera (see hle_overrides.txt, fn_8015F068). The camera setup fn_800182F0 keeps the view's
+ * horizontal field of view (binary angle, camera +0x14) and height / width (+0x20); everything else is
+ * derived from them right after: the projection, and the half-angle sine/cosine the game culls objects
+ * against (+0x94..+0xA0, used by many draw functions). A view over the whole screen is shown 4/3 as wide
+ * in widescreen, so here it gets the field of view that really covers (tan * 4/3) and height / width
+ * * 3/4: the vertical view, and so the picture, stay the same, the projection is already wide (gx.c
+ * then leaves it alone), and objects at the sides are no longer culled as off screen. Narrower views
+ * (split screen columns) keep theirs. SFA_WIDE_CAMERA=0 (testing): the game's own 4:3 camera. */
+void rt_hook_8015F068(Ctx *c) {
+    static int on = -1;
+    if (on < 0) on = !getenv("SFA_WIDE_CAMERA") || atoi(getenv("SFA_WIDE_CAMERA")) != 0;
+    if (!g_widescreen || !on || c->lr != 0x80018408u) return;
+    uint32_t cam = c->r[29];
+    if (!ppc_is_ram(cam) || u2f(rd32(cam + 0x18)) < 632.0f) return;
+    int fov = (int16_t)rd16(cam + 0x14);
+    if (fov <= 1 || fov >= 0x7FFF) return;
+    const double unit = 3.14159265358979323846 / 32768.0; /* radians per binary-angle step */
+    double half = atan(tan(fov * 0.5 * unit) * (4.0 / 3.0));
+    int wide = (int)(half * 2.0 / unit + 0.5);
+    if (wide > 0x7FF0) wide = 0x7FF0;
+    wr16(cam + 0x14, (uint16_t)wide);
+    c->r[3] = (uint32_t)(wide >> 1); /* the call's argument, already loaded from +0x14 */
+    wr32(cam + 0x20, f2u(u2f(rd32(cam + 0x20)) * 0.75f));
+}
+
+/* Widescreen projection (see hle_overrides.txt, fn_801803D0 and fn_80180598). The graphics library's 3D
+ * projection gets the horizontal field of view (r3, a binary angle) and the height's share (f1: the matrix's
+ * y scale is the x scale times f1). For the gameplay camera (fn_8003D9D4) and the cutscene camera
+ * (fn_800ACF04, which also uses the lens-shifted variant fn_80180598), when they fill the screen, the angle is
+ * widened so the view covers the 16:9 picture and f1 grows by 4/3 so the vertical view stays the same. The game
+ * then draws and culls for the whole picture (gx.c no longer stretches it). */
+static void widen_projection(Ctx *c) {
+    static int on = -1;
+    if (on < 0) on = !getenv("SFA_WIDE_CAMERA") || atoi(getenv("SFA_WIDE_CAMERA")) != 0;
+    if (!g_widescreen || !on) return;
+    uint32_t cam = rd32(0x80385190u);
+    if (!ppc_is_ram(cam) || u2f(rd32(cam + 0x18)) < 632.0f) return;
+    int fov = (int)(int32_t)c->r[3];
+    if (fov <= 1 || fov >= 0x7FFF) return;
+    const double unit = 3.14159265358979323846 / 32768.0;
+    double half = atan(tan(fov * 0.5 * unit) * (4.0 / 3.0));
+    int wide = (int)(half * 2.0 / unit + 0.5);
+    if (wide > 0x7FF0) wide = 0x7FF0;
+    double sy = tan(fov * 0.5 * unit) / tan(half); /* keeps cot(angle/2) * f1 (the y scale) as it was */
+    c->r[3] = (uint32_t)wide;
+    c->f[1].ps0 = c->f[1].ps0 / sy;
+}
+
+void rt_hook_801803D0(Ctx *c) {
+    if (c->lr == 0x8003DA40u || c->lr == 0x800AEB4Cu || c->lr == 0x800AEA50u) widen_projection(c);
+}
+
+void rt_hook_80180598(Ctx *c) {
+    if (c->lr >= 0x800ACF04u && c->lr < 0x800AF724u) widen_projection(c); /* only the cutscene camera calls it */
+}
